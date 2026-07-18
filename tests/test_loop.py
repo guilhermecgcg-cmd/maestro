@@ -20,7 +20,7 @@ class _Voz:
 
 
 def _proj(**kw):
-    base = dict(nome="p1", projeto_easypanel="proj1", servicos=("api",), saude={}, adaptador="", database_url="")
+    base = dict(nome="p1", projeto_easypanel="proj1", servicos=("api",), saude={}, adaptador="", database_url="", gerenciar=True)
     base.update(kw); return Projeto(**base)
 
 
@@ -47,3 +47,10 @@ def test_so_olha_servicos_do_projeto():
                  "outro": Servico("outro", up=False, restarting=False)}); v = _Voz()
     ciclo(a, v, [_proj(servicos=("api",))], llm=lambda p: "{}")
     assert a.restarts == []  # 'outro' está caído mas NÃO é do projeto -> ignora
+
+
+def test_projeto_monitorado_so_avisa_nao_age():
+    a = _Acesso({"api": Servico("api", up=False, restarting=False)}); v = _Voz()
+    ciclo(a, v, [_proj(gerenciar=False)], llm=lambda p: "{}")
+    assert a.restarts == [] and a.redeploys == []   # NÃO agiu
+    assert v.escaladas                              # só avisou

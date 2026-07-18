@@ -43,6 +43,12 @@ def ciclo(acesso, voz, projetos, *, llm) -> list:
             from maestro.adaptadores import conhecimento
             problemas += conhecimento.checar(proj)
         for p in problemas:
+            if not proj.gerenciar:
+                # projeto monitorado (não opt-in): só avisa, NUNCA age sozinho.
+                voz.escalar(p, f"[{proj.nome}] {p.tipo}: {p.detalhe} "
+                               f"(monitorado; diga 'gerencia {proj.nome}' pra eu agir)")
+                acoes.append(playbook.Acao("", False, True))
+                continue
             acao = _resolver(p, acesso, proj, llm)
             if acao.executada:
                 voz.avisar_acao(acao)

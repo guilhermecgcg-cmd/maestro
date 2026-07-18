@@ -21,3 +21,14 @@ def test_redeploy_usa_projeto_do_registro():
     a.redeploy("painel-api", "conhecimentoinfinito")
     assert chamado["body"]["json"]["projectName"] == "conhecimentoinfinito"
     assert chamado["body"]["json"]["serviceName"] == "painel-api"
+
+
+def test_descobrir_projetos():
+    data = {"json": {"services": [
+        {"projectName": "conhecimentoinfinito", "name": "worker"},
+        {"projectName": "conhecimentoinfinito", "name": "db"},
+        {"projectName": "loja", "name": "api"}]}}
+    a = Acesso(http_get=lambda path: data)
+    d = a.descobrir_projetos()
+    assert d["conhecimentoinfinito"] == ["worker", "db"]
+    assert d["loja"] == ["api"]

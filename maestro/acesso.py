@@ -19,10 +19,21 @@ def _nome_curto(container: str) -> str:
 
 
 class Acesso:
-    def __init__(self, *, run_cmd=None, http_post=None, probe=None):
+    def __init__(self, *, run_cmd=None, http_get=None, http_post=None, probe=None):
         self._run_cmd = run_cmd
+        self._http_get = http_get
         self._http_post = http_post
         self._probe = probe
+
+    def descobrir_projetos(self) -> dict:
+        """Auto-descoberta: TODOS os projetos+serviços do Easypanel. Deploy novo
+        aparece aqui sozinho — o Maestro não depende de registro manual pra SABER
+        que um sistema existe. Retorna {projeto_easypanel: [serviços]}."""
+        data = self._http_get("/api/trpc/projects.listProjectsAndServices")
+        out = {}
+        for svc in (data.get("json", {}) or {}).get("services", []):
+            out.setdefault(svc["projectName"], []).append(svc["name"])
+        return out
 
     def servicos(self) -> dict:
         saida = self._run_cmd('docker ps -a --format "{{.Status}}  {{.Names}}"')

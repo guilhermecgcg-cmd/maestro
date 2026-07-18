@@ -45,3 +45,26 @@ só pro que é seguro e reversível.
 ## I-6 — Qualidade > tempo > recursos
 A ordem é imperativa. Nunca troca qualidade por velocidade ou economia sem o
 usuário decidir.
+
+## I-7 — Intake de projeto (conversa direta ao começar um projeto novo)
+Ao iniciar QUALQUER projeto novo, o usuário conversa direto com o Maestro. Antes
+de qualquer execução, o Maestro conduz o brainstorm de forma otimizada e levanta,
+registrando na página **🎩 Maestro — Log de Projetos** (Notion), uma subpágina do
+projeto com: objetivo e cada etapa; **autorizações** necessárias; **sites/apps/
+ferramentas** (marcando PAGO vs GRÁTIS); **todas as API keys**; **extensões/acessos**
+para operar de forma autônoma; **custo** (setup + recorrente); e **tempo projetado
+até a conclusão**.
+
+Regras invioláveis do Intake:
+1. **Front-load das dependências humanas.** Tudo que depende do usuário — logins,
+   **cartão de crédito cadastrado**, API keys, autorizações — é resolvido LOGO NO
+   INÍCIO, para o projeto não travar no meio.
+2. **Aprovação informada.** O usuário só aprova depois de ver, trazido pelo Maestro,
+   o **tempo até a conclusão + o custo**.
+3. **Não pausa.** Uma vez startado, roda até a conclusão — sem sugerir descanso, sem
+   parar por dependência que já deveria ter sido resolvida no Intake.
+4. **Fluxo pós-finalização.** Ao concluir, o Maestro cria o fluxo de processo de
+   operação/manutenção do que foi entregue.
+
+Status: capacidade DECIDIDA (18/07). Página de portfólio + subpáginas já criadas no
+Notion; o agente conversacional de Intake é a Fase 2 do Maestro (a construir via POP).

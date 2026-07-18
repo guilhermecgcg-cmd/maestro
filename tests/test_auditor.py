@@ -28,3 +28,27 @@ def test_criterio_que_estoura_e_falha():
 def test_auditar_lista_vazia_reprova():
     # sem critério não há verificação -> NÃO aprova (fail-closed).
     assert auditar([], ctx={}).aprovado is False
+
+
+# --- I-2: nunca sobrepor decisão de arquitetura do usuário ---
+from maestro.auditor import criterio_igual
+
+
+def test_criterio_igual_reprova_quando_real_diverge_da_decisao():
+    # usuário decidiu projeto próprio; realidade veio dentro do conhecimento.
+    c = criterio_igual("projeto easypanel", "maestro", "conhecimentoinfinito",
+                       rotulo="projeto")
+    laudo = auditar([c], ctx={})
+    assert laudo.aprovado is False
+    assert "viola I-2" in laudo.resultados[0].evidencia
+
+
+def test_criterio_igual_aprova_quando_bate():
+    c = criterio_igual("projeto easypanel", "maestro", "maestro", rotulo="projeto")
+    assert auditar([c], ctx={}).aprovado is True
+
+
+def test_contradicao_arquitetura_e_falha_automatica():
+    c = contradicoes({"arquitetura_decidida": "projeto:maestro",
+                      "arquitetura_real": "projeto:conhecimentoinfinito"})
+    assert c and "I-2" in c[0]

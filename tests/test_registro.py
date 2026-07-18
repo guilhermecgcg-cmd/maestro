@@ -1,0 +1,13 @@
+from maestro.registro import carregar
+
+
+def test_carrega_e_resolve_db_por_env(tmp_path, monkeypatch):
+    y = tmp_path / "p.yaml"
+    y.write_text("- nome: c\n  projeto_easypanel: cp\n  servicos: [a, b]\n"
+                 "  adaptador: conhecimento\n  database_url_env: FOO_DB\n")
+    monkeypatch.setenv("FOO_DB", "postgresql://x")
+    projs = carregar(str(y))
+    assert len(projs) == 1
+    p = projs[0]
+    assert p.nome == "c" and p.servicos == ("a", "b")
+    assert p.database_url == "postgresql://x"   # resolvido do env, não do YAML

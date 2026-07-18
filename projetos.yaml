@@ -1,0 +1,9 @@
+# Projetos que o Maestro coordena. Novo projeto = nova entrada (sem tocar no código).
+- nome: conhecimento
+  projeto_easypanel: conhecimentoinfinito
+  servicos: [worker, painel-api, painel-web, conhecimentoinfinito, db, ponte]
+  saude:
+    painel-api: http://painel-api:8200/
+    painel-web: http://painel-web:3000/
+  adaptador: conhecimento
+  database_url_env: CONHECIMENTO_DATABASE_URL

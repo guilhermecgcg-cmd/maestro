@@ -20,7 +20,7 @@ class _Voz:
 
 
 def _proj(**kw):
-    base = dict(nome="p1", projeto_easypanel="proj1", servicos=("api",), saude={}, adaptador="", database_url="", gerenciar=True)
+    base = dict(nome="p1", projeto_easypanel="proj1", servicos=("api",), saude={}, adaptador="", gerenciar=True)
     base.update(kw); return Projeto(**base)
 
 

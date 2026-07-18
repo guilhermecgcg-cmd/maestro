@@ -12,7 +12,7 @@ from maestro.cerebro import diagnosticar
 
 def _resolver(p, acesso, proj, llm):
     # problemas específicos do projeto -> adaptador
-    if p.tipo in ("job_travado", "job_falhou", "claim_orfao"):
+    if p.tipo in ("job_travado", "job_falhou", "claim_orfao", "conhecimento_db_inacessivel"):
         if proj.adaptador == "conhecimento":
             from maestro.adaptadores import conhecimento
             return conhecimento.resolver(p, acesso, proj)
@@ -41,7 +41,7 @@ def ciclo(acesso, voz, projetos, *, llm) -> list:
         problemas = list(sentinela.checar(snap))
         if proj.adaptador == "conhecimento":
             from maestro.adaptadores import conhecimento
-            problemas += conhecimento.checar(proj)
+            problemas += conhecimento.checar(proj, acesso)
         for p in problemas:
             if not proj.gerenciar:
                 # projeto monitorado (não opt-in): só avisa, NUNCA age sozinho.

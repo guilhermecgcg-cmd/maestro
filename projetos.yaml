@@ -1,9 +1,13 @@
-# Projetos que o Maestro coordena. Novo projeto = nova entrada (sem tocar no código).
 - nome: conhecimento
   projeto_easypanel: conhecimentoinfinito
-  servicos: [worker, painel-api, painel-web, conhecimentoinfinito, db, ponte]
-  saude:
-    painel-api: http://painel-api:8200/
-    painel-web: http://painel-web:3000/
+  servicos: [conhecimentoinfinito, db, painel-api, painel-web, ponte, worker]
   adaptador: conhecimento
-  database_url_env: CONHECIMENTO_DATABASE_URL
+  # acesso ao banco via `docker exec` no container do Postgres (socket) — o Maestro
+  # roda num projeto próprio, isolado da rede interna do conhecimento.
+  db_container: conhecimentoinfinito_db
+  db_name: conhecimento
+  db_user: postgres
+  gerenciar: true
+  # health por socket (docker ps) cobre serviço caído; saude HTTP interna é opcional
+  # e não confiável cross-project, então fica vazia (o núcleo usa servicos()).
+  saude: {}

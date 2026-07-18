@@ -32,3 +32,43 @@ def test_descobrir_projetos():
     d = a.descobrir_projetos()
     assert d["conhecimentoinfinito"] == ["worker", "db"]
     assert d["loja"] == ["api"]
+
+
+import pytest
+
+
+def test_exec_sql_monta_comando_e_parseia_linhas():
+    capturado = {}
+    def fake_run(cmd):
+        capturado["cmd"] = cmd
+        return "1|capturando|123.0|\n2|falhou|0|erro\n__EXEC_OK__\n"
+    a = Acesso(run_cmd=fake_run)
+    linhas = a.exec_sql("cp_db", "SELECT 1", db="conhecimento", user="postgres")
+    assert linhas == ["1|capturando|123.0|", "2|falhou|0|erro"]   # sentinela removida
+    c = capturado["cmd"]
+    assert "psql -U postgres -d conhecimento" in c
+    assert "docker ps -qf name=cp_db" in c   # descobre o container pelo socket
+
+
+def test_exec_sql_levanta_quando_container_nao_existe():
+    a = Acesso(run_cmd=lambda cmd: "__EXEC_FAIL__no_container\n")
+    with pytest.raises(RuntimeError):
+        a.exec_sql("nao_existe", "SELECT 1", db="d")
+
+
+def test_exec_sql_levanta_quando_psql_falha():
+    a = Acesso(run_cmd=lambda cmd: "ERRO psql\n__EXEC_FAIL__psql\n")
+    with pytest.raises(RuntimeError):
+        a.exec_sql("cp_db", "SELECT bad", db="d")
+
+
+def test_exec_sql_levanta_sem_sentinela():
+    # falha silenciosa (stdout vazio) NÃO pode virar "0 linhas"
+    a = Acesso(run_cmd=lambda cmd: "")
+    with pytest.raises(RuntimeError):
+        a.exec_sql("cp_db", "SELECT 1", db="d")
+
+
+def test_exec_sql_rows_false_ok_com_sentinela():
+    a = Acesso(run_cmd=lambda cmd: "UPDATE 1\n__EXEC_OK__\n")
+    assert a.exec_sql("cp_db", "UPDATE x SET y=1", db="d", rows=False) == []

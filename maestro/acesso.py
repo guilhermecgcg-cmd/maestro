@@ -58,6 +58,31 @@ class Acesso:
         self._http_post("/api/trpc/services.app.deployService",
                         {"json": {"projectName": projeto_easypanel, "serviceName": nome}})
 
+    def exec_sql(self, container_match: str, sql: str, *, db: str,
+                 user: str = "postgres", rows: bool = True) -> list:
+        """Roda SQL DENTRO de um container Postgres via socket (`docker exec ... psql`).
+        Vence o isolamento de rede entre projetos do Easypanel: o Maestro, externo ao
+        projeto, alcança o banco de DENTRO do container do próprio projeto. Sem senha
+        (trust local no socket unix do postgres). Linhas -tA: campos separados por '|'.
+
+        LEVANTA em qualquer falha (container inexistente, auth, erro de psql). Sem
+        isso, falha viraria stdout vazio == 'fila limpa' — ponto cego que deixaria
+        job travado sem vigilância (risco de queimar conta paga). Usa uma sentinela
+        __EXEC_OK__ como última linha só quando o psql retorna 0."""
+        q = shlex.quote
+        inner = (f'docker exec -i "$CID" psql -U {q(user)} -d {q(db)} -tAqc {q(sql)}')
+        cmd = (f'CID=$(docker ps -qf name={q(container_match)} | head -1); '
+               f'if [ -z "$CID" ]; then echo __EXEC_FAIL__no_container; '
+               f'else {inner} && echo __EXEC_OK__ || echo __EXEC_FAIL__psql; fi')
+        saida = self._run_cmd(cmd) or ""
+        linhas = saida.splitlines()
+        if not linhas or linhas[-1].strip() != "__EXEC_OK__":
+            raise RuntimeError(
+                f"exec_sql falhou em {container_match}/{db}: {saida[-200:]!r}")
+        if not rows:
+            return []
+        return [ln for ln in linhas[:-1] if ln.strip()]
+
     def saude_http(self, alvos: dict) -> dict:
         out = {}
         for nome, url in alvos.items():

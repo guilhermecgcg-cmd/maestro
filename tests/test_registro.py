@@ -1,16 +1,17 @@
 from maestro.registro import carregar
 
 
-def test_carrega_e_resolve_db_por_env(tmp_path, monkeypatch):
+def test_carrega_le_db_container_e_gerenciar(tmp_path):
     y = tmp_path / "p.yaml"
     y.write_text("- nome: c\n  projeto_easypanel: cp\n  servicos: [a, b]\n"
-                 "  adaptador: conhecimento\n  database_url_env: FOO_DB\n")
-    monkeypatch.setenv("FOO_DB", "postgresql://x")
+                 "  adaptador: conhecimento\n  db_container: cp_db\n"
+                 "  db_name: conhecimento\n  db_user: postgres\n")
     projs = carregar(str(y))
     assert len(projs) == 1
     p = projs[0]
     assert p.nome == "c" and p.servicos == ("a", "b")
-    assert p.database_url == "postgresql://x"   # resolvido do env, não do YAML
+    assert p.db_container == "cp_db" and p.db_name == "conhecimento" and p.db_user == "postgres"
+    assert p.gerenciar is True   # configurado no YAML = gerenciado por padrão
 
 
 def test_mesclar_descobre_novo_como_monitorado():

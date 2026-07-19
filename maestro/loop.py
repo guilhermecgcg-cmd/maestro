@@ -72,6 +72,23 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None) -> list:
                     voz.escalar(sentinela.Problema("reconcile", proj.nome, acao.pedido, "aviso"),
                                 acao.pedido)
                 acoes.append(acao)
+
+        # ROTINA periodica: PROTOCOLO DE CAPTURA por curso desejado. Fonte = a lista
+        # `cursos_desejados` (course_urls) do PROPRIO projeto do conhecimento — VAZIA
+        # por default, entao nada e auto-disparado ate ser populada. NAO cria entrada
+        # nova no registro (mesmos containers -> evita monitoramento duplicado). Estado
+        # por-curso persiste entre ciclos num dict aninhado sob a chave do projeto. O
+        # coordenar e dono do seu reporte (dirige a voz sozinho); o loop so registra.
+        if proj.gerenciar and getattr(proj, "cursos_desejados", ()):
+            from maestro.adaptadores import captura
+            cap_estado = estado.setdefault(f"{proj.nome}::captura", {})
+            executor = captura.FilaExecutor(acesso, proj)
+            for curso_url in proj.cursos_desejados:
+                st = cap_estado.setdefault(curso_url, {})
+                acao = captura.coordenar(proj, acesso, voz, executor=executor,
+                                         curso_url=curso_url, estado=st, agora=snap["agora"])
+                if acao is not None:
+                    acoes.append(acao)
     return acoes
 
 

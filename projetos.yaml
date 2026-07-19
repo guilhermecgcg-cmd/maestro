@@ -16,3 +16,8 @@
   # health por socket (docker ps) cobre serviço caído; saude HTTP interna é opcional
   # e não confiável cross-project, então fica vazia (o núcleo usa servicos()).
   saude: {}
+  # PROTOCOLO DE CAPTURA: course_urls que o Maestro deve capturar (dispara no worker
+  # RESIDENCIAL via fila_captura, monitora estado_aulas, auto-ingesta ao concluir).
+  # VAZIA por default — popule com as URLs dos cursos a capturar. NÃO cria projeto
+  # novo: convive no mesmo registro do conhecimento (sem monitoramento duplicado).
+  cursos_desejados: []

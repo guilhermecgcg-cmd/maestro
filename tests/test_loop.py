@@ -71,3 +71,25 @@ def test_captura_vazia_do_adaptador_escala_sem_agir():
     ciclo(a, v, [proj], llm=lambda p: "{}")
     assert a.restarts == [] and a.redeploys == []          # NÃO agiu sozinho
     assert any("falso-sucesso" in e for e in v.escaladas)  # escalou claro
+
+
+def test_loop_coordena_cursos_desejados_por_url():
+    # C4 wiring: o loop itera cursos_desejados do PROJETO conhecimento e dispara a
+    # captura por course_url (sem criar entrada nova no registro), guardando estado
+    # por-curso entre ciclos num dict aninhado sob a chave do projeto.
+    class _AcessoCap(_Acesso):
+        def __init__(self, s): super().__init__(s); self.sqls = []
+        def exec_sql(self, container, sql, *, db, user="postgres", rows=True):
+            self.sqls.append(sql)
+            return []                                       # sem sinal de morte / fila limpa
+    a = _AcessoCap({"worker": Servico("worker", up=True, restarting=False)}); v = _Voz()
+    # app_container vazio: a rotina reconcile do adaptador conhecimento nao dispara
+    # (foco do teste = wiring da captura), mas o coordenar so precisa dela na conclusao.
+    proj = _proj(servicos=("worker",), adaptador="conhecimento", db_container="cp_db",
+                 db_name="conhecimento", app_container="",
+                 cursos_desejados=("https://plat/c1",))
+    estado = {}
+    ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado)
+    # enfileirou o curso desejado por course_url e persistiu a fase
+    assert any("INSERT INTO fila_captura" in s and "https://plat/c1" in s for s in a.sqls)
+    assert estado["p1::captura"]["https://plat/c1"]["fase"] == "capturando"

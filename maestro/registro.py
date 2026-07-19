@@ -19,6 +19,10 @@ class Projeto:
     db_user: str = "postgres"    # usuário local (trust no socket do container)
     app_container: str = ""      # container do APP p/ `docker exec` de rotinas (ex.: reconcile)
     gerenciar: bool = False      # False = só monitora/avisa; True = pode agir (opt-in)
+    # course_urls que o Maestro deve CAPTURAR (protocolo captura, por curso). VAZIA por
+    # default: nada é auto-disparado até o usuário/eu popular. Convive no MESMO projeto
+    # do conhecimento (não cria entrada nova -> não duplica o monitoramento).
+    cursos_desejados: tuple = ()
 
 
 def carregar(path: str) -> list:
@@ -33,7 +37,8 @@ def carregar(path: str) -> list:
                            db_name=d.get("db_name", ""),
                            db_user=d.get("db_user", "postgres"),
                            app_container=d.get("app_container", ""),
-                           gerenciar=d.get("gerenciar", True)))  # configurado = gerenciado
+                           gerenciar=d.get("gerenciar", True),  # configurado = gerenciado
+                           cursos_desejados=tuple(d.get("cursos_desejados", []))))
     return out
 
 

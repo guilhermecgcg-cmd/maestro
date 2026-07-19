@@ -180,3 +180,201 @@ def test_adaptador_nao_importa_browser():
     assert "playwright" not in baixo
     assert "selenium" not in baixo
     assert "webdriver" not in baixo
+
+
+# --------------------------------------------------------------------------
+# coordenar — orquestrador do protocolo, por curso, com estado entre ciclos
+# --------------------------------------------------------------------------
+AGORA = 1_000_000.0
+
+
+def _sessao_viva():
+    return [f"t|{AGORA - 60}"]
+
+
+# ---- FASE 1: checar sessão (INVIOLÁVEL anti-login) --------------------------
+def test_sessao_morta_pede_reseed_e_nao_dispara_captura():
+    # O inviolável mais importante: sessão morta NÃO tenta logar, NÃO dispara a
+    # captura — PEDE reseed via voz.
+    ac = FakeAcesso(sessao=[f"f|{AGORA - 60}"])
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert ex.disparos == []                       # NÃO disparou captura
+    assert ac.inserts == []                        # nem enfileirou
+    assert len(voz.escaladas) == 1
+    pedido = voz.escaladas[0][1].lower()
+    assert "reseed" in pedido or "re-semear" in pedido
+    assert "login" not in pedido or "não" in pedido  # jamais promete logar
+    assert estado.get("fase") != captura.FASE_CAPTURANDO  # não avançou
+
+
+def test_sessao_desconhecida_escala_honesto_e_nao_dispara():
+    # exec falhou -> não sabemos da sessão -> NÃO dispara às cegas; escala.
+    ac = FakeAcesso(boom_sql=True)
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado={}, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert ex.disparos == []
+    assert len(voz.escaladas) == 1
+
+
+# ---- FASE 2: disparar captura via EXECUTOR residencial ---------------------
+def test_sessao_viva_dispara_via_executor_e_avisa():
+    ac = FakeAcesso(sessao=_sessao_viva())
+    voz = FakeVoz()
+    ex = FakeExecutor(confirmacao="enfileirado:55")
+    estado = {}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.executada and not acao.escalar
+    assert ex.disparos == ["55"]                   # captura foi delegada ao executor
+    assert estado["fase"] == captura.FASE_CAPTURANDO
+    assert len(voz.avisos) == 1
+    assert "55" in acao.descricao
+
+
+def test_disparo_que_levanta_escala_honesto_sem_avancar():
+    # DENTES: executor que falha NÃO pode virar "capturando" nem avisar sucesso.
+    ac = FakeAcesso(sessao=_sessao_viva())
+    voz = FakeVoz()
+    ex = FakeExecutor(boom=True)
+    estado = {}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert estado.get("fase") != captura.FASE_CAPTURANDO
+    assert voz.avisos == [] and len(voz.escaladas) == 1
+
+
+def test_disparo_sem_confirmacao_escala_honesto():
+    # DENTES: executor que devolve falsy = sem confirmação -> não assume sucesso.
+    ac = FakeAcesso(sessao=_sessao_viva())
+    voz = FakeVoz()
+    ex = FakeExecutor(confirmacao="")
+    estado = {}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert estado.get("fase") != captura.FASE_CAPTURANDO
+
+
+# ---- FASE 3: monitorar progresso -------------------------------------------
+def test_capturando_incompleto_fica_quieto_sem_ingest():
+    ac = FakeAcesso(progresso=["10|4"])            # 4 de 10 -> ainda rodando
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao is None                            # nada a reportar (não spamma)
+    assert ac.execs == []                          # NÃO disparou auto-ingest
+    assert estado["fase"] == captura.FASE_CAPTURANDO
+
+
+def test_progresso_inacessivel_escala_honesto():
+    ac = FakeAcesso(boom_sql=True)
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(), curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert len(voz.escaladas) == 1
+
+
+# ---- FASE 4: concluído -> auto-ingest reusando conhecimento.reconciliar -----
+def test_curso_completo_dispara_autoingest_via_reconciliar():
+    ac = FakeAcesso(progresso=["10|10"], reconcile="RECONCILE_OK {'ingeridas': 10}")
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(), curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.executada and not acao.escalar
+    # provou o REUSO: passou pelo exec_app do reconcile no container de app
+    assert ac.execs == [("conhecimentoinfinito_conhecimentoinfinito",
+                         "python -m conhecimento.reconcile")]
+    assert estado["fase"] == captura.FASE_CONCLUIDO
+    assert any("reconcile" in a.descricao for a in voz.avisos)
+
+
+def test_autoingest_que_falha_escala_e_nao_marca_concluido():
+    # DENTES: reconcile que falha NÃO pode marcar o curso como concluído.
+    ac = FakeAcesso(progresso=["10|10"], boom_app=True)
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(), curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert estado["fase"] != captura.FASE_CONCLUIDO
+
+
+def test_autoingest_sem_sentinela_escala_nao_finge_sucesso():
+    ac = FakeAcesso(progresso=["10|10"], reconcile="Traceback: boom")
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(), curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert estado["fase"] != captura.FASE_CONCLUIDO
+
+
+def test_autoingest_sem_app_container_escala():
+    # curso completo mas projeto sem alvo de ingest -> honesto, não some silencioso.
+    ac = FakeAcesso(progresso=["10|10"])
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(app_container=""), ac, voz,
+                             executor=FakeExecutor(), curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao.escalar and not acao.executada
+    assert ac.execs == []
+
+
+def test_concluido_nao_redispara_nada():
+    ac = FakeAcesso(sessao=_sessao_viva(), progresso=["10|10"])
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {"fase": captura.FASE_CONCLUIDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso="55",
+                             estado=estado, agora=AGORA)
+    assert acao is None
+    assert ex.disparos == [] and ac.execs == []    # idempotente e quieto
+
+
+# ---- Protocolo completo ao longo de ciclos (estado persiste) ---------------
+def test_protocolo_completo_novo_ate_concluido():
+    voz = FakeVoz()
+    ex = FakeExecutor(confirmacao="enfileirado:55")
+    estado = {}
+
+    # ciclo 1: sessão viva -> dispara
+    ac1 = FakeAcesso(sessao=_sessao_viva())
+    a1 = captura.coordenar(_proj(), ac1, voz, executor=ex, curso="55",
+                           estado=estado, agora=AGORA)
+    assert a1.executada and estado["fase"] == captura.FASE_CAPTURANDO
+
+    # ciclo 2: ainda capturando -> quieto, não redispara
+    ac2 = FakeAcesso(progresso=["10|3"])
+    a2 = captura.coordenar(_proj(), ac2, voz, executor=ex, curso="55",
+                           estado=estado, agora=AGORA)
+    assert a2 is None and ex.disparos == ["55"]     # disparou UMA vez só
+
+    # ciclo 3: completou -> auto-ingest -> concluído
+    ac3 = FakeAcesso(progresso=["10|10"], reconcile="RECONCILE_OK {}")
+    a3 = captura.coordenar(_proj(), ac3, voz, executor=ex, curso="55",
+                           estado=estado, agora=AGORA)
+    assert a3.executada and estado["fase"] == captura.FASE_CONCLUIDO
+    assert ac3.execs and ac3.execs[0][1] == "python -m conhecimento.reconcile"
+
+
+# ---- SEAM da esteira (classificador/sintetizador) — declarado, não implementado
+def test_seam_esteira_existe_e_e_noop():
+    # O ponto de extensão para o classificador fino e o Sintetizador (cursos how_to)
+    # existe e é um NO-OP honesto: não faz nada e não finge que fez.
+    assert hasattr(captura, "_hooks_esteira")
+    assert captura._hooks_esteira(_proj(), "55", {}) == []

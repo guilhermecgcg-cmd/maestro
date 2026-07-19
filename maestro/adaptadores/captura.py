@@ -29,6 +29,13 @@ from maestro.sentinela import Problema
 # (parede/erro, que I-3 proíbe tratar como sucesso).
 SESSAO_MAX_IDADE_S = 6 * 3600.0
 
+# Fases do protocolo de captura de UM curso. Persistem em `estado` entre ciclos do
+# loop (mesmo padrão do `ultimo` de reconciliar): o coordenador é chamado a cada
+# ciclo e avança a máquina de estados sem bloquear.
+FASE_NOVO = "novo"                # ainda não disparado
+FASE_CAPTURANDO = "capturando"    # disparado no residencial; monitorando progresso
+FASE_CONCLUIDO = "concluido"      # capturado + auto-ingest confirmado
+
 # --- QUERIES DO TRACKER -----------------------------------------------------
 # ATENÇÃO: `sessao_plataforma` é o contrato ASSUMIDO do tracker de sessão (o motor
 # de login grava validade + carimbo). VERIFICAR tabela/colunas reais antes de ativar
@@ -114,3 +121,120 @@ class FilaExecutor:
                               db=self._projeto.db_name, user=self._projeto.db_user,
                               rows=False)
         return f"enfileirado:{int(curso)}"
+
+    # SEAM DE EVOLUÇÃO (roadmap, NÃO construir agora): hoje o browser roda no worker
+    # RESIDENCIAL do Mac (IP residencial), que só liga quando o Mac está ligado. Para
+    # captura 24/7 com o Mac desligado, trocar o executor por um que roteie o browser
+    # por um PROXY residencial a partir da VPS — mantendo o inviolável anti-ban (IP
+    # residencial), sem depender do Mac. É só outro executor injetado: o coordenador
+    # não muda.
+
+
+def coordenar(projeto, acesso, voz, *, executor, curso, estado, agora=None):
+    """Coordena o PROTOCOLO DE CAPTURA de UM curso, um passo por ciclo, avançando a
+    máquina de estados em `estado` (dict por curso, mutável, persiste entre ciclos).
+    Dirige a `voz` diretamente (pede reseed / avisa / escala honesto) e devolve a
+    Acao do passo (ou None quando não há nada a reportar). O loop apenas registra a
+    Acao — não re-dirige a voz (o coordenador é dono do seu reporte).
+
+    INVIOLÁVEIS cravados aqui:
+      - sessão morta/desconhecida -> NÃO dispara captura; pede reseed / escala;
+      - captura SEMPRE via `executor` residencial (nunca Chrome na VPS — anti-ban);
+      - nenhuma etapa é dada como sucesso sem confirmação (reseed, disparo, ingest).
+    """
+    agora = time.time() if agora is None else agora
+    fase = estado.get("fase", FASE_NOVO)
+
+    if fase == FASE_CONCLUIDO:
+        return None                                       # idempotente: nada a fazer
+
+    # ---- FASE 1: checar a sessão ANTES de qualquer disparo -----------------
+    if fase == FASE_NOVO:
+        sess = estado_sessao(projeto, acesso, agora=agora)
+        if sess == "morta":
+            # INVIOLÁVEL: nunca loga sozinho. PEDE reseed humano via voz (Telegram).
+            pedido = (f"[{projeto.nome}] sessão da plataforma MORTA — preciso de RESEED "
+                      f"(re-semear o storage_state pelo Mac e me avisar); NÃO faço login "
+                      f"sozinho e NÃO capturo o curso {curso} sem sessão viva")
+            voz.escalar(Problema("sessao_morta", str(curso), pedido, "critico"), pedido)
+            return Acao("", False, True, pedido)
+        if sess != "viva":                                # "desconhecida": não age às cegas
+            pedido = (f"[{projeto.nome}] não consegui CONFIRMAR a sessão (curso {curso}); "
+                      f"não disparo captura sem confirmar — verificar o tracker de sessão")
+            voz.escalar(Problema("sessao_desconhecida", str(curso), pedido, "aviso"), pedido)
+            return Acao("", False, True, pedido)
+
+        # ---- FASE 2: sessão viva -> dispara via EXECUTOR residencial --------
+        # O Maestro roda na VPS (datacenter). Capturar por browser AQUI queimaria a
+        # conta (anti-ban). Então NÃO abrimos Chrome: delegamos ao executor, que dispara
+        # o worker RESIDENCIAL (Mac). Falha/silêncio do executor -> escala honesto.
+        try:
+            confirmacao = executor.disparar(curso)
+        except Exception as e:
+            pedido = (f"[{projeto.nome}] FALHEI ao disparar a captura residencial do curso "
+                      f"{curso}: {str(e)[:160]}")
+            voz.escalar(Problema("captura_disparo_falhou", str(curso), pedido, "critico"), pedido)
+            return Acao("", False, True, pedido)
+        if not confirmacao:
+            pedido = (f"[{projeto.nome}] disparo da captura do curso {curso} SEM confirmação "
+                      f"do executor residencial — não assumo sucesso")
+            voz.escalar(Problema("captura_disparo_sem_confirmacao", str(curso), pedido, "critico"),
+                        pedido)
+            return Acao("", False, True, pedido)
+        estado["fase"] = FASE_CAPTURANDO
+        acao = Acao(f"[{projeto.nome}] captura do curso {curso} disparada no residencial: "
+                    f"{confirmacao}", True, False)
+        voz.avisar_acao(acao)
+        return acao
+
+    # ---- FASE 3: monitorar progresso via Acesso (tracker) ------------------
+    if fase == FASE_CAPTURANDO:
+        try:
+            total, done, pend = progresso(projeto, acesso, curso)
+        except Exception as e:
+            pedido = (f"[{projeto.nome}] não consigo ler o progresso do curso {curso}: "
+                      f"{str(e)[:140]}")
+            voz.escalar(Problema("progresso_inacessivel", str(curso), pedido, "aviso"), pedido)
+            return Acao("", False, True, pedido)
+        if not (total > 0 and done >= total):
+            return None                                   # ainda capturando: quieto (não spamma)
+
+        # ---- FASE 4: curso completo -> AUTO-INGEST reusando reconciliar ----
+        # REUSO (não reimplementa): forço o disparo AGORA passando ultimo bem no
+        # passado, furando a cadência periódica de reconciliar de propósito — curso
+        # recém-concluído deve ser ingerido já, não no próximo intervalo de 30 min.
+        acao, _ = conhecimento.reconciliar(
+            projeto, acesso, agora=agora,
+            ultimo=agora - conhecimento.INTERVALO_RECONCILE_S - 1)
+        if acao is None:
+            # sem app_container -> não há alvo de ingest; honesto, não some silencioso.
+            pedido = (f"[{projeto.nome}] curso {curso} capturado mas SEM app_container para "
+                      f"auto-ingest — verificar o registro do projeto")
+            voz.escalar(Problema("ingest_sem_alvo", str(curso), pedido, "aviso"), pedido)
+            return Acao("", False, True, pedido)
+        if not acao.executada:
+            # reconcile falhou / sem RECONCILE_OK -> NÃO marca concluído; escala honesto.
+            voz.escalar(Problema("ingest_falhou", str(curso), acao.pedido, "aviso"), acao.pedido)
+            return acao
+        estado["fase"] = FASE_CONCLUIDO
+        voz.avisar_acao(acao)
+        # SEAM DA ESTEIRA (declarado, não implementado): classificador fino + Sintetizador.
+        _hooks_esteira(projeto, curso, estado)
+        return acao
+
+    return None
+
+
+def _hooks_esteira(projeto, curso, estado) -> list:
+    """SEAM da esteira downstream — ponto de extensão APÓS o auto-ingest confirmado.
+    Hoje é um NO-OP honesto (não faz nada e não finge que fez): devolve [] ações.
+
+    Aqui entram, quando construídos (fora do escopo agora):
+      - CLASSIFICADOR FINO: hoje inline no motor; passará a rodar como etapa própria
+        na esteira, classificando o curso/aulas por tipo/intenção.
+      - SINTETIZADOR: só para cursos how_to — extrai passo-a-passo/skills/agentes a
+        partir das aulas já ingeridas.
+    Ambos consomem o que o auto-ingest deixou no pgvector; por isso o gancho é DEPOIS
+    da ingestão confirmada, nunca antes.
+    """
+    return []

@@ -11,7 +11,9 @@ import pytest
 
 from maestro.acesso import Acesso
 from maestro.adaptadores import conhecimento
-from maestro.adaptadores.conhecimento import INTERVALO_RECONCILE_S
+from maestro.adaptadores.conhecimento import INTERVALO_RECONCILE_S, RECONCILE_TIMEOUT_S
+
+_CMD_RECONCILE = "uv run --directory /app python -m conhecimento.reconcile"
 from maestro.registro import Projeto
 
 
@@ -27,8 +29,9 @@ def _proj(**kw):
 # ---- Acesso.exec_app -------------------------------------------------------
 def test_exec_app_monta_docker_exec_e_captura_stderr():
     cap = {}
-    def fake_run(cmd):
+    def fake_run(cmd, timeout=None):
         cap["cmd"] = cmd
+        cap["timeout"] = timeout
         return "RECONCILE_OK {'ingeridas': 2}\n"
     a = Acesso(run_cmd=fake_run)
     saida = a.exec_app("cont_app", "python -m conhecimento.reconcile")
@@ -41,9 +44,21 @@ def test_exec_app_monta_docker_exec_e_captura_stderr():
 
 
 def test_exec_app_levanta_quando_container_nao_existe():
-    a = Acesso(run_cmd=lambda cmd: "__EXEC_FAIL__no_container\n")
+    a = Acesso(run_cmd=lambda cmd, timeout=None: "__EXEC_FAIL__no_container\n")
     with pytest.raises(RuntimeError):
         a.exec_app("nao_existe", "python -m conhecimento.reconcile")
+
+
+def test_exec_app_repassa_timeout_ao_seam_run_cmd():
+    # exec_app deve REPASSAR o timeout recebido ao seam run_cmd -- senao o
+    # subprocess.run do main.py roda sempre no default de 120s e o reconcile estoura.
+    cap = {}
+    def fake_run(cmd, timeout=None):
+        cap["timeout"] = timeout
+        return "RECONCILE_OK\n"
+    a = Acesso(run_cmd=fake_run)
+    a.exec_app("cont_app", "python -m conhecimento.reconcile", timeout=900.0)
+    assert cap["timeout"] == 900.0
 
 
 # ---- reconciliar (rotina periodica) ----------------------------------------
@@ -52,8 +67,8 @@ class FakeAcesso:
         self._saida = saida
         self._boom = boom
         self.execs = []
-    def exec_app(self, container, comando):
-        self.execs.append((container, comando))
+    def exec_app(self, container, comando, timeout=None):
+        self.execs.append((container, comando, timeout))
         if self._boom:
             raise RuntimeError("docker off")
         return self._saida
@@ -66,8 +81,11 @@ def test_reconciliar_dispara_quando_janela_venceu():
     acao, novo = conhecimento.reconciliar(_proj(), ac, agora=agora, ultimo=ultimo)
     assert acao.executada and not acao.escalar
     assert novo == agora                              # marca o disparo
+    # DENTES: reconciliar dispara com o teto GENEROSO (nao o default 120s) -- o 3o
+    # campo do exec e o timeout repassado; se reconciliar parar de passa-lo, isto RED.
     assert ac.execs == [("conhecimentoinfinito_conhecimentoinfinito",
-                         "python -m conhecimento.reconcile")]
+                         _CMD_RECONCILE, RECONCILE_TIMEOUT_S)]
+    assert RECONCILE_TIMEOUT_S != 120                 # e realmente o generoso, nao o curto
     assert "reconcile" in acao.descricao
 
 
@@ -94,6 +112,25 @@ def test_reconciliar_falha_de_exec_escala_honesto():
     assert acao.escalar and not acao.executada
     assert novo == 10_000.0                            # nao re-tenta em looping no mesmo ciclo
     assert "FALHOU" in acao.pedido
+
+
+def test_reconciliar_timeout_escala_e_usa_teto_generoso():
+    # O BUG ORIGINAL: reconcile embeda lote novo no Voyage e passa de 120s -> o
+    # subprocess.run do main.py levanta TimeoutExpired. Aqui usamos o Acesso REAL
+    # com um run_cmd que MODELA esse estouro e captura o timeout recebido. A cadeia
+    # reconciliar -> exec_app -> run_cmd deve (a) ainda ESCALAR honesto (comportamento
+    # preservado) e (b) ter passado o teto GENEROSO, nao o default de 120s.
+    import subprocess
+    cap = {}
+    def run_cmd_timeout(cmd, timeout=None):
+        cap["timeout"] = timeout
+        raise subprocess.TimeoutExpired(cmd, timeout or 120)
+    ac = Acesso(run_cmd=run_cmd_timeout)
+    acao, novo = conhecimento.reconciliar(_proj(), ac, agora=10_000.0, ultimo=0.0)
+    assert acao.escalar and not acao.executada        # escalada preservada
+    assert "FALHOU" in acao.pedido
+    assert cap["timeout"] == RECONCILE_TIMEOUT_S        # teto generoso, nao 120s
+    assert cap["timeout"] != 120
 
 
 def test_reconciliar_sem_sentinela_escala_nao_finge_sucesso():
@@ -125,8 +162,8 @@ class _AcessoLoop:
     def logs(self, nome, n=50): return ""
     def restart(self, nome): pass
     def exec_sql(self, container, sql, *, db, user="postgres", rows=True): return []
-    def exec_app(self, container, comando):
-        self.execs.append((container, comando)); return self._saida
+    def exec_app(self, container, comando, timeout=None):
+        self.execs.append((container, comando, timeout)); return self._saida
 
 
 def test_loop_dispara_reconcile_no_primeiro_ciclo_e_respeita_janela():
@@ -134,7 +171,8 @@ def test_loop_dispara_reconcile_no_primeiro_ciclo_e_respeita_janela():
     proj = _proj(servicos=("conhecimentoinfinito",))
     estado = {}
     ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado)
-    assert len(a.execs) == 1 and a.execs[0][1] == "python -m conhecimento.reconcile"
+    assert len(a.execs) == 1 and a.execs[0][1] == _CMD_RECONCILE
+    assert a.execs[0][2] == RECONCILE_TIMEOUT_S        # loop tambem dispara com o teto generoso
     assert any("reconcile" in x.descricao for x in v.avisos)
     # 2o ciclo logo em seguida: janela nao venceu -> NAO dispara de novo.
     ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado)

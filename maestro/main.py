@@ -17,8 +17,13 @@ from maestro.telegram_api import TelegramClient
 def main():  # pragma: no cover
     cfg = carregar()
 
-    def run_cmd(comando: str) -> str:
-        return subprocess.run(["sh", "-c", comando], capture_output=True, text=True, timeout=120).stdout
+    def run_cmd(comando: str, timeout=None) -> str:
+        # timeout POR-COMANDO: health checks (docker ps/df/logs/restart) usam o
+        # default curto (120s); o reconcile passa um teto generoso (RECONCILE_TIMEOUT_S)
+        # porque embeda lote novo no Voyage e enumera ~485 paginas do Notion, o que
+        # estoura 120s num curso recem-capturado. None -> 120 (retrocompativel).
+        return subprocess.run(["sh", "-c", comando], capture_output=True, text=True,
+                              timeout=timeout or 120).stdout
 
     http = httpx.Client(timeout=60, headers={"Authorization": f"Bearer {cfg.easypanel_token}"})
 

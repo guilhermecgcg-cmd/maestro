@@ -83,18 +83,22 @@ class Acesso:
             return []
         return [ln for ln in linhas[:-1] if ln.strip()]
 
-    def exec_app(self, container_match: str, comando: str) -> str:
+    def exec_app(self, container_match: str, comando: str, timeout=None) -> str:
         """Roda um comando ARBITRARIO dentro de um container de APP (nao-psql) via
         `docker exec`, descobrindo o container pelo socket (`docker ps`). Captura
         stdout+stderr (2>&1) para o chamador confirmar sucesso/erro pela saida.
         LEVANTA se o container nao existe -- silencio nao pode virar falso 'ok'
         (mesma disciplina do exec_sql). `comando` e CODIGO-controlado (literal fixo
-        no adaptador), nunca entrada de usuario -- por isso vai cru (com args)."""
+        no adaptador), nunca entrada de usuario -- por isso vai cru (com args).
+
+        `timeout` (segundos) e REPASSADO ao seam run_cmd: comandos longos (reconcile
+        que embeda lote no Voyage) precisam de teto generoso, senao o subprocess.run
+        do main.py estoura no default de 120s. None -> mantem o default do seam."""
         q = shlex.quote
         cmd = (f'CID=$(docker ps -qf name={q(container_match)} | head -1); '
                f'if [ -z "$CID" ]; then echo __EXEC_FAIL__no_container; '
                f'else docker exec -i "$CID" {comando} 2>&1; fi')
-        saida = self._run_cmd(cmd) or ""
+        saida = self._run_cmd(cmd, timeout=timeout) or ""
         if "__EXEC_FAIL__no_container" in saida:
             raise RuntimeError(f"exec_app: container {container_match!r} nao encontrado")
         return saida

@@ -17,6 +17,17 @@ TETO_JOB_S = 4 * 3600.0
 # aula nova em ~<=30min sem martelar o tier.
 INTERVALO_RECONCILE_S = 30 * 60.0
 
+# Teto de tempo do docker exec do reconcile. O default de 120s do run_cmd estoura
+# num curso recem-capturado: o reconcile enumera ~485 paginas do Notion e embeda o
+# lote NOVO no Voyage (API paga), o que passa MUITO de 2 min -> TimeoutExpired ->
+# escala "reconcile FALHOU" a cada janela e o lote nunca fecha. 15 min (900s) e o
+# equilibrio: (1) generoso o bastante pra um lote real de embeddings terminar;
+# (2) MENOR que INTERVALO_RECONCILE_S (1800s) -- um reconcile lento nao pode
+# transbordar pra dentro da proxima janela; (3) reconciliar roda SINCRONO no loop
+# de saude, entao um reconcile longo CONGELA os health checks pela sua duracao --
+# 15 min limita esse congelamento (metade da janela), sem sufocar um lote legitimo.
+RECONCILE_TIMEOUT_S = 15 * 60.0
+
 _SQL_FILA = (
     "SELECT id, status, extract(epoch from claimed_at), "
     "replace(replace(replace(coalesce(error,''),chr(10),' '),chr(13),' '),'|','/') "
@@ -129,7 +140,8 @@ def reconciliar(projeto, acesso, *, agora: float, ultimo: float):
     if agora - ultimo < INTERVALO_RECONCILE_S:
         return None, ultimo                      # janela ainda nao venceu
     try:
-        saida = acesso.exec_app(alvo, "uv run --directory /app python -m conhecimento.reconcile")
+        saida = acesso.exec_app(alvo, "uv run --directory /app python -m conhecimento.reconcile",
+                                timeout=RECONCILE_TIMEOUT_S)
     except Exception as e:
         return Acao("", False, True,
                     f"[{projeto.nome}] reconcile Notion->busca FALHOU: {str(e)[:160]}"), agora

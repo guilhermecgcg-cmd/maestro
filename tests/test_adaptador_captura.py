@@ -19,6 +19,7 @@ import re
 import pytest
 
 from maestro.adaptadores import captura
+from maestro.adaptadores import conhecimento
 from maestro.registro import Projeto
 
 
@@ -118,8 +119,8 @@ class FakeAcesso:
         pend = sum(1 for s in self._aulas if s.lower() not in terminais)
         return [f"{total}|{pend}"]
 
-    def exec_app(self, container, comando):
-        self.execs.append((container, comando))
+    def exec_app(self, container, comando, timeout=None):
+        self.execs.append((container, comando, timeout))
         if self._boom_app:
             raise RuntimeError("docker off")
         return self._reconcile
@@ -410,7 +411,8 @@ def test_curso_completo_dispara_autoingest_via_reconciliar():
                              curso_url=URL, estado=estado, agora=AGORA)
     assert acao.executada and not acao.escalar
     assert ac.execs == [("conhecimentoinfinito_conhecimentoinfinito",
-                         "python -m conhecimento.reconcile")]
+                         "uv run --directory /app python -m conhecimento.reconcile",
+                         conhecimento.RECONCILE_TIMEOUT_S)]
     assert estado["fase"] == captura.FASE_CONCLUIDO
     assert any("reconcile" in a.descricao for a in voz.avisos)
 
@@ -497,7 +499,7 @@ def test_protocolo_completo_novo_ate_concluido():
     a4 = captura.coordenar(_proj(), ac4, voz, executor=ex, curso_url=URL,
                            estado=estado, agora=AGORA)
     assert a4.executada and estado["fase"] == captura.FASE_CONCLUIDO
-    assert ac4.execs and ac4.execs[0][1] == "python -m conhecimento.reconcile"
+    assert ac4.execs and ac4.execs[0][1] == "uv run --directory /app python -m conhecimento.reconcile"
 
 
 # ==========================================================================

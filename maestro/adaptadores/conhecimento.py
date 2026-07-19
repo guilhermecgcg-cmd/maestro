@@ -129,7 +129,7 @@ def reconciliar(projeto, acesso, *, agora: float, ultimo: float):
     if agora - ultimo < INTERVALO_RECONCILE_S:
         return None, ultimo                      # janela ainda nao venceu
     try:
-        saida = acesso.exec_app(alvo, "python -m conhecimento.reconcile")
+        saida = acesso.exec_app(alvo, "uv run --directory /app python -m conhecimento.reconcile")
     except Exception as e:
         return Acao("", False, True,
                     f"[{projeto.nome}] reconcile Notion->busca FALHOU: {str(e)[:160]}"), agora

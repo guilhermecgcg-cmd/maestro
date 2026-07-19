@@ -31,9 +31,11 @@ def _resolver(p, acesso, proj, llm):
     return acao
 
 
-def ciclo(acesso, voz, projetos, *, llm) -> list:
+def ciclo(acesso, voz, projetos, *, llm, estado=None) -> list:
     todas = acesso.servicos()
     acoes = []
+    if estado is None:
+        estado = {}
     for proj in projetos:
         servs = {n: s for n, s in todas.items() if n in proj.servicos}
         snap = {"servicos": servs, "saude": acesso.saude_http(proj.saude),
@@ -55,15 +57,31 @@ def ciclo(acesso, voz, projetos, *, llm) -> list:
             elif acao.escalar:
                 voz.escalar(p, acao.pedido)
             acoes.append(acao)
+
+        # ROTINA periodica (nao e "problema"): PONTE AUTO-INGEST Notion->pgvector.
+        # So projetos gerenciados e com o adaptador conhecimento; o proprio
+        # reconciliar decide se a janela venceu (estado por projeto entre ciclos).
+        if proj.gerenciar and proj.adaptador == "conhecimento":
+            from maestro.adaptadores import conhecimento
+            acao, estado[proj.nome] = conhecimento.reconciliar(
+                proj, acesso, agora=snap["agora"], ultimo=estado.get(proj.nome, 0.0))
+            if acao is not None:
+                if acao.executada:
+                    voz.avisar_acao(acao)
+                elif acao.escalar:
+                    voz.escalar(sentinela.Problema("reconcile", proj.nome, acao.pedido, "aviso"),
+                                acao.pedido)
+                acoes.append(acao)
     return acoes
 
 
 async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=120.0, max_iters=None):
     i = 0
+    estado = {}
     while max_iters is None or i < max_iters:
         i += 1
         try:
-            ciclo(acesso, voz, projetos, llm=llm)
+            ciclo(acesso, voz, projetos, llm=llm, estado=estado)
         except Exception:
             pass
         await sleep(intervalo_s)

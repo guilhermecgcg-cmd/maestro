@@ -83,6 +83,22 @@ class Acesso:
             return []
         return [ln for ln in linhas[:-1] if ln.strip()]
 
+    def exec_app(self, container_match: str, comando: str) -> str:
+        """Roda um comando ARBITRARIO dentro de um container de APP (nao-psql) via
+        `docker exec`, descobrindo o container pelo socket (`docker ps`). Captura
+        stdout+stderr (2>&1) para o chamador confirmar sucesso/erro pela saida.
+        LEVANTA se o container nao existe -- silencio nao pode virar falso 'ok'
+        (mesma disciplina do exec_sql). `comando` e CODIGO-controlado (literal fixo
+        no adaptador), nunca entrada de usuario -- por isso vai cru (com args)."""
+        q = shlex.quote
+        cmd = (f'CID=$(docker ps -qf name={q(container_match)} | head -1); '
+               f'if [ -z "$CID" ]; then echo __EXEC_FAIL__no_container; '
+               f'else docker exec -i "$CID" {comando} 2>&1; fi')
+        saida = self._run_cmd(cmd) or ""
+        if "__EXEC_FAIL__no_container" in saida:
+            raise RuntimeError(f"exec_app: container {container_match!r} nao encontrado")
+        return saida
+
     def saude_http(self, alvos: dict) -> dict:
         out = {}
         for nome, url in alvos.items():

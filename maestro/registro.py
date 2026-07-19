@@ -17,6 +17,7 @@ class Projeto:
     db_container: str = ""       # container Postgres do projeto (match p/ docker ps)
     db_name: str = ""            # nome do banco dentro do container
     db_user: str = "postgres"    # usuário local (trust no socket do container)
+    app_container: str = ""      # container do APP p/ `docker exec` de rotinas (ex.: reconcile)
     gerenciar: bool = False      # False = só monitora/avisa; True = pode agir (opt-in)
 
 
@@ -31,6 +32,7 @@ def carregar(path: str) -> list:
                            db_container=d.get("db_container", ""),
                            db_name=d.get("db_name", ""),
                            db_user=d.get("db_user", "postgres"),
+                           app_container=d.get("app_container", ""),
                            gerenciar=d.get("gerenciar", True)))  # configurado = gerenciado
     return out
 

@@ -11,6 +11,12 @@ from maestro.playbook import Acao
 
 TETO_JOB_S = 4 * 3600.0
 
+# Cadencia da PONTE AUTO-INGEST (reconcile Notion->pgvector). O loop do Maestro
+# roda a cada ~120s, mas reconcile embeda no Voyage (custa $) e enumera o Notion
+# (rate limit) -- entao roda ESPACADO, so quando a janela vence. 30 min: pega
+# aula nova em ~<=30min sem martelar o tier.
+INTERVALO_RECONCILE_S = 30 * 60.0
+
 _SQL_FILA = (
     "SELECT id, status, extract(epoch from claimed_at), "
     "replace(replace(replace(coalesce(error,''),chr(10),' '),chr(13),' '),'|','/') "
@@ -107,3 +113,29 @@ def resolver(problema, acesso, projeto) -> Acao:
         # só re-queima a conta contra o mesmo gate (IP datacenter/anti-ban). ESCALA.
         return Acao("", False, True, f"[{projeto.nome}] {problema.detalhe}")
     return Acao("", False, True, f"[{projeto.nome}] {problema.tipo}")
+
+
+def reconciliar(projeto, acesso, *, agora: float, ultimo: float):
+    """PONTE AUTO-INGEST: dispara o reconcile Notion->pgvector na VPS via
+    `docker exec` no container do servico de busca. Devolve (Acao|None, novo_ultimo).
+
+    PERIODICO: so age quando passou INTERVALO_RECONCILE_S desde `ultimo` -- nos
+    ciclos intermediarios devolve (None, ultimo), sem tocar o container (barato).
+    HONESTO: se o exec falha ou a saida nao traz a sentinela RECONCILE_OK, ESCALA
+    em vez de fingir sucesso (mesma disciplina do exec_sql do adaptador)."""
+    alvo = getattr(projeto, "app_container", "")
+    if not alvo:
+        return None, ultimo                      # projeto sem container de app: nao ha o que disparar
+    if agora - ultimo < INTERVALO_RECONCILE_S:
+        return None, ultimo                      # janela ainda nao venceu
+    try:
+        saida = acesso.exec_app(alvo, "python -m conhecimento.reconcile")
+    except Exception as e:
+        return Acao("", False, True,
+                    f"[{projeto.nome}] reconcile Notion->busca FALHOU: {str(e)[:160]}"), agora
+    if "RECONCILE_OK" not in (saida or ""):
+        return Acao("", False, True,
+                    f"[{projeto.nome}] reconcile SEM confirmacao (RECONCILE_OK ausente): "
+                    f"{(saida or '')[-160:]!r}"), agora
+    linha = next((l for l in saida.splitlines() if "RECONCILE_OK" in l), (saida or "").strip())
+    return Acao(f"[{projeto.nome}] reconcile Notion->busca: {linha.strip()}", True, False), agora

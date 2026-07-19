@@ -7,6 +7,11 @@
   db_container: conhecimentoinfinito_db
   db_name: conhecimento
   db_user: postgres
+  # container do serviço de busca (tem o pacote `conhecimento`): o Maestro dispara
+  # `python -m conhecimento.reconcile` aqui via docker exec. VERIFICAR o nome exato
+  # do container antes de ativar (padrão Easypanel: <projeto>_<serviço>) e garantir
+  # NOTION_TOKEN + NOTION_DB_LESSONS_ID no ambiente DESTE serviço.
+  app_container: conhecimentoinfinito_conhecimentoinfinito
   gerenciar: true
   # health por socket (docker ps) cobre serviço caído; saude HTTP interna é opcional
   # e não confiável cross-project, então fica vazia (o núcleo usa servicos()).

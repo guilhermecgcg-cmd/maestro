@@ -12,7 +12,7 @@ from maestro.cerebro import diagnosticar
 
 def _resolver(p, acesso, proj, llm):
     # problemas específicos do projeto -> adaptador
-    if p.tipo in ("job_travado", "job_falhou", "claim_orfao", "conhecimento_db_inacessivel"):
+    if p.tipo in ("job_travado", "job_falhou", "claim_orfao", "conhecimento_db_inacessivel", "captura_vazia"):
         if proj.adaptador == "conhecimento":
             from maestro.adaptadores import conhecimento
             return conhecimento.resolver(p, acesso, proj)

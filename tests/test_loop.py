@@ -54,3 +54,20 @@ def test_projeto_monitorado_so_avisa_nao_age():
     ciclo(a, v, [_proj(gerenciar=False)], llm=lambda p: "{}")
     assert a.restarts == [] and a.redeploys == []   # NÃO agiu
     assert v.escaladas                              # só avisou
+
+
+def test_captura_vazia_do_adaptador_escala_sem_agir():
+    # o loop precisa ROTEAR 'captura_vazia' pro adaptador conhecimento (senão cai
+    # no playbook genérico como 'não-mapeado'); o adaptador escala sem agir.
+    from maestro.playbook import Acao
+    class _AcessoAd(_Acesso):
+        def exec_sql(self, container, sql, *, db, user="postgres", rows=True):
+            if "estado_aulas" in sql:
+                return ["1978824|3|0"]
+            return []
+    a = _AcessoAd({"worker": Servico("worker", up=True, restarting=False)}); v = _Voz()
+    proj = _proj(servicos=("worker",), adaptador="conhecimento",
+                 db_container="cp_db", db_name="conhecimento")
+    ciclo(a, v, [proj], llm=lambda p: "{}")
+    assert a.restarts == [] and a.redeploys == []          # NÃO agiu sozinho
+    assert any("falso-sucesso" in e for e in v.escaladas)  # escalou claro

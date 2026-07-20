@@ -5,8 +5,9 @@ doente -> Cérebro; problemas de adaptador -> adaptador) e reporta (Voz). Genér
 testável com dublês."""
 import asyncio
 import time
+from types import SimpleNamespace
 
-from maestro import sentinela, playbook, observador
+from maestro import sentinela, playbook, observador, orquestrador
 from maestro.cerebro import diagnosticar
 
 
@@ -31,11 +32,19 @@ def _resolver(p, acesso, proj, llm):
     return acao
 
 
-def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None) -> list:
+def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None, voo=None,
+          orquestrar_cursos=False) -> list:
     todas = acesso.servicos()
     acoes = []
     if estado is None:
         estado = {}
+    # `voo` = estado cross-ciclo da Camada 2 (passadas "em voo"). O CHAMADOR (run)
+    # o cria UMA vez e o REINJETA a cada ciclo — sem isso a confirmação cross-ciclo
+    # de um curso nunca acontece (contrato do orquestrador). Um `voo` local aqui
+    # (quando o chamador não injeta) NÃO persiste entre ciclos: só serve p/ um ciclo
+    # avulso não quebrar. `run` sempre injeta o mesmo dict.
+    if voo is None:
+        voo = {}
 
     # SONDA ÚNICA POR CICLO (dedup): /health e df/free são idempotentes mas custam
     # rede/IO na VPS. Sondá-los UMA vez e REUSAR mata a sondagem dupla que existia
@@ -122,25 +131,98 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None) -> list:
             prog_notion_fn = (
                 (lambda u: captura.progresso_curso_no_notion(acesso, alvo_app, u))
                 if alvo_app else None)
-            for curso_url in proj.cursos_desejados:
-                st = cap_estado.setdefault(curso_url, {})
-                acao = captura.coordenar(proj, acesso, voz, executor=executor,
-                                         curso_url=curso_url, estado=st, agora=snap["agora"],
-                                         progresso_notion_fn=prog_notion_fn)
-                if acao is not None:
-                    acoes.append(acao)
+            if orquestrar_cursos and alvo_app:
+                # CAMADA 2 (o CÉREBRO) sobre os cursos: lê o estado OBSERVADO (progresso
+                # REAL no Notion NESTE ciclo) + o ESPERADO (enumeração) e roda o feedback
+                # loop cross-ciclo com o `voo` REINJETADO. É AQUI que uma passada fica "em
+                # voo" e só confirma/escala em ciclos POSTERIORES. `estado.progresso`
+                # reflete o Notion lido agora (nunca flag). DESLIGADO por default: quando
+                # ligado, ELE (não o coordenar) é o dono do disparo dos cursos — ver a
+                # pendência de design registrada no relatório (coordenar ainda detém
+                # anti-dup por completude + checagem de sessão + auto-ingest).
+                acoes.extend(_orquestrar_cursos(
+                    proj, acesso, voz, executor, prog_notion_fn,
+                    agora=snap["agora"], voo=voo))
+            else:
+                for curso_url in proj.cursos_desejados:
+                    st = cap_estado.setdefault(curso_url, {})
+                    acao = captura.coordenar(proj, acesso, voz, executor=executor,
+                                             curso_url=curso_url, estado=st, agora=snap["agora"],
+                                             progresso_notion_fn=prog_notion_fn)
+                    if acao is not None:
+                        acoes.append(acao)
     return acoes
 
 
+# formas do estado OBSERVADO que o orquestrador (Camada 2) consome. Espelham
+# observador.ServicoObservado/ProgressoCurso no que o orquestrador de fato lê.
+def _prog_obs(curso, done, total):
+    return SimpleNamespace(curso=curso, done=int(done), total=int(total))
+
+
+def _orquestrar_cursos(proj, acesso, voz, executor, prog_notion_fn, *, agora, voo):
+    """Monta o snapshot OBSERVADO por-curso (done = contagem REAL no Notion; total =
+    enumeração esperada) e roda `orquestrador.orquestrar` com o `voo` reinjetado.
+    Curso cujo Notion/enumeração não dá para ler NESTE ciclo é PULADO (não vira
+    divergência às cegas). Devolve os Resultados (o `run` os ignora; testes os leem)."""
+    from maestro.adaptadores import captura
+    progresso, esperado_cursos = [], {}
+    for curso_url in proj.cursos_desejados:
+        try:
+            no_notion = prog_notion_fn(curso_url).no_notion
+        except Exception:
+            continue                      # não lê o Notion agora -> não diagnostica às cegas
+        total = captura._total_esperado(proj, acesso, curso_url, None)
+        progresso.append(_prog_obs(curso_url, no_notion, total))
+        esperado_cursos[curso_url] = total
+    est_obs = SimpleNamespace(servicos=(), progresso=tuple(progresso))
+    acoes_ath = orquestrador.AcoesAthena(acesso, proj, executor=executor)
+    # verificar só é consultado p/ serviços (efeito imediato); aqui só há cursos
+    # (assíncronos, confirmados via `voo`), então nunca é chamado.
+    return orquestrador.orquestrar(est_obs, {"cursos": esperado_cursos}, acoes_ath,
+                                   lambda div: False, voz, agora=agora, voo=voo)
+
+
 async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=120.0,
-              max_iters=None, db=None):
+              max_iters=None, db=None, orquestrar_cursos=False):
     i = 0
     estado = {}
+    # `voo` (Camada 2): criado UMA vez e REINJETADO a cada ciclo. É o store cross-ciclo
+    # onde as passadas ficam "em voo" — sem reinjetar o MESMO dict, a confirmação de um
+    # curso (que só chega em ciclos posteriores) nunca aconteceria.
+    voo = {}
     while max_iters is None or i < max_iters:
         i += 1
         try:
-            ciclo(acesso, voz, projetos, llm=llm, estado=estado, db=db)
+            ciclo(acesso, voz, projetos, llm=llm, estado=estado, db=db, voo=voo,
+                  orquestrar_cursos=orquestrar_cursos)
         except Exception:
             pass
         await sleep(intervalo_s)
     return i
+
+
+async def servir(acesso, voz, projetos, *, llm, athena=None, db=None,
+                 orquestrar_cursos=False, intervalo_s=120.0, max_iters=None,
+                 sleep_saude=asyncio.sleep, athena_intervalo=25, athena_max_iters=None,
+                 offset_load=None, offset_save=None):
+    """Entrelaça a Camada 1+2 (loop de saúde/orquestração) com a Camada 3 (listener
+    de comandos da Athena no Telegram) como tarefas CONCORRENTES. O listener é
+    SÍNCRONO e bloqueante (long-poll), então roda numa thread (`asyncio.to_thread`)
+    em paralelo ao loop de saúde — um não trava o outro.
+
+    A Athena NUNCA comanda a infra sem whitelist: `athena` já vem com `autorizados`
+    plumbados (fail-closed) e o offset do Telegram PERSISTIDO via offset_load/save
+    (sem isso, um restart reprocessaria comandos antigos). Sem `athena`, roda só o
+    loop de saúde (retrocompatível)."""
+    tarefas = [run(acesso, voz, projetos, llm=llm, sleep=sleep_saude,
+                   intervalo_s=intervalo_s, max_iters=max_iters, db=db,
+                   orquestrar_cursos=orquestrar_cursos)]
+    if athena is not None:
+        kw = {"intervalo": athena_intervalo, "max_iters": athena_max_iters}
+        if offset_load is not None:
+            kw["offset_load"] = offset_load
+        if offset_save is not None:
+            kw["offset_save"] = offset_save
+        tarefas.append(asyncio.to_thread(athena.rodar, **kw))
+    await asyncio.gather(*tarefas)

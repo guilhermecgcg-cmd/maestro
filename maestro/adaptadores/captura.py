@@ -424,10 +424,13 @@ def _pid_vivo(pid) -> bool:
     return True
 
 
-# Diretório de locks DURÁVEIS padrão: um caminho ESTÁVEL entre reinicializações (mesmo
-# tempdir do SO), para que o guard anti-ban sobreviva a um restart/crash do loop. NÃO é
-# um dir efêmero por-processo de propósito — a durabilidade É o ponto (ver LocalExecutor).
-_LOCK_DIR_PADRAO = os.path.join(tempfile.gettempdir(), "athena-local-locks")
+# Diretório de locks DURÁVEIS padrão. A verdade do guard anti-ban vive AQUI e tem de
+# sobreviver não só a um restart/crash do loop, mas a um REBOOT do Mac — por isso mora no
+# HOME, NÃO no tempdir do SO. Em macOS `tempfile.gettempdir()` devolve /var/folders/.../T
+# (e /tmp), ambos VARRIDOS no reboot: um lock ali seria apagado e um curso ainda em
+# captura (ou re-semeado) poderia ser re-disparado na mesma conta = ban. O HOME persiste.
+# (Env ATHENA_LOCK_DIR sobrepõe; ver LocalExecutor / athena_local.main.)
+_LOCK_DIR_PADRAO = os.path.join(os.path.expanduser("~"), ".athena-local", "locks")
 
 
 class LocalExecutor:
@@ -502,6 +505,16 @@ class LocalExecutor:
             # lock corrompido/ilegível: trata como obsoleto (não pode travar para sempre).
             self._remover_lock(path)
             return None
+        if data.get("pid") is None:
+            # LOCK DE INTENÇÃO (gravado ANTES do spawn, ver `disparar`): FAIL-CLOSED. Ou o
+            # spawn está acontecendo AGORA (mesma encarnação, síncrono), ou um crash caiu na
+            # janela intenção->PID e deixou uma captura ÓRFÃ cujo PID não conhecemos. Nos
+            # dois casos a conta está OCUPADA — tratar como livre re-dispararia (2 browsers
+            # na mesma conta = ban). Sem PID a sondar, NÃO consultamos `_pid_vivo`. Este é o
+            # exato ponto que fecha o TOCTOU; o preço é anti-ban > disponibilidade (um lock
+            # de intenção de um crash cuja captura também morreu só libera por ação humana —
+            # a completude-por-Notion ou o disjuntor/stall do owner escalam esse curso).
+            return data
         if not self._pid_vivo(data.get("pid")):
             self._remover_lock(path)              # PID morto -> lock obsoleto -> libera
             return None
@@ -510,7 +523,8 @@ class LocalExecutor:
     def _escrever_lock(self, conta, curso_url, pid):
         tmp = self._lock_path(conta) + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"pid": pid, "course_url": curso_url, "conta": str(conta)}, f)
+            json.dump({"pid": pid, "course_url": curso_url, "conta": str(conta),
+                       "ts": time.time()}, f)
         os.replace(tmp, self._lock_path(conta))   # troca atômica
 
     def _remover_lock(self, path):
@@ -573,10 +587,25 @@ class LocalExecutor:
                 f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
                 f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
         cmd, env = self._montar(meta)                      # fail-closed ANTES de qualquer spawn
-        proc = self._spawn(cmd, env=env, cwd=self._motor_dir)
+        # TOCTOU (fix do achado MÉDIO): grava o lock de INTENÇÃO (pid=None) ANTES do spawn.
+        # Se o loop crashar na janela sub-ms entre o spawn e a escrita do PID, a captura
+        # órfã (start_new_session) segue viva SEM que seu PID tenha sido registrado — mas o
+        # lock de intenção JÁ está em disco e (via `_ler_lock` pid=None fail-closed) mantém
+        # a conta OCUPADA no restart, de modo que NADA re-dispara. Gravar o lock só DEPOIS
+        # do spawn (o bug) deixaria essa janela sem lock -> re-disparo -> ban + captura dupla.
+        self._escrever_lock(meta.conta, curso_url, None)
+        try:
+            proc = self._spawn(cmd, env=env, cwd=self._motor_dir)
+        except Exception:
+            # o spawn FALHOU: a intenção não virou captura. Remove o lock de intenção para
+            # não travar a conta para sempre por um disparo que nunca aconteceu (o processo
+            # não existe; manter o lock seria uma conta ocupada por nada).
+            self._remover_lock(self._lock_path(meta.conta))
+            raise
         self._procs[curso_url] = proc
-        # grava o lock durável com o PID do processo de captura — é o que um executor
-        # nascido pós-restart lerá para NÃO re-disparar esta mesma captura.
+        # PROMOVE o lock de intenção a lock DEFINITIVO, com o PID real do processo de
+        # captura — é o que um executor nascido pós-restart lerá (via `_pid_vivo`) para
+        # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
         return f"local_iniciada:{curso_url}"
 

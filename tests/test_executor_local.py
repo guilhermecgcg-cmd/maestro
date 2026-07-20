@@ -9,6 +9,8 @@ MundoProc modela a TABELA DE PROCESSOS DO SO — quais PIDs estão vivos AGORA �
 `pid_vivo` (o `os.kill(pid, 0)` do executor) consulta. É COMPARTILHÁVEL entre encarnações
 do LocalExecutor: é isso que dá DENTES ao teste de RESTART (um executor novo, com o
 processo antigo AINDA vivo na tabela, lê o lock DURÁVEL em disco e NÃO re-dispara)."""
+import glob
+import json
 import os
 import tempfile
 
@@ -310,3 +312,89 @@ def test_restart_curso_ativo_e_conta_ocupada_leem_o_lock_duravel(tmp_path):
     # o executor NOVO enxerga o estado durável, não seu _procs vazio.
     assert ex2.curso_ativo(C1) is True
     assert ex2.conta_ocupada("conta-A") is True
+
+
+# ==========================================================================
+# TOCTOU (achado MÉDIO): o lock tem de ser gravado ANTES do spawn (lock de
+# INTENÇÃO, pid=None), não DEPOIS. Um crash na janela sub-ms entre spawn e a
+# escrita do lock deixaria uma captura ÓRFÃ (start_new_session) sem lock em
+# disco -> restart releria o Notion parcial, veria a conta livre e re-dispararia
+# = 2 browsers na mesma conta = ban + captura dupla.
+# ==========================================================================
+def test_disparar_grava_lock_de_intencao_ANTES_do_spawn(tmp_path):
+    lock = str(tmp_path)
+    visto = {}
+
+    def spawn_que_espia(cmd, *, env, cwd):
+        # No MOMENTO do spawn, o lock de INTENÇÃO já tem de existir em disco: é isso
+        # que fecha o TOCTOU. Se o lock só fosse gravado DEPOIS (o bug), aqui não
+        # haveria arquivo nenhum.
+        arqs = glob.glob(os.path.join(lock, "*.lock"))
+        visto["arqs_no_spawn"] = list(arqs)
+        if arqs:
+            with open(arqs[0]) as f:
+                visto["conteudo_no_spawn"] = json.load(f)
+        return FakeProc()
+
+    ex = captura.LocalExecutor([_hot(C1, "conta-A")], motor_python=PY, motor_dir=DIR,
+                               spawn=spawn_que_espia, lock_dir=lock,
+                               pid_vivo=lambda p: True)
+    ex.disparar(C1)
+    # DENTES: sem o lock de intenção ANTES do spawn, `arqs_no_spawn` estaria vazio.
+    assert visto["arqs_no_spawn"], "lock de INTENÇÃO tem de existir em disco ANTES do spawn"
+    assert visto["conteudo_no_spawn"]["pid"] is None       # é INTENÇÃO (pid ainda desconhecido)
+    assert visto["conteudo_no_spawn"]["course_url"] == C1
+    # e APÓS o spawn o mesmo lock foi atualizado com o PID real do processo de captura.
+    with open(visto["arqs_no_spawn"][0]) as f:
+        final = json.load(f)
+    assert final["pid"] is not None and final["course_url"] == C1
+
+
+def test_restart_apos_crash_na_janela_do_toctou_NAO_redispara(tmp_path):
+    # Modela o ARTEFATO que um crash na janela intenção->pid deixa em disco: um lock de
+    # INTENÇÃO órfão (pid=None). A captura órfã (start_new_session) segue viva, mas seu
+    # PID não chegou a ser gravado. O restart NÃO pode re-disparar essa conta.
+    lock = str(tmp_path)
+    semente = _exec(_hot(C1, "conta-A"), _hot(C2, "conta-A"), lock_dir=lock)
+    semente._escrever_lock("conta-A", C1, None)            # lock de INTENÇÃO órfão (crash)
+
+    # RESTART: novo executor. pid_vivo=False p/ TUDO -> prova que o lock de intenção
+    # (pid=None) é fail-closed SEM depender de sondar PID nenhum (não há PID a sondar).
+    sp2 = FakeSpawn()
+    ex2 = _exec(_hot(C1, "conta-A"), _hot(C2, "conta-A"), spawn=sp2, lock_dir=lock,
+                pid_vivo=lambda p: False)
+    with pytest.raises(captura.ContaOcupada):              # DENTES: anti-ban durável no TOCTOU
+        ex2.disparar(C2)                                  # 2º curso na conta ocupada
+    assert len(sp2.calls) == 0
+    assert ex2.disparar(C1) == f"ja_capturando:{C1}"      # idempotente p/ o MESMO curso
+    assert len(sp2.calls) == 0                             # nenhum 2º browser aberto
+
+
+def test_spawn_falho_remove_o_lock_de_intencao(tmp_path):
+    # Se o spawn FALHA, a intenção não virou captura -> o lock de intenção tem de ser
+    # removido, senão a conta ficaria travada para sempre por um disparo que nunca houve.
+    lock = str(tmp_path)
+
+    def spawn_quebrado(cmd, *, env, cwd):
+        raise OSError("spawn falhou")
+
+    ex = captura.LocalExecutor([_hot(C1, "conta-A")], motor_python=PY, motor_dir=DIR,
+                               spawn=spawn_quebrado, lock_dir=lock, pid_vivo=lambda p: True)
+    with pytest.raises(OSError):
+        ex.disparar(C1)
+    assert ex.conta_ocupada("conta-A") is False           # DENTES: conta NÃO travada
+    # e um novo disparo (spawn bom) tem de conseguir rodar de fato.
+    sp_ok = FakeSpawn()
+    ex2 = _exec(_hot(C1, "conta-A"), spawn=sp_ok, lock_dir=lock, pid_vivo=sp_ok.mundo.vivo)
+    assert ex2.disparar(C1) == f"local_iniciada:{C1}"
+    assert len(sp_ok.calls) == 1
+
+
+# ==========================================================================
+# achado BAIXO: o lock_dir PADRÃO tem de ser DURÁVEL (sobrevive a um REBOOT). O
+# tempdir do macOS (/tmp, $TMPDIR em /var/folders) some no reboot -> o guard
+# anti-ban perderia a verdade. O default tem de morar no HOME.
+# ==========================================================================
+def test_lock_dir_padrao_e_duravel_nao_no_tempdir():
+    assert tempfile.gettempdir() not in captura._LOCK_DIR_PADRAO
+    assert captura._LOCK_DIR_PADRAO.startswith(os.path.expanduser("~"))

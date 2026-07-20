@@ -207,9 +207,15 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     """O LOOP doméstico. Cria o `voo` (store cross-ciclo do owner) e o `estado`
     (máquina por-curso) UMA vez e os REINJETA a cada ciclo — sem isso a confirmação/
     stall (que são cross-ciclo) nunca fechariam. Um ciclo que estoura não derruba o
-    loop (o owner já é fail-closed por-curso; isto é o cinto extra)."""
+    loop (o owner já é fail-closed por-curso; isto é o cinto extra) — MAS a falha NÃO é
+    engolida em silêncio: ela é ESCALADA via voz (I-1 escala honesta). Sem isso, uma
+    falha SISTEMÁTICA (ex.: dependência quebrada) viraria um no-op silencioso — o loop
+    'rodando' sem capturar nada e ninguém sabendo. Latch por assinatura de erro: escala
+    UMA vez por episódio e re-arma quando um ciclo volta a passar (não inunda o Telegram
+    a cada `intervalo_s`, mas nunca mascara uma falha nova ou persistente sem avisar)."""
     estado = {}
     voo = {}
+    ultimo_erro = None
     i = 0
     while max_iters is None or i < max_iters:
         i += 1
@@ -217,8 +223,18 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
             ciclo_local(cursos, executor, progresso_fn, voz, voo, estado,
                         agora=time.time(), plataformas_suportadas=plataformas_suportadas,
                         max_tentativas=max_tentativas, projeto_nome=projeto_nome)
-        except Exception:
-            pass
+            ultimo_erro = None                             # ciclo passou: re-arma o latch
+        except Exception as e:
+            assinatura = f"{type(e).__name__}:{str(e)[:120]}"
+            if assinatura != ultimo_erro:                  # episódio novo -> escala honesto
+                pedido = (f"[{projeto_nome}] o CICLO doméstico ESTOUROU (não derrubo o "
+                          f"loop, mas NÃO capturo nada até resolver): {assinatura}")
+                try:
+                    voz.escalar(Problema("ciclo_local_estourou", projeto_nome, pedido,
+                                         "critico"), pedido)
+                except Exception:
+                    pass                                   # a voz falhar não pode matar o loop
+                ultimo_erro = assinatura
         await sleep(intervalo_s)
     return i
 
@@ -293,7 +309,11 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     cursos_path = os.environ["ATHENA_LOCAL_CURSOS"]        # YAML dos cursos desejados
     cursos = carregar_cursos(cursos_path)
 
-    executor = captura.LocalExecutor(cursos, motor_python=motor_python, motor_dir=motor_dir)
+    # lock_dir DURÁVEL e ESTÁVEL entre restarts (o guard anti-ban depende disso — ver
+    # LocalExecutor). Env sobrepõe; o default do executor já é um caminho estável do SO.
+    lock_dir = os.getenv("ATHENA_LOCK_DIR") or None
+    executor = captura.LocalExecutor(cursos, motor_python=motor_python, motor_dir=motor_dir,
+                                     lock_dir=lock_dir)
     total_por_curso = {c.url: c.total_esperado for c in cursos}
     progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso)
 

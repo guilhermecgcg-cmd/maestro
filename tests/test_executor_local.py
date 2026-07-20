@@ -1,10 +1,16 @@
 """LocalExecutor — a Athena DOMÉSTICA chamando o MOTOR DIRETO no Mac (subprocesso).
 
 Dublês COM DENTES: FakeProc modela o CONTRATO real de Popen (`poll()` -> None enquanto
-vivo, código quando encerra) e FakeSpawn registra CADA comando/env/cwd — errar o
-módulo, o backend Whisper, a política headed/headless, o cwd, o anti-ban ou a
-idempotência FALHA um teste. Nada de subprocesso real."""
+vivo, código quando encerra; `pid` estável) e FakeSpawn registra CADA comando/env/cwd —
+errar o módulo, o backend Whisper, a política headed/headless, o cwd, o anti-ban ou a
+idempotência FALHA um teste. Nada de subprocesso real.
+
+MundoProc modela a TABELA DE PROCESSOS DO SO — quais PIDs estão vivos AGORA — e é o que
+`pid_vivo` (o `os.kill(pid, 0)` do executor) consulta. É COMPARTILHÁVEL entre encarnações
+do LocalExecutor: é isso que dá DENTES ao teste de RESTART (um executor novo, com o
+processo antigo AINDA vivo na tabela, lê o lock DURÁVEL em disco e NÃO re-dispara)."""
 import os
+import tempfile
 
 import pytest
 
@@ -18,9 +24,14 @@ DIR = "/opt/aula"
 
 
 class FakeProc:
-    """Modela um Popen: vivo (poll()->None) até `encerrar(code)`."""
+    """Modela um Popen: vivo (poll()->None) até `encerrar(code)`. `pid` único e estável —
+    é o que vai para o lockfile durável e o que `pid_vivo` sonda."""
+    _seq = 4000
+
     def __init__(self):
         self._code = None
+        FakeProc._seq += 1
+        self.pid = FakeProc._seq
 
     def poll(self):
         return self._code
@@ -29,12 +40,29 @@ class FakeProc:
         self._code = code
 
 
-class FakeSpawn:
+class MundoProc:
+    """Tabela de processos compartilhada entre encarnações do executor. `vivo(pid)` é o
+    dublê do `os.kill(pid, 0)`: True enquanto o processo daquele PID não encerrou."""
     def __init__(self):
+        self.procs = {}
+
+    def novo(self):
+        proc = FakeProc()
+        self.procs[proc.pid] = proc
+        return proc
+
+    def vivo(self, pid):
+        p = self.procs.get(pid)
+        return p is not None and p.poll() is None
+
+
+class FakeSpawn:
+    def __init__(self, mundo=None):
         self.calls = []
+        self.mundo = mundo or MundoProc()
 
     def __call__(self, cmd, *, env, cwd):
-        proc = FakeProc()
+        proc = self.mundo.novo()
         self.calls.append({"cmd": cmd, "env": env, "cwd": cwd, "proc": proc})
         return proc
 
@@ -43,9 +71,12 @@ class FakeSpawn:
         return [c["proc"] for c in self.calls]
 
 
-def _exec(*cursos, spawn=None, **kw):
+def _exec(*cursos, spawn=None, lock_dir=None, pid_vivo=None, **kw):
+    spawn = spawn or FakeSpawn()
     return captura.LocalExecutor(
-        cursos, motor_python=PY, motor_dir=DIR, spawn=spawn or FakeSpawn(), **kw)
+        cursos, motor_python=PY, motor_dir=DIR, spawn=spawn,
+        lock_dir=lock_dir or tempfile.mkdtemp(),
+        pid_vivo=pid_vivo or spawn.mundo.vivo, **kw)
 
 
 def _hot(url, conta="a"):
@@ -178,3 +209,104 @@ def test_groq_key_injetada_quando_fornecida():
     sp = FakeSpawn()
     _exec(_hot(C1), spawn=sp, groq_key="gsk-abc").disparar(C1)
     assert sp.calls[0]["env"]["GROQ_API_KEY"] == "gsk-abc"
+
+
+# ==========================================================================
+# INVIOLÁVEL (achado BAIXO): extra_env NUNCA clobbera os invioláveis (Groq/HEADLESS).
+# Os invioláveis são aplicados DEPOIS do extra_env -> vencem.
+# ==========================================================================
+def test_extra_env_nao_clobbera_os_invioaveis():
+    sp = FakeSpawn()
+    # extra_env HOSTIL: tenta forçar backend local e HEADLESS num curso hotmart.
+    _exec(_hot(C1), spawn=sp,
+          extra_env={"WHISPER_BACKEND": "local", "HEADLESS": "1", "X_QUALQUER": "ok"}
+          ).disparar(C1)
+    env = sp.calls[0]["env"]
+    # DENTES: se os invioláveis fossem aplicados ANTES do extra_env (o bug), estes 2
+    # asserts quebrariam — o extra_env teria vencido.
+    assert env["WHISPER_BACKEND"] == "groq"                # inviolável Groq venceu
+    assert "HEADLESS" not in env                           # hotmart HEADED venceu
+    assert env["X_QUALQUER"] == "ok"                       # extra_env inócuo preservado
+
+
+def test_extra_env_nao_liga_headless_em_hotmart_via_clobber():
+    sp = FakeSpawn()
+    _exec(captura.CursoLocal(url=MK, conta="mk", plataforma="memberkit"), spawn=sp,
+          extra_env={"WHISPER_BACKEND": "openai"}).disparar(MK)
+    env = sp.calls[0]["env"]
+    assert env["WHISPER_BACKEND"] == "groq"                # inviolável vence mesmo em memberkit
+    assert env["HEADLESS"] == "1"                          # política headless preservada
+
+
+# ==========================================================================
+# INVIOLÁVEL ANTI-BAN DURÁVEL (achado ALTO): o guard 1-por-conta + idempotência-por-curso
+# SOBREVIVE a um restart/crash do loop, porque vive num LOCKFILE em disco (PID + curso),
+# não só no dict in-memory. O processo de captura sobrevive (start_new_session); um
+# executor NOVO, com o processo antigo AINDA vivo, NÃO pode re-disparar.
+# ==========================================================================
+def test_restart_nao_redispara_o_mesmo_curso_com_processo_antigo_vivo(tmp_path):
+    mundo = MundoProc()                                    # tabela de PIDs compartilhada
+    lock = str(tmp_path)                                   # lock DURÁVEL compartilhado
+
+    # Encarnação 1: dispara C1 na conta-A (processo desacoplado, "horas").
+    sp1 = FakeSpawn(mundo)
+    ex1 = _exec(_hot(C1, "conta-A"), spawn=sp1, lock_dir=lock, pid_vivo=mundo.vivo)
+    assert ex1.disparar(C1) == f"local_iniciada:{C1}"
+    assert len(sp1.calls) == 1                             # 1 processo real
+
+    # >>> RESTART <<< o loop crasha/reinicia: NOVO executor, _procs={} do zero. Mas o
+    # processo antigo (pid em sp1) CONTINUA vivo na tabela do SO (mundo).
+    sp2 = FakeSpawn(mundo)
+    ex2 = _exec(_hot(C1, "conta-A"), spawn=sp2, lock_dir=lock, pid_vivo=mundo.vivo)
+    conf = ex2.disparar(C1)                                # relê Notion, acha PARCIAL, tenta C1
+    # DENTES: NÃO abriu 2º processo do MESMO curso (idempotência durável). Remover o lock
+    # durável faria este disparo abrir um 2º browser na mesma conta = ban + captura dupla.
+    assert conf == f"ja_capturando:{C1}"
+    assert len(sp2.calls) == 0                             # nenhum spawn novo pós-restart
+
+
+def test_restart_recusa_2o_curso_na_mesma_conta_do_processo_antigo(tmp_path):
+    mundo = MundoProc()
+    lock = str(tmp_path)
+    sp1 = FakeSpawn(mundo)
+    ex1 = _exec(_hot(C1, "conta-A"), _hot(C2, "conta-A"), spawn=sp1,
+                lock_dir=lock, pid_vivo=mundo.vivo)
+    ex1.disparar(C1)                                       # C1 roda na conta-A
+
+    # restart: novo executor; C1 antigo ainda vivo. Tentar C2 (mesma conta) = 2ª sessão.
+    sp2 = FakeSpawn(mundo)
+    ex2 = _exec(_hot(C1, "conta-A"), _hot(C2, "conta-A"), spawn=sp2,
+                lock_dir=lock, pid_vivo=mundo.vivo)
+    with pytest.raises(captura.ContaOcupada):              # DENTES: anti-ban durável
+        ex2.disparar(C2)
+    assert len(sp2.calls) == 0                             # nada disparado na conta ocupada
+
+
+def test_restart_libera_a_conta_quando_o_processo_antigo_morreu(tmp_path):
+    # O lado inverso: se o processo antigo MORREU (crash da captura, não só do loop), o
+    # lock é obsoleto — a conta LIBERA e o novo executor PODE re-disparar (retomar).
+    mundo = MundoProc()
+    lock = str(tmp_path)
+    sp1 = FakeSpawn(mundo)
+    ex1 = _exec(_hot(C1, "conta-A"), spawn=sp1, lock_dir=lock, pid_vivo=mundo.vivo)
+    ex1.disparar(C1)
+    sp1.procs[0].encerrar(1)                               # processo de captura MORREU
+
+    sp2 = FakeSpawn(mundo)
+    ex2 = _exec(_hot(C1, "conta-A"), spawn=sp2, lock_dir=lock, pid_vivo=mundo.vivo)
+    assert ex2.disparar(C1) == f"local_iniciada:{C1}"      # PID morto -> conta livre -> retoma
+    assert len(sp2.calls) == 1
+
+
+def test_restart_curso_ativo_e_conta_ocupada_leem_o_lock_duravel(tmp_path):
+    mundo = MundoProc()
+    lock = str(tmp_path)
+    ex1 = _exec(_hot(C1, "conta-A"), spawn=FakeSpawn(mundo), lock_dir=lock,
+                pid_vivo=mundo.vivo)
+    ex1.disparar(C1)
+
+    ex2 = _exec(_hot(C1, "conta-A"), spawn=FakeSpawn(mundo), lock_dir=lock,
+                pid_vivo=mundo.vivo)
+    # o executor NOVO enxerga o estado durável, não seu _procs vazio.
+    assert ex2.curso_ativo(C1) is True
+    assert ex2.conta_ocupada("conta-A") is True

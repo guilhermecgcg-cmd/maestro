@@ -24,8 +24,11 @@ reivindica o job e o resolve via `vincular_curso`. Logo: dispara-se por URL; mon
 se por course_id resolvido da fila. Enquanto o worker não reivindicou, o course_id é
 nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar.
 """
+import hashlib
+import json
 import os
 import shlex
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -402,6 +405,31 @@ def _spawn_popen(cmd, *, env, cwd):  # pragma: no cover — processo REAL do mot
                             stderr=subprocess.STDOUT, start_new_session=True)
 
 
+def _pid_vivo(pid) -> bool:
+    """O PID ainda roda? `os.kill(pid, 0)` NÃO envia sinal — só sonda a existência do
+    processo. ProcessLookupError => morreu (lock órfão obsoleto, pode liberar).
+    PermissionError => existe mas é de outro dono (vivo, conservador: NÃO libera).
+    Qualquer outro OSError => trata como morto (fail-open p/ NÃO travar a conta para
+    sempre por um pid ilegível). pid inválido (None/0/negativo) => morto."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+# Diretório de locks DURÁVEIS padrão: um caminho ESTÁVEL entre reinicializações (mesmo
+# tempdir do SO), para que o guard anti-ban sobreviva a um restart/crash do loop. NÃO é
+# um dir efêmero por-processo de propósito — a durabilidade É o ponto (ver LocalExecutor).
+_LOCK_DIR_PADRAO = os.path.join(tempfile.gettempdir(), "athena-local-locks")
+
+
 class LocalExecutor:
     """Executor DOMÉSTICO: CHAMA O MOTOR DIRETO no Mac (subprocesso), em vez de
     enfileirar. Mesmo contrato do FilaExecutor: `disparar(url) -> confirmação truthy`,
@@ -409,25 +437,38 @@ class LocalExecutor:
 
     INVIOLÁVEIS cravados AQUI (o executor é o único ponto que SABE como a captura
     acontece — logo é o lugar certo do guard físico anti-ban):
-      - 1-POR-CONTA: nunca 2 capturas na MESMA conta ao mesmo tempo. Um 2º disparo na
-        conta ocupada LEVANTA `ContaOcupada` (fail-closed). Contas diferentes rodam em
-        paralelo (sem bloqueio entre contas).
-      - IDEMPOTENTE POR CURSO: um curso cujo processo AINDA roda não é re-spawnado
-        (nem martela — disjuntor —, nem duplica a captura); devolve confirmação sem
-        abrir um 2º processo.
+      - 1-POR-CONTA, DURÁVEL: nunca 2 capturas na MESMA conta ao mesmo tempo, INCLUSIVE
+        através de um restart/crash do loop. Um 2º disparo na conta ocupada LEVANTA
+        `ContaOcupada` (fail-closed). Contas diferentes rodam em paralelo.
+      - IDEMPOTENTE POR CURSO, DURÁVEL: um curso cujo processo AINDA roda não é
+        re-spawnado (nem martela, nem duplica a captura); devolve confirmação sem abrir
+        um 2º processo — mesmo se quem disparou foi uma ENCARNAÇÃO ANTERIOR do executor.
       - WHISPER_BACKEND=groq SEMPRE (a GROQ_API_KEY vem do chave-groq.txt, que
         `motor.config` auto-carrega quando o subprocesso roda com cwd=motor_dir).
       - Hotmart HEADED (a sonda de sessão FALHA headless); demais plataformas headless.
       - NUNCA loga sozinho: o executor só dispara o motor; a sessão (e o reseed HEADED
         interativo no Mac) é responsabilidade do próprio motor (`ensure_session`).
 
+    POR QUE O GUARD É DURÁVEL EM DISCO (e não só o dict in-memory `self._procs`):
+    `_spawn_popen` usa `start_new_session=True` DE PROPÓSITO — a captura (horas) SOBREVIVE
+    a um restart do loop. Se o único guard fosse o dict in-memory, um crash/OOM/redeploy do
+    loop nasceria um LocalExecutor novo com `_procs={}`, releria o Notion, veria o curso
+    PARCIAL, acharia a conta livre e DISPARARIA A MESMA captura DE NOVO — 2 sessões de
+    browser na MESMA conta = BAN + captura dupla (o exato prejuízo do inviolável anti-ban).
+    Por isso cada disparo grava um LOCKFILE por conta em disco (PID + course_url); antes de
+    disparar, consulta-se o lock e checa-se se o PID AINDA RODA (`_pid_vivo`). O lock
+    sobrevive ao restart; um PID morto (processo encerrou) libera a conta (lock obsoleto é
+    removido). `self._procs` continua existindo só para colher (poll()) os processos que
+    ESTA encarnação spawnou — reaping preciso do próprio filho, evitando zumbi manter a
+    conta 'ocupada'. A verdade do guard, porém, é o disco (atravessa restart).
+
     A completude/monitoramento NÃO é daqui (não há fila/tracker no Mac): é do OWNER
     (`orquestrador.orquestrar_captura` via a contagem-verdade do Notion). O executor só
     sabe o que está VIVO agora (`curso_ativo`/`conta_ocupada`), colhendo processos
-    encerrados a cada consulta (reap por `poll()`)."""
+    encerrados a cada consulta (reap por `poll()` + varredura de lock obsoleto)."""
 
     def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
-                 extra_env=None):
+                 extra_env=None, lock_dir=None, pid_vivo=None):
         self._meta = {c.url: c for c in cursos}
         self._motor_python = motor_python
         self._motor_dir = motor_dir
@@ -435,16 +476,76 @@ class LocalExecutor:
         self._groq_key = groq_key
         self._extra_env = dict(extra_env or {})
         self._procs = {}                       # course_url -> handle de processo vivo
+        # Guard DURÁVEL: dir estável (sobrevive a restart) + sonda de PID injetável (os
+        # testes de RESTART simulam o processo antigo ainda vivo sem um pid real).
+        self._lock_dir = lock_dir or _LOCK_DIR_PADRAO
+        self._pid_vivo = pid_vivo or _pid_vivo
+        os.makedirs(self._lock_dir, exist_ok=True)
+
+    # --- LOCKFILE DURÁVEL POR CONTA (a verdade do guard anti-ban) ------------
+    def _lock_path(self, conta) -> str:
+        # nome de arquivo estável e seguro a partir da conta (que pode ter espaços/barras).
+        slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self._lock_dir, slug + ".lock")
+
+    def _ler_lock(self, conta):
+        """Lê o lock da conta e devolve o dict {pid, course_url, conta} SE o PID ainda
+        roda; senão devolve None e REMOVE o lock obsoleto (processo morreu -> conta
+        livre). É aqui que o restart libera uma conta cujo processo antigo já terminou."""
+        path = self._lock_path(conta)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (ValueError, OSError):
+            # lock corrompido/ilegível: trata como obsoleto (não pode travar para sempre).
+            self._remover_lock(path)
+            return None
+        if not self._pid_vivo(data.get("pid")):
+            self._remover_lock(path)              # PID morto -> lock obsoleto -> libera
+            return None
+        return data
+
+    def _escrever_lock(self, conta, curso_url, pid):
+        tmp = self._lock_path(conta) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"pid": pid, "course_url": curso_url, "conta": str(conta)}, f)
+        os.replace(tmp, self._lock_path(conta))   # troca atômica
+
+    def _remover_lock(self, path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     def _reap(self):
-        """Colhe processos encerrados (poll() != None) — sem isso uma conta ficaria
-        'ocupada' para sempre e a próxima captura nunca dispararia."""
+        """Colhe processos que ESTA encarnação spawnou e já encerraram (poll() != None):
+        tira do dict e REMOVE o lock durável da conta (se ainda for deste curso), para
+        que a próxima captura da conta possa disparar. Sem isso a conta ficaria 'ocupada'
+        para sempre. poll() reapa o zumbi do próprio filho — essencial: um filho encerrado
+        e não-colhido continuaria 'vivo' para `os.kill(pid, 0)`."""
         for url in [u for u, p in self._procs.items() if p.poll() is not None]:
             del self._procs[url]
+            meta = self._meta.get(url)
+            if meta is None:
+                continue
+            path = self._lock_path(meta.conta)
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except (FileNotFoundError, ValueError, OSError):
+                continue
+            if data.get("course_url") == url:    # só remove o lock SE ainda for deste curso
+                self._remover_lock(path)
 
     def curso_ativo(self, curso_url) -> bool:
         self._reap()
-        return curso_url in self._procs
+        meta = self._meta.get(curso_url)
+        if meta is None:
+            return False
+        lock = self._ler_lock(meta.conta)
+        return lock is not None and lock.get("course_url") == curso_url
 
     def conta_de(self, curso_url) -> str:
         meta = self._meta.get(curso_url)
@@ -452,7 +553,7 @@ class LocalExecutor:
 
     def conta_ocupada(self, conta) -> bool:
         self._reap()
-        return any(self._meta[u].conta == conta for u in self._procs)
+        return self._ler_lock(conta) is not None
 
     def disparar(self, curso_url):
         self._reap()
@@ -462,16 +563,21 @@ class LocalExecutor:
             # montar o comando — jamais disparar às cegas.
             raise RuntimeError(
                 f"curso {curso_url} sem metadados locais (conta/plataforma) — não disparo")
-        if curso_url in self._procs:                       # IDEMPOTENTE por curso
-            return f"ja_capturando:{curso_url}"
-        for u in self._procs:                              # ANTI-BAN 1-por-conta (HARD)
-            if self._meta[u].conta == meta.conta:
-                raise ContaOcupada(
-                    f"conta {meta.conta!r} já captura {u} — recuso 2ª captura simultânea "
-                    f"de {curso_url} (anti-ban: 1 por conta)")
-        cmd, env = self._montar(meta)
+        # GUARD DURÁVEL: a verdade está no disco (sobrevive a restart), não no _procs.
+        lock = self._ler_lock(meta.conta)
+        if lock is not None:
+            if lock.get("course_url") == curso_url:        # IDEMPOTENTE por curso (durável)
+                return f"ja_capturando:{curso_url}"
+            raise ContaOcupada(                            # ANTI-BAN 1-por-conta (durável)
+                f"conta {meta.conta!r} já captura {lock.get('course_url')} (PID "
+                f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
+                f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
+        cmd, env = self._montar(meta)                      # fail-closed ANTES de qualquer spawn
         proc = self._spawn(cmd, env=env, cwd=self._motor_dir)
         self._procs[curso_url] = proc
+        # grava o lock durável com o PID do processo de captura — é o que um executor
+        # nascido pós-restart lerá para NÃO re-disparar esta mesma captura.
+        self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
         return f"local_iniciada:{curso_url}"
 
     def _montar(self, meta):
@@ -485,14 +591,17 @@ class LocalExecutor:
                 f"fail-closed, não capturo {meta.url}")
         cmd = [self._motor_python, "-m", modulo, meta.url]
         env = dict(os.environ)
-        env["WHISPER_BACKEND"] = "groq"                    # INVIOLÁVEL Groq
+        # extra_env PRIMEIRO (base overridável); os INVIOLÁVEIS entram DEPOIS para VENCER
+        # o extra_env — senão um extra_env poderia clobberar WHISPER_BACKEND/HEADLESS (o
+        # exato inviolável anti-ban / Groq que este executor existe para cravar).
+        env.update(self._extra_env)
+        env["WHISPER_BACKEND"] = "groq"                    # INVIOLÁVEL Groq (vence extra_env)
         if self._groq_key:
             env["GROQ_API_KEY"] = self._groq_key
         if meta.plataforma == "hotmart":
             env.pop("HEADLESS", None)                      # HEADED (sonda falha headless)
         else:
             env["HEADLESS"] = "1"                          # demais plataformas headless
-        env.update(self._extra_env)
         return cmd, env
 
 

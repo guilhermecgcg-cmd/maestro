@@ -278,6 +278,70 @@ def test_rodar_itera_e_persiste_estado_cross_ciclo():
 
 
 # ==========================================================================
+# ACHADO MÉDIO: um ciclo que ESTOURA NÃO vira no-op silencioso — é ESCALADO.
+# (antes: `except Exception: pass` engolia falha sistemática em silêncio.)
+# ==========================================================================
+async def _noop_sleep(_):
+    return None
+
+
+def test_rodar_escala_quando_o_ciclo_estoura(monkeypatch):
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+
+    def boom(*a, **k):
+        raise RuntimeError("dependência doméstica quebrada")
+
+    monkeypatch.setattr(athena_local, "ciclo_local", boom)
+    asyncio.run(athena_local.rodar([_curso(C1, total=18)], ex, _prog({C1: (0, 18)}), voz,
+                                   sleep=_noop_sleep, max_iters=3, intervalo_s=0.0))
+    tipos = [p.tipo for p, _ in voz.escaladas]
+    # DENTES: a falha do ciclo SURFA (não é engolida). Reverter para `except: pass`
+    # deixaria `escaladas` vazio e este assert quebraria.
+    assert "ciclo_local_estourou" in tipos
+    # latch por assinatura: 3 ciclos com o MESMO erro escalam UMA vez (não inunda).
+    assert tipos.count("ciclo_local_estourou") == 1
+
+
+def test_rodar_rearma_o_latch_e_reescala_novo_episodio(monkeypatch):
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    chamadas = {"n": 0}
+    real = athena_local.ciclo_local
+
+    def intermitente(*a, **k):
+        chamadas["n"] += 1
+        if chamadas["n"] in (1, 3):                        # falha, OK, falha
+            raise RuntimeError("intermitente")
+        return real(*a, **k)
+
+    monkeypatch.setattr(athena_local, "ciclo_local", intermitente)
+    asyncio.run(athena_local.rodar([_curso(C1, total=18)], ex, _prog({C1: (0, 18)}), voz,
+                                   sleep=_noop_sleep, max_iters=3, intervalo_s=0.0))
+    tipos = [p.tipo for p, _ in voz.escaladas]
+    # um ciclo bem-sucedido no meio RE-ARMA o latch -> o 2º episódio re-escala honesto.
+    assert tipos.count("ciclo_local_estourou") == 2
+
+
+def test_rodar_nao_morre_se_a_voz_falhar_ao_escalar(monkeypatch):
+    # a escalada é best-effort: se a própria voz estourar, o loop NÃO pode morrer.
+    class VozRuim(FakeVoz):
+        def escalar(self, problema, pedido):
+            raise RuntimeError("telegram fora")
+
+    voz = VozRuim()
+    ex = FakeExecutor({C1: "a"})
+
+    def boom(*a, **k):
+        raise RuntimeError("ciclo estourou")
+
+    monkeypatch.setattr(athena_local, "ciclo_local", boom)
+    n = asyncio.run(athena_local.rodar([_curso(C1, total=18)], ex, _prog({C1: (0, 18)}),
+                                       voz, sleep=_noop_sleep, max_iters=2, intervalo_s=0.0))
+    assert n == 2                                          # completou os ciclos, não morreu
+
+
+# ==========================================================================
 # carregar_cursos: lê o YAML doméstico; conta é obrigatória
 # ==========================================================================
 def test_carregar_cursos_le_yaml(tmp_path):

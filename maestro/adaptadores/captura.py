@@ -26,7 +26,9 @@ nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar
 """
 import shlex
 import time
+from dataclasses import dataclass
 
+from maestro import observador
 from maestro.adaptadores import conhecimento
 from maestro.playbook import Acao
 from maestro.sentinela import Problema
@@ -175,27 +177,39 @@ def progresso(projeto, acesso, course_id) -> tuple:
 # ("InvistoDireito" vs "Invisto Direito | Escola de PPS") e foi o que enganou o
 # sistema. A URL não mente: as aulas de um curso têm URL que COMEÇA pela URL do curso
 # (curso .../products/3486759 -> aulas .../products/3486759/content/XXX).
-NOTION_SENTINELA = "JA_NO_NOTION"
+NOTION_SENTINELA = "JA_NO_NOTION"       # guard anti-duplicidade (tem/não tem)
+# PROGRESSO usa o MESMO mecanismo de contagem por prefixo de 'Origem', só com uma
+# sentinela própria (a Athena lê o done-count REAL do curso na fonte de verdade).
+PROGRESSO_SENTINELA = "PROGRESSO_NOTION"
 
-# Script executado DENTRO do container do app (uv run python -c). O prefixo vai como
-# ARGV (shlex-quotado no comando), nunca interpolado no fonte — evita quebrar aspas.
-# Pagina com data_sources.query (page_size 100) até esgotar e imprime a contagem.
-_NOTION_COUNT_SCRIPT = (
-    "import os,sys\n"
-    "from notion_client import Client\n"
-    "n=Client(auth=os.environ['NOTION_TOKEN'])\n"
-    "ds=n.databases.retrieve(database_id=os.environ['NOTION_DB_LESSONS_ID'])"
-    "['data_sources'][0]['id']\n"
-    "p=sys.argv[1];c=0;cur=None\n"
-    "while True:\n"
-    " kw={'data_source_id':ds,'filter':{'property':'Origem','url':{'starts_with':p}},"
-    "'page_size':100}\n"
-    " if cur: kw['start_cursor']=cur\n"
-    " r=n.data_sources.query(**kw);c+=len(r.get('results',[]))\n"
-    " if not r.get('has_more'): break\n"
-    " cur=r.get('next_cursor')\n"
-    "print('" + NOTION_SENTINELA + " %d' % c)\n"
-)
+
+def _build_count_script(sentinela: str) -> str:
+    """Constrói o script executado DENTRO do container do app (uv run python -c). O
+    prefixo vai como ARGV (shlex-quotado no comando), nunca interpolado no fonte —
+    evita quebrar aspas. Pagina com data_sources.query (page_size 100) até esgotar e
+    imprime `<sentinela> <count>`. Único ponto que fala com o Notion — reusa o token
+    que o app JÁ tem (NOTION_TOKEN / NOTION_DB_LESSONS_ID), sem segredo novo na Athena.
+    Anti-dup e progresso partilham EXATAMENTE a mesma consulta (só muda a sentinela)."""
+    return (
+        "import os,sys\n"
+        "from notion_client import Client\n"
+        "n=Client(auth=os.environ['NOTION_TOKEN'])\n"
+        "ds=n.databases.retrieve(database_id=os.environ['NOTION_DB_LESSONS_ID'])"
+        "['data_sources'][0]['id']\n"
+        "p=sys.argv[1];c=0;cur=None\n"
+        "while True:\n"
+        " kw={'data_source_id':ds,'filter':{'property':'Origem','url':{'starts_with':p}},"
+        "'page_size':100}\n"
+        " if cur: kw['start_cursor']=cur\n"
+        " r=n.data_sources.query(**kw);c+=len(r.get('results',[]))\n"
+        " if not r.get('has_more'): break\n"
+        " cur=r.get('next_cursor')\n"
+        "print('" + sentinela + " %d' % c)\n"
+    )
+
+
+_NOTION_COUNT_SCRIPT = _build_count_script(NOTION_SENTINELA)
+_PROGRESSO_SCRIPT = _build_count_script(PROGRESSO_SENTINELA)
 
 
 def _normalizar_url_curso(url: str) -> str:
@@ -216,6 +230,31 @@ def _prefixo_de_curso(url: str) -> str:
     return _normalizar_url_curso(url) + "/"
 
 
+def _contar_no_notion(acesso, alvo_container, curso_url, *, sentinela, script,
+                      ctx="") -> int:
+    """Núcleo COMPARTILHADO da contagem por prefixo de 'Origem' (anti-dup e progresso).
+    Roda `script` DE DENTRO do container do app (exec_app), passando o prefixo do curso
+    como ARGV, e devolve a contagem que a sentinela imprime.
+
+    LEVANTA se não der para determinar (sem container, exec falha, ou saída sem a
+    sentinela). Silêncio NÃO pode virar 0: para o anti-dup isso viraria 'curso novo'
+    (re-captura), e para o progresso viraria 'nada no Notion' (subestima) — em ambos
+    o chamador ESCALA honesto em vez de agir às cegas."""
+    if not alvo_container:
+        raise RuntimeError(
+            f"{ctx}sem app_container: não dá para verificar o Notion de {curso_url}")
+    prefixo = _prefixo_de_curso(curso_url)
+    comando = ("uv run --directory /app python -c "
+               f"{shlex.quote(script)} {shlex.quote(prefixo)}")
+    saida = acesso.exec_app(alvo_container, comando) or ""
+    if sentinela not in saida:
+        raise RuntimeError(
+            f"{ctx}contagem no Notion SEM confirmação ({sentinela} ausente) "
+            f"p/ {curso_url}: {saida[-160:]!r}")
+    linha = next(l for l in saida.splitlines() if sentinela in l)
+    return int(linha.split(sentinela, 1)[1].strip().split()[0])
+
+
 def curso_ja_no_notion(projeto, acesso, curso_url) -> tuple:
     """(tem_aulas, quantidade) — quantas aulas do Notion ('Aulas (motor)') têm 'Origem'
     cuja URL começa pelo prefixo deste curso. FONTE DA VERDADE durável e stateless: lê
@@ -225,22 +264,59 @@ def curso_ja_no_notion(projeto, acesso, curso_url) -> tuple:
     sentinela). Silêncio NÃO pode virar '(False,0)': isso viraria 'curso novo' e
     re-capturaria — o oposto do que este guard existe para evitar. O chamador
     (coordenar) captura a exceção e ESCALA honesto, sem enfileirar às cegas."""
-    alvo = getattr(projeto, "app_container", "")
-    if not alvo:
-        raise RuntimeError(
-            f"[{projeto.nome}] sem app_container: não dá para verificar o Notion "
-            f"(anti-duplicidade) de {curso_url}")
-    prefixo = _prefixo_de_curso(curso_url)
-    comando = ("uv run --directory /app python -c "
-               f"{shlex.quote(_NOTION_COUNT_SCRIPT)} {shlex.quote(prefixo)}")
-    saida = acesso.exec_app(alvo, comando) or ""
-    if NOTION_SENTINELA not in saida:
-        raise RuntimeError(
-            f"[{projeto.nome}] checagem anti-duplicidade SEM confirmação "
-            f"({NOTION_SENTINELA} ausente) p/ {curso_url}: {saida[-160:]!r}")
-    linha = next(l for l in saida.splitlines() if NOTION_SENTINELA in l)
-    qtd = int(linha.split(NOTION_SENTINELA, 1)[1].strip().split()[0])
+    qtd = _contar_no_notion(acesso, getattr(projeto, "app_container", ""), curso_url,
+                            sentinela=NOTION_SENTINELA, script=_NOTION_COUNT_SCRIPT,
+                            ctx=f"[{projeto.nome}] (anti-duplicidade) ")
     return (qtd > 0, qtd)
+
+
+# --- VISÃO-DE-PROGRESSO POR VERDADE (dono: ATHENA) --------------------------
+# O #1 problema: o sistema reportou cursos 'pronto' que estavam incompletos. A cura é
+# medir o done-count REAL na FONTE DE VERDADE (Notion), NUNCA num flag. `ProgressoNotion`
+# carrega quantas aulas o Notion já tem (`no_notion`); `completo(total)` só diz "pronto"
+# quando no_notion >= total (com total>0) — e o `total` (esperado) vem da ENUMERAÇÃO,
+# injetado de fora (a Athena NÃO enumera aqui). Assim o falso-pronto (10/18) nunca passa.
+@dataclass(frozen=True)
+class ProgressoNotion:
+    course_url: str
+    no_notion: int
+    ts: float
+
+    def completo(self, total) -> bool:
+        """Completo SÓ quando o Notion PROVA: no_notion >= total, com total>0. total<=0
+        (enumeração vazia/desconhecida) nunca prova conclusão — fail-closed, é o modo de
+        falha que gera o falso-pronto."""
+        return int(total) > 0 and self.no_notion >= int(total)
+
+
+def progresso_curso_no_notion(acesso, alvo_container, course_url, *, agora=None
+                              ) -> ProgressoNotion:
+    """Contagem REAL de aulas deste curso já no Notion (por prefixo de 'Origem'),
+    lida DE DENTRO do container do app — mesmo mecanismo do guard anti-duplicidade
+    (`curso_ja_no_notion`), só com a sentinela PROGRESSO_NOTION. Devolve um
+    ProgressoNotion carimbado; o `total` esperado é aplicado depois em `.completo`.
+    LEVANTA se não der para determinar (o chamador escala honesto — nunca assume 0)."""
+    qtd = _contar_no_notion(acesso, alvo_container, course_url,
+                            sentinela=PROGRESSO_SENTINELA, script=_PROGRESSO_SCRIPT,
+                            ctx="[athena progresso] ")
+    return ProgressoNotion(course_url=course_url, no_notion=qtd,
+                           ts=time.time() if agora is None else agora)
+
+
+def progresso_fn_observador(acesso, alvo_container, totais_por_curso, agora):
+    """Liga a Camada 1 (observador) à contagem REAL do Notion: devolve o seam
+    `progresso_fn` que `observador.coletar_estado` chama, produzindo um ProgressoCurso
+    por curso com done=contagem no Notion e total=esperado (da enumeração, injetado em
+    `totais_por_curso={course_url: total}`). É AQUI que `EstadoObservado.progresso`
+    passa a refletir a VERDADE, não um flag — a Camada 1 continua sem falar com o
+    Notion (a fonte é plugada por fora, como o observador exige)."""
+    def _fn():
+        return observador.progresso_captura(
+            lambda url: (progresso_curso_no_notion(acesso, alvo_container, url,
+                                                   agora=agora).no_notion,
+                         totais_por_curso[url]),
+            list(totais_por_curso.keys()), agora)
+    return _fn
 
 
 class FilaExecutor:
@@ -281,7 +357,7 @@ class FilaExecutor:
 
 
 def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
-              ja_no_notion=None):
+              ja_no_notion=None, progresso_notion_fn=None):
     """Coordena o PROTOCOLO DE CAPTURA de UM curso (identificado por `curso_url`), um
     passo por ciclo, avançando a máquina de estados em `estado` (dict por curso,
     mutável, persiste entre ciclos). Dirige a `voz` diretamente (pede reseed / avisa /
@@ -294,11 +370,19 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
       - captura SEMPRE via `executor` residencial (nunca Chrome na VPS — anti-ban);
       - nenhuma etapa é dada como sucesso sem confirmação (disparo, ingest);
       - ANTI-DUPLICIDADE: nunca enfileira um curso que o Notion (fonte da verdade
-        durável) já mostra capturado — resiliente a restart (checa a cada ciclo).
+        durável) já mostra capturado — resiliente a restart (checa a cada ciclo);
+      - COMPLETUDE POR NOTION, NÃO POR FLAG (gate I-1): quando o tracker diz 'done',
+        a conclusão só é DECLARADA se o Auditor CONFIRMAR contra o Notion; falso-pronto
+        é REJEITADO e escalado, e o curso NÃO é marcado CONCLUIDO (nem ingerido).
 
     `ja_no_notion`: seam injetável (curso_url)->(tem_aulas, qtd). Default = checar o
     Notion real via `curso_ja_no_notion` (exec_app no container do app). Injetável
     para os testes passarem um dublê sem tocar Notion/docker.
+
+    `progresso_notion_fn`: seam injetável (curso_url)->ProgressoNotion — a contagem-
+    verdade do Notion para o gate de conclusão (I-1). None => gate DESLIGADO (conclui
+    pelo tracker como antes; retrocompatível). Em produção o loop liga o seam real
+    (`progresso_curso_no_notion`) para que 'concluído' seja SEMPRE provado no Notion.
     """
     agora = time.time() if agora is None else agora
     if ja_no_notion is None:
@@ -401,6 +485,34 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
             return Acao("", False, True, pedido)
         if not (total > 0 and pend == 0):
             return None                                   # ainda capturando: quieto (não spamma)
+
+        # ---- GATE I-1: COMPLETUDE POR NOTION, NÃO POR FLAG --------------------
+        # O tracker (estado_aulas) diz 'done' — mas o tracker é um FLAG local, a exata
+        # fonte que já mentiu 'pronto' com aulas pendentes. Antes de declarar concluído
+        # (ou até de ingerir), o Auditor CONFIRMA contra a FONTE DE VERDADE (Notion):
+        # só passa se no_notion >= total. Falso-pronto é REJEITADO, escalado via voz, e
+        # o curso NÃO avança — o próximo ciclo re-tenta quando o Notion alcançar `total`.
+        # Seam desligado (None) => comportamento antigo (retrocompat). `total` é o
+        # esperado, vindo da ENUMERAÇÃO do tracker (a Athena não re-enumera aqui).
+        if progresso_notion_fn is not None:
+            try:
+                prog_notion = progresso_notion_fn(curso_url)
+            except Exception as e:
+                pedido = (f"[{projeto.nome}] curso {curso_url} reportado done pelo tracker, "
+                          f"mas NÃO consegui confirmar no Notion (gate I-1): {str(e)[:140]} "
+                          f"— NÃO declaro concluído; re-tento no próximo ciclo")
+                voz.escalar(Problema("conclusao_notion_inacessivel", curso_url, pedido, "aviso"),
+                            pedido)
+                return Acao("", False, True, pedido)
+            from maestro import auditor
+            laudo = auditor.auditar_conclusao(curso_url, prog_notion, total, voz=voz)
+            if not laudo.aprovado:
+                # FALSO-PRONTO: auditar_conclusao já escalou o gap honesto. NÃO ingere,
+                # NÃO marca CONCLUIDO — a fase segue CAPTURANDO (re-tenta).
+                falta = max(total - prog_notion.no_notion, 0)
+                return Acao("", False, True,
+                            f"[{projeto.nome}] conclusão de {curso_url} REJEITADA pelo Auditor "
+                            f"(Notion tem {prog_notion.no_notion}/{total} — {falta} faltando)")
 
         # ---- FASE 4: curso completo -> AUTO-INGEST reusando reconciliar ----
         # REUSO (não reimplementa): forço o disparo AGORA passando ultimo bem no

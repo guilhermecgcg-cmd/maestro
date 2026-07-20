@@ -100,10 +100,20 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None) -> list:
             from maestro.adaptadores import captura
             cap_estado = estado.setdefault(f"{proj.nome}::captura", {})
             executor = captura.FilaExecutor(acesso, proj)
+            # GATE I-1 (completude por Notion, não por flag): liga o seam real da
+            # contagem-verdade. Quando o tracker disser 'done', o coordenar CONFIRMA
+            # contra o Notion antes de declarar concluído — falso-pronto é rejeitado.
+            # Sem app_container não há como confirmar -> seam None (o coordenar cai no
+            # comportamento antigo em vez de escalar todo ciclo por um registro incompleto).
+            alvo_app = getattr(proj, "app_container", "")
+            prog_notion_fn = (
+                (lambda u: captura.progresso_curso_no_notion(acesso, alvo_app, u))
+                if alvo_app else None)
             for curso_url in proj.cursos_desejados:
                 st = cap_estado.setdefault(curso_url, {})
                 acao = captura.coordenar(proj, acesso, voz, executor=executor,
-                                         curso_url=curso_url, estado=st, agora=snap["agora"])
+                                         curso_url=curso_url, estado=st, agora=snap["agora"],
+                                         progresso_notion_fn=prog_notion_fn)
                 if acao is not None:
                     acoes.append(acao)
     return acoes

@@ -5,6 +5,8 @@ relato de quem implementou. Contradição entre fontes = falha automática. Sem 
 embaixo, declarado 100% funcional.)"""
 from dataclasses import dataclass
 
+from maestro.sentinela import Problema
+
 
 @dataclass(frozen=True)
 class Criterio:
@@ -51,6 +53,42 @@ def criterio_igual(nome: str, esperado, obtido, *, rotulo="valor") -> Criterio:
             ev += "  <- CONTRADIÇÃO com a decisão do usuário (viola I-2)"
         return ok, ev
     return Criterio(nome, _checar)
+
+
+def criterio_completude_notion(course_url, no_notion, total_esperado) -> Criterio:
+    """Critério I-1: um curso só está COMPLETO quando a FONTE DE VERDADE (Notion) tem
+    no_notion >= total_esperado (com total>0). É o anti-falso-pronto: o tracker/flag
+    pode dizer 'done', mas só o Notion PROVA. Reprova com o gap honesto (X/Y, Z
+    faltando). (Nasceu de 'pronto' declarado com 466 aulas pendentes.)"""
+    def _checar(_ctx):
+        n = int(no_notion)
+        alvo = int(total_esperado)
+        ok = alvo > 0 and n >= alvo
+        ev = f"completude: Notion tem {n}/{alvo}"
+        if not ok:
+            falta = max(alvo - n, 0)
+            ev += (f" — reportado pronto mas {falta} faltando"
+                   "  <- FALSO-PRONTO REJEITADO (viola I-1)")
+        return ok, ev
+    return Criterio("completude por Notion (I-1)", _checar)
+
+
+def auditar_conclusao(job, progresso_notion, total_esperado, *, voz=None) -> Laudo:
+    """GATE I-1: um job/curso reportado 'pronto' só é CONFIRMADO completo se o Notion
+    tiver `progresso_notion.no_notion >= total_esperado`. Senão, o Laudo é REJEITADO
+    com o gap honesto e (se `voz`) ESCALA — nunca confia num flag 'pronto'. `total_
+    esperado` vem da ENUMERAÇÃO (injetado); a Athena não enumera aqui."""
+    c = criterio_completude_notion(progresso_notion.course_url,
+                                   progresso_notion.no_notion, total_esperado)
+    laudo = auditar([c], ctx={})
+    if not laudo.aprovado and voz is not None:
+        n = int(progresso_notion.no_notion)
+        alvo = int(total_esperado)
+        falta = max(alvo - n, 0)
+        pedido = (f"[{job}] reportado PRONTO mas o Notion tem {n}/{alvo} — {falta} "
+                  f"faltando (falso-pronto REJEITADO, I-1); NÃO declaro concluído")
+        voz.escalar(Problema("falso_pronto", str(job), pedido, "critico"), pedido)
+    return laudo
 
 
 def contradicoes(fontes: dict) -> list:

@@ -140,7 +140,17 @@ def resolver(div: Divergencia, acoes, verificar, voz, *, agora=None,
         except Exception as e:                       # ação falhou de cara -> re-tenta
             ultimo_erro = f"ação levantou: {e}"
             continue
-        if verificar(div):                           # a VERDADE, não o instante
+        try:
+            confirmado = verificar(div)              # a VERDADE, não o instante
+        except Exception as e:
+            # reler a fonte de verdade ESTOUROU (Notion fora, docker exec sem
+            # container, socket off). Isso NÃO é confirmação. Fail-closed: trata como
+            # não-confirmado, re-tenta e, esgotado, escala — a exceção JAMAIS vaza de
+            # `resolver` (vazar abortaria a orquestração e deixaria a ação já
+            # executada sem veredito).
+            ultimo_erro = f"verificação da fonte de verdade levantou: {e}"
+            continue
+        if confirmado:                               # a VERDADE, não o instante
             return Resultado(div, acao, confirmado=True, tentativas=tentativas,
                              escalou=False, detalhe="confirmado na fonte de verdade")
         ultimo_erro = "efeito não confirmado na fonte de verdade"

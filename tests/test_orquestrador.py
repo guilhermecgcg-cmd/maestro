@@ -303,6 +303,55 @@ def test_acao_que_levanta_excecao_e_re_tentada_depois_escala():
     assert mundo.chamadas.count(("restart", "worker")) == 2
 
 
+def test_verificar_que_levanta_e_tratado_como_nao_confirmado_e_escala_TEETH():
+    # TEETH DO FAIL-CLOSED NA VERIFICAÇÃO: reler a FONTE DE VERDADE pode ESTOURAR
+    # (Notion 503, docker exec sem container, socket off — exec_sql LEVANTA de
+    # propósito). Uma exceção ao verificar NÃO é confirmação. O loop DEVE tratá-la
+    # como falha (re-tenta e, esgotado, ESCALA), NUNCA deixar a exceção vazar de
+    # `resolver` — vazar abortaria a orquestração inteira e deixaria a ação JÁ
+    # executada sem veredito: o ponto cego fail-open que este loop existe p/ matar.
+    mundo = MundoFake(servicos={"worker": False}, restart_conserta=True)
+    voz = FakeVoz()
+
+    def verificar_explode(div):
+        raise RuntimeError("Notion 503 / docker exec off")
+
+    res = orquestrador.resolver(_div("servico_caido", "worker"), mundo,
+                                verificar_explode, voz, max_tentativas=2)
+    assert res.confirmado is False                   # exceção NÃO virou sucesso
+    assert res.escalou is True
+    assert res.tentativas == 2                        # re-tentou antes de desistir
+    assert len(voz.escaladas) == 1
+    _, pedido = voz.escaladas[0]
+    assert "não confirm" in pedido.lower()
+    assert mundo.chamadas.count(("restart", "worker")) == 2
+
+
+def test_orquestrar_verificar_que_estoura_num_alvo_nao_aborta_os_demais_TEETH():
+    # A CONSEQUÊNCIA do vazamento: se reler a verdade estoura p/ UM alvo, a
+    # orquestração não pode morrer e abandonar os OUTROS. O alvo problemático vira
+    # falha-escalada; os demais seguem resolvidos normalmente.
+    est = estado(servicos=[Serv("worker", up=False, health=False),
+                           Serv("app", up=False, health=False)])
+    esp = {"servicos": {"worker": {"up": True, "health": True},
+                        "app": {"up": True, "health": True}}}
+    mundo = MundoFake(servicos={"worker": False, "app": False}, restart_conserta=True)
+    base = make_verificar(mundo)
+
+    def verificar(div):
+        if div.alvo == "worker":
+            raise RuntimeError("verdade indisponível p/ worker")
+        return base(div)
+
+    voz = FakeVoz()
+    resultados = orquestrador.orquestrar(est, esp, mundo, verificar, voz,
+                                         max_tentativas=2)
+    por_alvo = {r.divergencia.alvo: r for r in resultados}
+    assert set(por_alvo) == {"worker", "app"}        # NENHUM alvo foi abandonado
+    assert por_alvo["worker"].confirmado is False and por_alvo["worker"].escalou is True
+    assert por_alvo["app"].confirmado is True and por_alvo["app"].escalou is False
+
+
 def test_servico_doente_redeploy_confirma_pela_fonte():
     mundo = MundoFake(servicos={"app": False}, redeploy_conserta=True)
     voz = FakeVoz()

@@ -82,11 +82,17 @@ def test_loop_coordena_cursos_desejados_por_url():
         def exec_sql(self, container, sql, *, db, user="postgres", rows=True):
             self.sqls.append(sql)
             return []                                       # sem sinal de morte / fila limpa
+        def exec_app(self, container, comando, timeout=None):
+            # guard anti-duplicidade: Notion vazio p/ este curso -> (novo) -> enfileira.
+            from maestro.adaptadores import captura
+            if captura.NOTION_SENTINELA in comando:
+                return f"{captura.NOTION_SENTINELA} 0\n"
+            return "RECONCILE_OK {}\n"
     a = _AcessoCap({"worker": Servico("worker", up=True, restarting=False)}); v = _Voz()
-    # app_container vazio: a rotina reconcile do adaptador conhecimento nao dispara
-    # (foco do teste = wiring da captura), mas o coordenar so precisa dela na conclusao.
+    # app_container presente: o guard anti-duplicidade da captura consulta o Notion de
+    # dentro do container do app antes de enfileirar (curso novo aqui -> segue).
     proj = _proj(servicos=("worker",), adaptador="conhecimento", db_container="cp_db",
-                 db_name="conhecimento", app_container="",
+                 db_name="conhecimento", app_container="cp_app",
                  cursos_desejados=("https://plat/c1",))
     estado = {}
     ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado)

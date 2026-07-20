@@ -15,6 +15,7 @@ Os dublês MODELAM O SCHEMA REAL, não a coreografia (I2 — dublês COM DENTES)
 Cada teste de C1/C2/C3/I1 FALHA se o bug for reintroduzido (teeth verificados).
 """
 import re
+import shlex
 
 import pytest
 
@@ -48,10 +49,14 @@ class FakeAcesso:
       boom_sql     : todo exec_sql levanta (banco inacessível)
       boom_aulas   : só a query de estado_aulas levanta (progresso inacessível)
       boom_app     : exec_app levanta (reconcile inacessível)
+      notion_aulas : URLs de 'Origem' que o Notion tem (guard anti-duplicidade). O
+                     exec_app da CONTAGEM re-parseia o argv (shlex) e aplica o MESMO
+                     starts_with do filtro de URL do Notion. VAZIO (default) = curso
+                     novo -> (False, 0) -> FASE_NOVO segue enfileirando como antes.
     """
     def __init__(self, *, sessao_morta=False, resolve=None, aulas=None,
                  reconcile="RECONCILE_OK {}", boom_sql=False, boom_aulas=False,
-                 boom_app=False):
+                 boom_app=False, notion_aulas=()):
         self._sessao_morta = sessao_morta
         self._resolve = resolve
         self._aulas = aulas
@@ -59,6 +64,7 @@ class FakeAcesso:
         self._boom_sql = boom_sql
         self._boom_aulas = boom_aulas
         self._boom_app = boom_app
+        self._notion_aulas = list(notion_aulas)
         self.sqls = []
         self.inserts = []
         self.execs = []
@@ -123,6 +129,12 @@ class FakeAcesso:
         self.execs.append((container, comando, timeout))
         if self._boom_app:
             raise RuntimeError("docker off")
+        # GUARD anti-duplicidade: modela o container do app contando aulas do Notion
+        # cujo 'Origem' começa pelo PREFIXO (último argv, shlex-parseado como o sh -c).
+        if captura.NOTION_SENTINELA in comando:
+            prefixo = shlex.split(comando)[-1]
+            n = sum(1 for u in self._notion_aulas if u.startswith(prefixo))
+            return f"{captura.NOTION_SENTINELA} {n}\n"
         return self._reconcile
 
 

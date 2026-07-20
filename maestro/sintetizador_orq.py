@@ -24,8 +24,9 @@ sistemas reais em produção:
 Invariantes (herdadas do CLAUDE.md do dono — matar o falso-pronto):
   1. how-to ACIONA a síntese; não-how-to NÃO toca síntese/portão/registro.
   2. o artefato só é registrado DEPOIS que o Portão POP limpou — nunca antes.
-  3. portão reprova (ou síntese sem artefato) -> não registra, `sintetizado=False`,
-     escala pro humano (fail-closed).
+  3. portão reprova, síntese sem artefato, OU registro que falha -> não fica
+     registrado, `sintetizado=False`, escala pro humano (fail-closed) — nenhuma
+     dessas bordas pode virar crash: toda falha vira EstadoSintese auditável.
   4. `sintetizado=True` exige portão limpo E registro efetivado."""
 from dataclasses import dataclass
 from typing import Optional
@@ -98,8 +99,22 @@ def orquestrar_sintese(curso, *, classificar, sintetizar, portao, registrar):
             registrado=False, escalar=True,
             motivo="Portão POP reprovou o artefato — não registrado, escala")
 
-    # Portão limpo: SÓ AGORA registra e declara sintetizado.
-    registrar(artefato)
+    # Portão limpo: SÓ AGORA registra e declara sintetizado. O registro é I/O real
+    # (Notion/DB) que FALHA na prática — e aqui já passamos do ponto sem volta (o
+    # portão limpou). Uma falha crua ESCAPARIA como crash, deixando o curso num
+    # limbo: portão limpo, mas sem EstadoSintese e sem escalonamento auditável — o
+    # buraco exato que os outros caminhos fail-closed fecham. Fecha ele também:
+    # registro que falha NÃO declara sintetizado (invariante 4: exige registro
+    # efetivado), preserva o artefato pra auditoria e escala pro humano.
+    try:
+        registrar(artefato)
+    except Exception as e:  # noqa: BLE001 — fail-closed deliberado: qualquer falha
+        # do registro vira escalonamento auditável, nunca crash silencioso.
+        return EstadoSintese(
+            curso=curso, how_to=True, sintetizado=False, artefato=artefato,
+            registrado=False, escalar=True,
+            motivo=f"registro falhou após Portão POP limpo ({e!r}) — "
+                   "fail-closed, escala")
     return EstadoSintese(
         curso=curso, how_to=True, sintetizado=True, artefato=artefato,
         registrado=True, escalar=False,

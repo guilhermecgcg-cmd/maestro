@@ -189,3 +189,41 @@ def test_sintese_sem_artefato_escala_e_nao_registra():
     assert reg.registrados == []             # não registrou
     assert estado.sintetizado is False
     assert estado.escalar is True
+
+
+# --- 8. DENTES: registro falha APÓS portão limpo -> fail-closed, escala ------
+def test_dentes_registro_falha_apos_portao_e_fail_closed():
+    """DENTES: reintroduzi 'registrar sem guarda' (a chamada crua da linha 102).
+
+    O `registrar` real é I/O (Notion/DB) que FALHA na prática. Contra o
+    orquestrador ingênuo — que não embrulha o registro — uma exceção do registro
+    ESCAPA como crash: o curso já passou pelo portão limpo mas NÃO produz nenhum
+    EstadoSintese nem registro de escalonamento — o limbo exato que o fail-closed
+    existe pra matar (todos os OUTROS caminhos de falha devolvem escalar=True).
+
+    Aqui exigimos: a exceção NÃO estoura; devolve EstadoSintese auditável com
+    sintetizado=False (registro não efetivado -> invariante 4), registrado=False,
+    escalar=True, artefato preservado pra auditoria. Contra o código antigo este
+    teste ERRA com a exceção do registro (não devolve estado)."""
+    art = Artefato(skill="s", agente="a", sistema="sis")
+
+    class RegistroQueFalha:
+        def __init__(self):
+            self.tentativas = []
+
+        def __call__(self, artefato):
+            self.tentativas.append(artefato)
+            raise RuntimeError("registry down (Notion/DB indisponível)")
+
+    reg = RegistroQueFalha()
+    port = PortaoDuble(pronto=True)
+    sint = Sintetizador(artefato=art)
+    estado = sintetizador_orq.orquestrar_sintese(
+        "curso-x", classificar=Classificador(True),
+        sintetizar=sint, portao=port, registrar=reg)
+    assert reg.tentativas == [art]           # tentou registrar (portão já limpou)
+    assert estado.sintetizado is False       # registro não efetivou -> invariante 4
+    assert estado.registrado is False
+    assert estado.escalar is True            # fail-closed: humano decide
+    assert estado.artefato == art            # artefato preservado pra auditoria
+    assert "regist" in estado.motivo.lower()

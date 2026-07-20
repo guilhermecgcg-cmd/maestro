@@ -24,6 +24,7 @@ reivindica o job e o resolve via `vincular_curso`. Logo: dispara-se por URL; mon
 se por course_id resolvido da fila. Enquanto o worker não reivindicou, o course_id é
 nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar.
 """
+import os
 import shlex
 import time
 from dataclasses import dataclass
@@ -354,6 +355,145 @@ class FilaExecutor:
     # por um PROXY residencial a partir da VPS — mantendo o inviolável anti-ban (IP
     # residencial), sem depender do Mac. É só outro executor injetado: o coordenador
     # não muda.
+
+
+# ============================================================================
+# EXECUTOR DOMÉSTICO — a Athena rodando NO MAC, chamando o MOTOR DIRETO.
+# ============================================================================
+# Decisão de arquitetura (INVIOLÁVEL): a Athena doméstica NÃO enfileira no painel-api
+# para um worker da VPS reivindicar (isso é o MODELO VPS). No Mac, ELA MESMA é o
+# residencial: dispara `python -m motor.cli|motor.memberkit <curso>` como SUBPROCESSO
+# LOCAL. O contrato do executor é o MESMO do FilaExecutor (`disparar(url) -> confirmação
+# truthy | LEVANTA`), então o `coordenar`/`orquestrar_captura` não sabem a diferença —
+# só se TROCA o executor (fila -> local), como manda a tarefa.
+class ContaOcupada(RuntimeError):
+    """Levantada quando se tenta disparar uma 2ª captura na MESMA conta enquanto outra
+    ainda roda. NÃO é falha de infra — é o guard ANTI-BAN inviolável FUNCIONANDO
+    ('nunca 2 capturas na mesma conta ao mesmo tempo'). O chamador doméstico a trata
+    como 'aguarda a vez' (fail-safe), nunca como sucesso nem como crash."""
+
+
+@dataclass(frozen=True)
+class CursoLocal:
+    """Um curso desejado no modelo DOMÉSTICO. `conta` é a chave de serialização
+    anti-ban (contas diferentes rodam em paralelo; a MESMA conta, nunca). `plataforma`
+    escolhe o módulo do motor e a política headed/headless. `total_esperado` é o
+    DENOMINADOR (opcional) da completude-por-Notion — 0 = desconhecido => o owner
+    NUNCA declara concluído (fail-closed, anti-falso-pronto)."""
+    url: str
+    conta: str
+    plataforma: str = "hotmart"
+    total_esperado: int = 0
+
+
+# plataforma -> módulo do motor a invocar. Fora deste mapa => fail-closed (o motor só
+# sabe estas; capturar numa plataforma desconhecida às cegas violaria o anti-ban/o gate
+# de plataforma-nova). Hotmart usa o CLI base; Memberkit tem o adaptador próprio.
+_MODULO_POR_PLATAFORMA = {"hotmart": "motor.cli", "memberkit": "motor.memberkit"}
+
+
+def _spawn_popen(cmd, *, env, cwd):  # pragma: no cover — processo REAL do motor
+    """Spawn REAL não-bloqueante (o motor roda minutos-horas; o disparo retorna já).
+    `start_new_session` desacopla a captura do processo da Athena (uma reinicialização
+    do loop não mata uma captura em andamento). stdout/err vão pro DEVNULL — produção
+    pode injetar um spawn que loga por curso; este é o default enxuto."""
+    import subprocess
+    return subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+
+
+class LocalExecutor:
+    """Executor DOMÉSTICO: CHAMA O MOTOR DIRETO no Mac (subprocesso), em vez de
+    enfileirar. Mesmo contrato do FilaExecutor: `disparar(url) -> confirmação truthy`,
+    ou LEVANTA em falha.
+
+    INVIOLÁVEIS cravados AQUI (o executor é o único ponto que SABE como a captura
+    acontece — logo é o lugar certo do guard físico anti-ban):
+      - 1-POR-CONTA: nunca 2 capturas na MESMA conta ao mesmo tempo. Um 2º disparo na
+        conta ocupada LEVANTA `ContaOcupada` (fail-closed). Contas diferentes rodam em
+        paralelo (sem bloqueio entre contas).
+      - IDEMPOTENTE POR CURSO: um curso cujo processo AINDA roda não é re-spawnado
+        (nem martela — disjuntor —, nem duplica a captura); devolve confirmação sem
+        abrir um 2º processo.
+      - WHISPER_BACKEND=groq SEMPRE (a GROQ_API_KEY vem do chave-groq.txt, que
+        `motor.config` auto-carrega quando o subprocesso roda com cwd=motor_dir).
+      - Hotmart HEADED (a sonda de sessão FALHA headless); demais plataformas headless.
+      - NUNCA loga sozinho: o executor só dispara o motor; a sessão (e o reseed HEADED
+        interativo no Mac) é responsabilidade do próprio motor (`ensure_session`).
+
+    A completude/monitoramento NÃO é daqui (não há fila/tracker no Mac): é do OWNER
+    (`orquestrador.orquestrar_captura` via a contagem-verdade do Notion). O executor só
+    sabe o que está VIVO agora (`curso_ativo`/`conta_ocupada`), colhendo processos
+    encerrados a cada consulta (reap por `poll()`)."""
+
+    def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
+                 extra_env=None):
+        self._meta = {c.url: c for c in cursos}
+        self._motor_python = motor_python
+        self._motor_dir = motor_dir
+        self._spawn = spawn or _spawn_popen
+        self._groq_key = groq_key
+        self._extra_env = dict(extra_env or {})
+        self._procs = {}                       # course_url -> handle de processo vivo
+
+    def _reap(self):
+        """Colhe processos encerrados (poll() != None) — sem isso uma conta ficaria
+        'ocupada' para sempre e a próxima captura nunca dispararia."""
+        for url in [u for u, p in self._procs.items() if p.poll() is not None]:
+            del self._procs[url]
+
+    def curso_ativo(self, curso_url) -> bool:
+        self._reap()
+        return curso_url in self._procs
+
+    def conta_de(self, curso_url) -> str:
+        meta = self._meta.get(curso_url)
+        return meta.conta if meta is not None else ""
+
+    def conta_ocupada(self, conta) -> bool:
+        self._reap()
+        return any(self._meta[u].conta == conta for u in self._procs)
+
+    def disparar(self, curso_url):
+        self._reap()
+        meta = self._meta.get(curso_url)
+        if meta is None:
+            # fail-closed: sem conta/plataforma não dá para respeitar o anti-ban nem
+            # montar o comando — jamais disparar às cegas.
+            raise RuntimeError(
+                f"curso {curso_url} sem metadados locais (conta/plataforma) — não disparo")
+        if curso_url in self._procs:                       # IDEMPOTENTE por curso
+            return f"ja_capturando:{curso_url}"
+        for u in self._procs:                              # ANTI-BAN 1-por-conta (HARD)
+            if self._meta[u].conta == meta.conta:
+                raise ContaOcupada(
+                    f"conta {meta.conta!r} já captura {u} — recuso 2ª captura simultânea "
+                    f"de {curso_url} (anti-ban: 1 por conta)")
+        cmd, env = self._montar(meta)
+        proc = self._spawn(cmd, env=env, cwd=self._motor_dir)
+        self._procs[curso_url] = proc
+        return f"local_iniciada:{curso_url}"
+
+    def _montar(self, meta):
+        modulo = _MODULO_POR_PLATAFORMA.get(meta.plataforma)
+        if modulo is None:
+            # fail-closed: o motor só sabe as plataformas mapeadas. Uma nova nunca é
+            # capturada às cegas (o gate de plataforma-nova já deveria tê-la barrado
+            # antes; isto é a última linha de defesa).
+            raise RuntimeError(
+                f"plataforma {meta.plataforma!r} sem módulo de motor conhecido — "
+                f"fail-closed, não capturo {meta.url}")
+        cmd = [self._motor_python, "-m", modulo, meta.url]
+        env = dict(os.environ)
+        env["WHISPER_BACKEND"] = "groq"                    # INVIOLÁVEL Groq
+        if self._groq_key:
+            env["GROQ_API_KEY"] = self._groq_key
+        if meta.plataforma == "hotmart":
+            env.pop("HEADLESS", None)                      # HEADED (sonda falha headless)
+        else:
+            env["HEADLESS"] = "1"                          # demais plataformas headless
+        env.update(self._extra_env)
+        return cmd, env
 
 
 def _total_esperado(projeto, acesso, curso_url, total_esperado_fn):

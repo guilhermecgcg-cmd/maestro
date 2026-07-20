@@ -24,6 +24,7 @@ reivindica o job e o resolve via `vincular_curso`. Logo: dispara-se por URL; mon
 se por course_id resolvido da fila. Enquanto o worker não reivindicou, o course_id é
 nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar.
 """
+import shlex
 import time
 
 from maestro.adaptadores import conhecimento
@@ -152,6 +153,96 @@ def progresso(projeto, acesso, course_id) -> tuple:
     return (total, max(total - pend, 0), pend)
 
 
+# --- GUARD ANTI-DUPLICIDADE (dono: ATHENA) ----------------------------------
+# O usuário foi queimado por RE-capturar um curso já pronto (Invisto Direito: 485
+# aulas já no Notion; uma re-enumeração sob um rótulo duplicado fez o sistema achar
+# que estava pendente). Diretiva: a garantia de NÃO-duplicidade no INÍCIO da captura
+# é da Athena e tem de sobreviver ao Mac desligar / a sessão acabar. Por isso a
+# checagem consulta a FONTE DA VERDADE DURÁVEL (Notion) a CADA ciclo, inclusive após
+# restart — nunca uma memória local (um set in-process morreria no restart e o curso
+# pronto voltaria a parecer novo, o exato prejuízo).
+#
+# COMO ALCANÇA O NOTION (decisão de design):
+# Rodamos a consulta DE DENTRO do container do app (`acesso.exec_app`), reusando o
+# token do Notion que o app JÁ tem (NOTION_TOKEN / NOTION_DB_LESSONS_ID em env) e o
+# `notion_client` já instalado lá — mesmíssimo padrão da ponte reconcile. Assim NÃO
+# adicionamos segredo novo ao Maestro/Athena. O script imita `reconcile.enumerar_
+# aulas_notion`: resolve o data_source_id do database e usa `data_sources.query`
+# (notion-client v3), mas com um FILTRO por PREFIXO de URL da propriedade 'Origem'
+# ('starts_with') — barato e preciso, sem ler blocos. Imprime a sentinela abaixo.
+#
+# POR QUE PREFIXO DE URL (não o rótulo de exibição): o rótulo fragmenta
+# ("InvistoDireito" vs "Invisto Direito | Escola de PPS") e foi o que enganou o
+# sistema. A URL não mente: as aulas de um curso têm URL que COMEÇA pela URL do curso
+# (curso .../products/3486759 -> aulas .../products/3486759/content/XXX).
+NOTION_SENTINELA = "JA_NO_NOTION"
+
+# Script executado DENTRO do container do app (uv run python -c). O prefixo vai como
+# ARGV (shlex-quotado no comando), nunca interpolado no fonte — evita quebrar aspas.
+# Pagina com data_sources.query (page_size 100) até esgotar e imprime a contagem.
+_NOTION_COUNT_SCRIPT = (
+    "import os,sys\n"
+    "from notion_client import Client\n"
+    "n=Client(auth=os.environ['NOTION_TOKEN'])\n"
+    "ds=n.databases.retrieve(database_id=os.environ['NOTION_DB_LESSONS_ID'])"
+    "['data_sources'][0]['id']\n"
+    "p=sys.argv[1];c=0;cur=None\n"
+    "while True:\n"
+    " kw={'data_source_id':ds,'filter':{'property':'Origem','url':{'starts_with':p}},"
+    "'page_size':100}\n"
+    " if cur: kw['start_cursor']=cur\n"
+    " r=n.data_sources.query(**kw);c+=len(r.get('results',[]))\n"
+    " if not r.get('has_more'): break\n"
+    " cur=r.get('next_cursor')\n"
+    "print('" + NOTION_SENTINELA + " %d' % c)\n"
+)
+
+
+def _normalizar_url_curso(url: str) -> str:
+    """Normaliza a URL do curso para servir de PREFIXO estável: tira espaços, a query
+    string (`?access_source=...`, utm, etc.) e o fragmento (`#...`), e a barra final.
+    As aulas NÃO carregam essa query — normalizar ANTES é o que faz o prefixo casar."""
+    base = str(url).strip()
+    base = base.split("#", 1)[0]
+    base = base.split("?", 1)[0]
+    return base.rstrip("/")
+
+
+def _prefixo_de_curso(url: str) -> str:
+    """Prefixo de MATCH: URL normalizada do curso + '/'. A barra é a FRONTEIRA que
+    impede um curso .../3486759 casar as aulas de .../34867590 (um dígito a mais):
+    '34867590/content/...' NÃO começa por '3486759/'. As aulas reais começam por
+    '<curso>/content/...', então sempre casam este prefixo."""
+    return _normalizar_url_curso(url) + "/"
+
+
+def curso_ja_no_notion(projeto, acesso, curso_url) -> tuple:
+    """(tem_aulas, quantidade) — quantas aulas do Notion ('Aulas (motor)') têm 'Origem'
+    cuja URL começa pelo prefixo deste curso. FONTE DA VERDADE durável e stateless: lê
+    o Notion a cada chamada, não guarda nada em memória local.
+
+    LEVANTA se não der para determinar (sem app_container, exec falha, ou saída sem a
+    sentinela). Silêncio NÃO pode virar '(False,0)': isso viraria 'curso novo' e
+    re-capturaria — o oposto do que este guard existe para evitar. O chamador
+    (coordenar) captura a exceção e ESCALA honesto, sem enfileirar às cegas."""
+    alvo = getattr(projeto, "app_container", "")
+    if not alvo:
+        raise RuntimeError(
+            f"[{projeto.nome}] sem app_container: não dá para verificar o Notion "
+            f"(anti-duplicidade) de {curso_url}")
+    prefixo = _prefixo_de_curso(curso_url)
+    comando = ("uv run --directory /app python -c "
+               f"{shlex.quote(_NOTION_COUNT_SCRIPT)} {shlex.quote(prefixo)}")
+    saida = acesso.exec_app(alvo, comando) or ""
+    if NOTION_SENTINELA not in saida:
+        raise RuntimeError(
+            f"[{projeto.nome}] checagem anti-duplicidade SEM confirmação "
+            f"({NOTION_SENTINELA} ausente) p/ {curso_url}: {saida[-160:]!r}")
+    linha = next(l for l in saida.splitlines() if NOTION_SENTINELA in l)
+    qtd = int(linha.split(NOTION_SENTINELA, 1)[1].strip().split()[0])
+    return (qtd > 0, qtd)
+
+
 class FilaExecutor:
     """Executor residencial PADRÃO: ENFILEIRA a captura em fila_captura via exec_sql.
 
@@ -189,7 +280,8 @@ class FilaExecutor:
     # não muda.
 
 
-def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None):
+def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
+              ja_no_notion=None):
     """Coordena o PROTOCOLO DE CAPTURA de UM curso (identificado por `curso_url`), um
     passo por ciclo, avançando a máquina de estados em `estado` (dict por curso,
     mutável, persiste entre ciclos). Dirige a `voz` diretamente (pede reseed / avisa /
@@ -200,13 +292,50 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None):
     INVIOLÁVEIS cravados aqui:
       - sessão morta -> NÃO dispara captura; pede reseed (nunca loga sozinho);
       - captura SEMPRE via `executor` residencial (nunca Chrome na VPS — anti-ban);
-      - nenhuma etapa é dada como sucesso sem confirmação (disparo, ingest).
+      - nenhuma etapa é dada como sucesso sem confirmação (disparo, ingest);
+      - ANTI-DUPLICIDADE: nunca enfileira um curso que o Notion (fonte da verdade
+        durável) já mostra capturado — resiliente a restart (checa a cada ciclo).
+
+    `ja_no_notion`: seam injetável (curso_url)->(tem_aulas, qtd). Default = checar o
+    Notion real via `curso_ja_no_notion` (exec_app no container do app). Injetável
+    para os testes passarem um dublê sem tocar Notion/docker.
     """
     agora = time.time() if agora is None else agora
+    if ja_no_notion is None:
+        ja_no_notion = lambda u: curso_ja_no_notion(projeto, acesso, u)
     fase = estado.get("fase", FASE_NOVO)
 
     if fase == FASE_CONCLUIDO:
         return None                                       # idempotente: nada a fazer
+
+    # ---- FASE 0: GUARD ANTI-DUPLICIDADE (dono: Athena) ---------------------
+    # ANTES de qualquer disparo/sessão, re-checa a FONTE DA VERDADE (Notion). Roda a
+    # CADA ciclo: após um Mac-off / fim de sessão / restart da Athena, o estado
+    # in-process se perde e a fase volta a NOVO — sem este guard, um curso JÁ
+    # capturado seria re-enfileirado (o exato prejuízo). Como a decisão deriva do
+    # Notion (durável), e não de memória local, ela sobrevive ao restart (stateless).
+    if fase == FASE_NOVO:
+        try:
+            tem_aulas, qtd = ja_no_notion(curso_url)
+        except Exception as e:
+            # Não deu para confirmar: NÃO enfileira às cegas (evita re-captura) e
+            # ESCALA honesto; a fase segue NOVO -> o próximo ciclo re-tenta.
+            pedido = (f"[{projeto.nome}] NÃO consegui verificar no Notion se {curso_url} "
+                      f"já foi capturado (anti-duplicidade): {str(e)[:140]} — NÃO "
+                      f"enfileiro (evito re-captura às cegas); re-tento no próximo ciclo")
+            voz.escalar(Problema("antidup_notion_inacessivel", curso_url, pedido, "aviso"),
+                        pedido)
+            return Acao("", False, True, pedido)
+        if tem_aulas:
+            # JÁ capturado: pula o enfileiramento. Marca CONCLUIDO só para não
+            # re-reportar a cada ciclo DESTE processo — a correção NÃO depende disso:
+            # numa instância nova (pós-restart) a fase volta a NOVO e o Notion re-decide
+            # o skip do zero.
+            estado["fase"] = FASE_CONCLUIDO
+            acao = Acao(f"[{projeto.nome}] {curso_url} JÁ capturado ({qtd} aulas no Notion) "
+                        f"— pulo o enfileiramento (anti-duplicidade)", True, False)
+            voz.avisar_acao(acao)
+            return acao
 
     # ---- FASE 1: checar a sessão ANTES de qualquer disparo -----------------
     if fase == FASE_NOVO:

@@ -73,3 +73,31 @@ Cada projeto/sistema tem seu sub-agente (captura, sintetizador, adaptador-X, fro
 3. Ela decide prioridades e só me chama pra decisão real.
 4. Zero falso-pronto: tudo que ela diz "feito" está provado no Notion.
 5. Anti-ban nunca violado; conta paga protegida.
+
+---
+# ADENDO (20/07) — Decisões + Capacidades autônomas exigidas
+
+## Decisão de stack (aprovada)
+A Athena é construída em **Python/Docker/Postgres, reusando o maestro** (acesso.py já tem docker/health/Postgres; observador, anti-dup e reconcile já nesse stack). A Camada 3 (painel) usa o Next.js/r3f já existente. Nada do maestro é jogado fora.
+
+## Capacidade A — Portão de Qualidade POP (automatizado, NÃO-OPCIONAL)
+Toda coisa nova que a Athena produz (função, sistema, agente, skill, adaptador) passa OBRIGATORIAMENTE por:
+```
+ANTES do spec:  code-review do código existente → corrige TODOS os bugs (não só graves) → code-review de novo → repete até zerar → SÓ ENTÃO escreve o spec
+DEPOIS da impl: code-review da implementação → corrige TODOS os bugs → code-review de novo → repete até zerar → só então declara pronto (verificado no Notion, I-1)
+```
+Isto é uma CAPACIDADE da Athena, não um processo meu: ela **dispara os agentes de review e de fix sozinha**, em loop, e não avança enquanto sobrar bug. Regras do loop (invioláveis): verificar cada achado contra o código; teste-com-dentes obrigatório (reintroduz o bug, confirma que o teste pega); dublê que modela o mecanismo; "corrige TODOS os bugs" (o usuário rejeitou explicitamente 'só os graves').
+
+## Capacidade B — Criação autônoma de adaptadores de plataforma
+Dada a URL de uma plataforma nova (Kiwify, Nutror, Alpaclass, Kajabi, Hubla, Greenn, Stoa, Entrega Digital, domínio próprio…), a Athena:
+1. **Recon autenticado** (sessão residencial do Mac): identifica a plataforma, o player de vídeo, o mecanismo de listagem de aulas, o esquema de sessão/anti-ban.
+2. **Passa pelo Portão A** (review do recon + do código-base do motor onde o adaptador encaixa).
+3. **Escreve o spec do adaptador** → **plano** → **build TDD** (subagent-driven) → **Portão A de novo** (review→fix TODOS→review).
+4. **Deploy + validação ao vivo** (I-1: prova no Notion) antes de declarar pronto.
+5. O pipeline downstream é agnóstico → o adaptador só entra na boca de entrada.
+
+## Capacidade C — Operar o Sintetizador + gerar o sistema de exibição/execução
+Para curso how-to: a Athena aciona o Sintetizador (curso → **skill + agente + sistema executável**) e, além disso, **cria do zero o sistema que EXIBE/EXECUTA o que o curso ensina** (o resultado prático da metodologia). Cada sistema gerado passa pelo Portão A. O sistema de exibição usa o stack do frontend (Next.js) e é conectado à camada de conhecimento (busca semântica) como fonte.
+
+## Critério de aceite desta fase
+A Athena, sozinha: recebe link → não-duplica → inspeciona → captura completa (todas as passadas, 100% no Notion) → opera sintetizador nos how-to → gera o sistema de exibição → e, quando encontra plataforma nova ou bug, **constrói o adaptador/fix passando pelo Portão A** — chamando o humano só para decisão real. Tudo verificado no Notion, nunca por flag.

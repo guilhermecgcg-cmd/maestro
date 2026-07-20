@@ -26,11 +26,20 @@ o não-vídeo trava para sempre.
 import pytest
 
 from maestro.adaptadores import orquestrador as orq
+from maestro.adaptadores import captura
 from maestro.registro import Projeto
 
 
 AGORA = 1_000_000.0
 CURSO = "https://hotmart.com/pt-br/marketplace/produtos/x/products/3486759"
+
+
+def _prova(no_notion):
+    """Costura de VERDADE do Notion (progresso_notion_fn): devolve um ProgressoNotion
+    com a contagem REAL de aulas do curso no Notion — a prova que autoriza declarar 100%
+    (gate I-1). Modela o mecanismo: o censo (tracker) diz o que ACHA; isto diz o que o
+    Notion TEM. `no_notion >= diag.total` é o que conclui."""
+    return lambda url: captura.ProgressoNotion(course_url=url, no_notion=no_notion, ts=AGORA)
 
 
 def _proj(**kw):
@@ -243,7 +252,8 @@ def test_orquestrar_cascata_ordena_audio_embed_naovideo():
     for passo in range(4):
         caixa["i"] = passo
         orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                       curso_url=CURSO, estado=estado, agora=AGORA)
+                       curso_url=CURSO, estado=estado, agora=AGORA,
+                       progresso_notion_fn=_prova(10))   # Notion prova as 10 no fim
     assert [p for p, _ in disparo.disparos] == [orq.PASSE_AUDIO, orq.PASSE_EMBED,
                                                 orq.PASSE_NAO_VIDEO]
     assert estado.get("orq_fase") == orq.ORQ_CONCLUIDO
@@ -285,40 +295,108 @@ def test_orquestrar_declara_100pct_so_com_a_verdade_do_notion():
     estado = {}
     censo = _censo({"no_notion": 18})
     acao = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                          curso_url=CURSO, estado=estado, agora=AGORA)
+                          curso_url=CURSO, estado=estado, agora=AGORA,
+                          progresso_notion_fn=_prova(18))  # Notion PROVA os 18
     assert acao.executada and not acao.escalar
     assert estado["orq_fase"] == orq.ORQ_CONCLUIDO
+    assert "PROVADO no Notion" in acao.descricao         # não mais 'MEDIDO' por flag
     assert disparo.disparos == []                       # nada a disparar: já 100%
     # idempotente: segundo ciclo não faz nada.
     a2 = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                        curso_url=CURSO, estado=estado, agora=AGORA)
+                        curso_url=CURSO, estado=estado, agora=AGORA,
+                        progresso_notion_fn=_prova(18))
     assert a2 is None
     assert len(voz.avisos) == 1
 
 
-def test_orquestrar_nao_video_chega_a_100_sem_falso_negativo():
-    # TEETH (o outro lado do disjuntor): um curso com aulas legitimamente não-vídeo. Depois
-    # que a passada nao_video roda e as aulas seguem 'sem_embed' (não há vídeo mesmo), a
-    # cabeça declara 100% — não trava para sempre nem escala anti-ban.
+def test_orquestrar_nao_declara_100_por_flag_se_notion_nao_prova_TEETH():
+    # DENTES (achado [3]): o censo (tracker) diz tudo capturado (18) mas o Notion real só
+    # tem 10 -> o flag do tracker MENTIU. O gate rejeita: NÃO grava ORQ_CONCLUIDO, escala
+    # falso_pronto. Sem o gate (código antigo), isto declararia 100% por flag.
+    voz = FakeVoz()
+    estado = {}
+    censo = _censo({"no_notion": 18})
+    acao = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=FakeDisparo(),
+                          curso_url=CURSO, estado=estado, agora=AGORA,
+                          progresso_notion_fn=_prova(10))
+    assert estado.get("orq_fase") != orq.ORQ_CONCLUIDO
+    assert acao.escalar and not acao.executada
+    assert len(voz.escaladas) == 1
+    assert voz.escaladas[0][0].tipo == "falso_pronto"
+    assert "10/18" in voz.escaladas[0][1]
+
+
+def test_orquestrar_fail_closed_sem_costura_de_prova_no_notion_TEETH():
+    # DENTES (fail-closed): sem progresso_notion_fn não há como PROVAR completude no
+    # Notion -> NÃO declara 100% (nem por flag do tracker). Reporta uma vez e aguarda.
+    voz = FakeVoz()
+    estado = {}
+    censo = _censo({"no_notion": 18})
+    acao = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=FakeDisparo(),
+                          curso_url=CURSO, estado=estado, agora=AGORA)  # sem seam
+    assert estado.get("orq_fase") != orq.ORQ_CONCLUIDO
+    assert acao.escalar
+    assert len(voz.escaladas) == 1
+
+
+def test_orquestrar_nao_video_chega_a_100_quando_vira_pagina_no_notion():
+    # O outro lado do disjuntor: aulas legitimamente não-vídeo (documento/texto). Depois
+    # que a passada nao_video roda, elas viram PÁGINA no Notion (anexos_baixados) e o
+    # Notion PROVA o total (10) -> 100%. Não trava para sempre nem escala anti-ban.
     voz = FakeVoz()
     disparo = FakeDisparo()
     estado = {}
     seq = [
-        {"no_notion": 8, "sem_embed": 2},   # dispara nao_video
-        {"no_notion": 8, "sem_embed": 2},   # nao_video exauriu; segue não-vídeo -> feito
+        {"no_notion": 8, "sem_embed": 2},         # dispara nao_video
+        {"no_notion": 8, "anexos_baixados": 2},   # nao_video virou páginas Notion -> prova 10
     ]
     caixa = {"i": 0}
     censo = lambda url: dict(seq[caixa["i"]])
     caixa["i"] = 0
     a1 = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                        curso_url=CURSO, estado=estado, agora=AGORA)
+                        curso_url=CURSO, estado=estado, agora=AGORA,
+                        progresso_notion_fn=_prova(8))    # ciclo 0: Notion ainda tem 8
     assert disparo.disparos == [(orq.PASSE_NAO_VIDEO, CURSO)]
     assert not a1.escalar
     caixa["i"] = 1
     a2 = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                        curso_url=CURSO, estado=estado, agora=AGORA)
+                        curso_url=CURSO, estado=estado, agora=AGORA,
+                        progresso_notion_fn=_prova(10))   # ciclo 1: Notion prova as 10
     assert a2.executada and estado["orq_fase"] == orq.ORQ_CONCLUIDO
-    assert voz.escaladas == []                          # não-vídeo NÃO é anti-ban
+    assert voz.escaladas == []                            # não-vídeo NÃO é anti-ban
+
+
+def test_orquestrar_nao_video_enfileirado_nao_conclui_premature_e_ve_parede_TEETH():
+    # DENTES (achado [4]): a passada nao_video foi ENFILEIRADA mas o worker (lento, por
+    # anti-ban) ainda NÃO processou — o censo segue sem_embed. O censo já conta essas
+    # aulas como 'nao_video done', MAS o Notion ainda não as tem: no_notion(9) < total(10)
+    # -> gate REJEITA, NÃO declara 100% nem LATCHA. No ciclo seguinte a passada bate numa
+    # PAREDE real (falhou) -> é VISTA e escalada. Sem o gate (código antigo), o ciclo 1
+    # latcharia ORQ_CONCLUIDO e a parede do ciclo 2 seria ENGOLIDA (return None idempotente).
+    voz = FakeVoz()
+    disparo = FakeDisparo()
+    estado = {}
+    seq = [
+        {"no_notion": 9, "sem_embed": 1},   # ciclo 0: dispara nao_video
+        {"no_notion": 9, "sem_embed": 1},   # ciclo 1: worker ainda não processou (censo igual)
+        {"no_notion": 9, "falhou": 1},      # ciclo 2: a passada bateu numa parede real
+    ]
+    caixa = {"i": 0}
+    censo = lambda url: dict(seq[caixa["i"]])
+    # Notion NUNCA chegou a 10 (a 10ª aula nunca foi capturada).
+    caixa["i"] = 0
+    orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo, curso_url=CURSO,
+                   estado=estado, agora=AGORA, progresso_notion_fn=_prova(9))
+    caixa["i"] = 1
+    orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo, curso_url=CURSO,
+                   estado=estado, agora=AGORA, progresso_notion_fn=_prova(9))
+    assert estado.get("orq_fase") != orq.ORQ_CONCLUIDO   # NÃO declarou 100% prematuro
+    caixa["i"] = 2
+    a3 = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo, curso_url=CURSO,
+                        estado=estado, agora=AGORA, progresso_notion_fn=_prova(9))
+    assert estado.get("orq_fase") != orq.ORQ_CONCLUIDO
+    assert a3.escalar
+    assert any(p.tipo == "parede_anti_ban" for p, _ in voz.escaladas)  # parede VISTA, não engolida
 
 
 def test_orquestrar_sem_legenda_persistente_nao_declara_falso_pronto():
@@ -414,10 +492,12 @@ def test_orquestrar_parede_que_some_destrava_o_reporte():
     censo = lambda url: dict(seq[caixa["i"]])
     caixa["i"] = 0
     orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                   curso_url=CURSO, estado=estado, agora=AGORA)
+                   curso_url=CURSO, estado=estado, agora=AGORA,
+                   progresso_notion_fn=_prova(18))
     caixa["i"] = 1
     a2 = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
-                        curso_url=CURSO, estado=estado, agora=AGORA)
+                        curso_url=CURSO, estado=estado, agora=AGORA,
+                        progresso_notion_fn=_prova(18))
     assert a2.executada and estado["orq_fase"] == orq.ORQ_CONCLUIDO
 
 

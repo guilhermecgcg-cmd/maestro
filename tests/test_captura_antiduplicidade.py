@@ -157,19 +157,58 @@ def test_ja_no_notion_sem_app_container_levanta():
 # ==========================================================================
 # GUARD em coordenar — nao enfileira curso ja capturado; enfileira o novo
 # ==========================================================================
-def test_guard_pula_curso_ja_capturado_nao_enfileira():
+def test_guard_pula_curso_ja_capturado_COMPLETO_nao_enfileira():
+    # Só pula quando o Notion PROVA completude: no_notion (485) >= total (485). O total
+    # entra pela régua do gate I-1 (seam total_esperado_fn). Presença sozinha NÃO basta.
     checar = DoubleChecar(ja=[CURSO], quantidade=485)
     voz = FakeVoz()
     ex = FakeExecutor()
     estado = {}
     acao = captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex,
                              curso_url=CURSO, estado=estado, agora=AGORA,
-                             ja_no_notion=checar)
-    assert ex.disparos == []                     # NAO enfileirou (ja capturado)
+                             ja_no_notion=checar, total_esperado_fn=lambda u: 485)
+    assert ex.disparos == []                     # NAO enfileirou (ja COMPLETO)
     assert acao is not None and not acao.escalar
+    assert estado["fase"] == captura.FASE_CONCLUIDO
     assert len(voz.avisos) == 1                  # reportou o skip via voz
     assert "485" in acao.descricao or "capturad" in acao.descricao.lower()
     assert checar.chamadas == [CURSO]
+
+
+def test_guard_NAO_pula_curso_parcial_retoma_a_captura():
+    # DENTES do bug central (achados [1]/[2]): 200/537 no Notion. PRESENÇA (200>0) NÃO
+    # é completude. O guard antigo marcava CONCLUIDO e ABANDONAVA 337 aulas para sempre
+    # (falso-pronto, viola Inviolável 4). Agora: NÃO conclui por presença -> RETOMA
+    # (re-enfileira idempotente); o gate I-1 só declara pronto quando o Notion bater 537.
+    checar = DoubleChecar(ja=[CURSO], quantidade=200)
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {}
+    acao = captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex,
+                             curso_url=CURSO, estado=estado, agora=AGORA,
+                             ja_no_notion=checar, total_esperado_fn=lambda u: 537)
+    assert estado.get("fase") != captura.FASE_CONCLUIDO   # NAO declarou pronto por presença
+    assert estado.get("fase") == captura.FASE_CAPTURANDO   # retomou o protocolo de captura
+    assert ex.disparos == [CURSO]                          # RE-ENFILEIROU (retomada)
+    assert acao is not None and acao.executada and not acao.escalar
+    # reportou a retomada (não o skip) — honesto sobre o parcial
+    assert any("PARCIAL" in a.descricao or "RETOM" in a.descricao.upper()
+               for a in voz.avisos)
+
+
+def test_guard_total_desconhecido_falha_fechado_retoma_nao_pula():
+    # DENTES do fail-closed (achado [6]): há aulas no Notion (qtd>0) mas o total esperado
+    # é DESCONHECIDO (seam devolve 0 — ex.: course_id ainda não resolvido). NÃO pode
+    # concluir por presença: o lado seguro é RE-CAPTURAR, nunca abandonar. Retoma.
+    checar = DoubleChecar(ja=[CURSO], quantidade=200)
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {}
+    captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex,
+                      curso_url=CURSO, estado=estado, agora=AGORA,
+                      ja_no_notion=checar, total_esperado_fn=lambda u: 0)
+    assert estado.get("fase") != captura.FASE_CONCLUIDO
+    assert ex.disparos == [CURSO]                          # retomou (fail-closed)
 
 
 def test_guard_enfileira_curso_novo_normalmente():
@@ -185,16 +224,18 @@ def test_guard_enfileira_curso_novo_normalmente():
 
 
 def test_guard_nao_spamma_ciclo_a_ciclo_no_mesmo_estado():
-    # Curso ja capturado: reporta UMA vez e sossega nos ciclos seguintes do MESMO
-    # processo (nao re-reporta a cada 120s). A DECISAO segue durAvel (Notion).
-    checar = DoubleChecar(ja=[CURSO])
+    # Curso ja COMPLETO: reporta UMA vez e sossega nos ciclos seguintes do MESMO
+    # processo (nao re-reporta a cada 120s). A DECISAO segue durAvel (Notion+total).
+    checar = DoubleChecar(ja=[CURSO], quantidade=485)
     voz = FakeVoz()
     ex = FakeExecutor()
     estado = {}
     captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex, curso_url=CURSO,
-                      estado=estado, agora=AGORA, ja_no_notion=checar)
+                      estado=estado, agora=AGORA, ja_no_notion=checar,
+                      total_esperado_fn=lambda u: 485)
     a2 = captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex, curso_url=CURSO,
-                           estado=estado, agora=AGORA, ja_no_notion=checar)
+                           estado=estado, agora=AGORA, ja_no_notion=checar,
+                           total_esperado_fn=lambda u: 485)
     assert a2 is None                            # ciclo 2: quieto
     assert len(voz.avisos) == 1                  # so um aviso no total
     assert ex.disparos == []
@@ -221,35 +262,40 @@ def test_guard_falha_da_checagem_escala_e_nao_enfileira():
 # RESILIENCIA / STATELESSNESS — durAvel (Notion), sobrevive a restart
 # ==========================================================================
 def test_resiliencia_restart_reinstancia_e_ainda_pula_pela_verdade_do_notion():
-    # Instancia A ja pulou o curso (fase virou CONCLUIDO no estado in-process).
-    checar = DoubleChecar(ja=[CURSO])
+    # Instancia A ja pulou o curso COMPLETO (fase virou CONCLUIDO no estado in-process).
+    checar = DoubleChecar(ja=[CURSO], quantidade=485)
     voz = FakeVoz()
     ex = FakeExecutor()
     estado_a = {}
     captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex, curso_url=CURSO,
-                      estado=estado_a, agora=AGORA, ja_no_notion=checar)
+                      estado=estado_a, agora=AGORA, ja_no_notion=checar,
+                      total_esperado_fn=lambda u: 485)
     assert ex.disparos == []
 
     # RESTART: o Mac desligou / a sessao acabou -> o estado in-process se PERDE.
     # A nova instancia comeca com estado VAZIO (fase volta a NOVO). Se dependesse de
-    # memoria local, re-enfileiraria. Como deriva de Notion, ainda pula.
+    # memoria local, re-enfileiraria. Como deriva de Notion+total, ainda pula (completo).
     estado_b = {}                                # <- fresh, como apos um restart
     acao = captura.coordenar(_proj(), FakeNotionApp(), voz, executor=ex, curso_url=CURSO,
-                             estado=estado_b, agora=AGORA, ja_no_notion=checar)
-    assert ex.disparos == []                     # continua NAO enfileirando
+                             estado=estado_b, agora=AGORA, ja_no_notion=checar,
+                             total_esperado_fn=lambda u: 485)
+    assert ex.disparos == []                     # continua NAO enfileirando (completo)
     assert acao is not None and not acao.escalar
-    # provou statelessness: o skip veio do Notion (checagem), nao do estado antigo.
+    # provou statelessness: o skip veio da PROVA de completude (Notion+total), nao do
+    # estado antigo.
     assert CURSO in checar.chamadas
 
 
 def test_coordenar_usa_curso_ja_no_notion_por_padrao_quando_seam_omitido():
-    # Sem injetar o seam, coordenar cai no default real (curso_ja_no_notion via
-    # exec_app). Aqui o Notion tem as aulas -> pula, provando o wiring do default.
+    # Sem injetar o seam ja_no_notion, coordenar cai no default real (curso_ja_no_notion
+    # via exec_app). Aqui o Notion tem as 3 aulas e o total esperado é 3 -> COMPLETO ->
+    # pula, provando o wiring do default. (total via seam para não depender do tracker.)
     ac = FakeNotionApp(lessons=AULAS)
     voz = FakeVoz()
     ex = FakeExecutor()
     estado = {}
     acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso_url=CURSO,
-                             estado=estado, agora=AGORA)   # <- sem ja_no_notion
-    assert ex.disparos == []                     # pulou pelo default real
+                             estado=estado, agora=AGORA,       # <- sem ja_no_notion
+                             total_esperado_fn=lambda u: 3)
+    assert ex.disparos == []                     # pulou pelo default real (completo)
     assert ac.comandos and captura.NOTION_SENTINELA in ac.comandos[0][1]

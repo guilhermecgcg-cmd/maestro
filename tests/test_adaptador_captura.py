@@ -303,6 +303,43 @@ def test_capturando_sem_course_id_aguarda_reivindicacao():
 
 
 # ==========================================================================
+# FASE 0 — GUARD anti-dup por COMPLETUDE (default real: Notion + total do tracker)
+# ==========================================================================
+def _aulas_notion(n):
+    return [f"{URL}/content/{i}" for i in range(n)]
+
+
+def test_guard_pula_so_quando_notion_prova_completude_default_tracker():
+    # Wiring DEFAULT (sem seams injetados): o NUMERADOR vem do Notion (exec_app conta
+    # notion_aulas por prefixo) e o DENOMINADOR (total) vem da ENUMERAÇÃO do tracker
+    # (progresso: count(estado_aulas)). Notion 3 == tracker 3 -> COMPLETO -> pula.
+    ac = FakeAcesso(resolve="42", aulas=["no_notion"] * 3, notion_aulas=_aulas_notion(3))
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso_url=URL,
+                             estado=estado, agora=AGORA)
+    assert ex.disparos == []                              # completo -> não re-enfileira
+    assert estado["fase"] == captura.FASE_CONCLUIDO
+    assert acao.executada and not acao.escalar
+
+
+def test_guard_retoma_quando_notion_abaixo_do_total_do_tracker_default():
+    # DENTES (bug central, default): o tracker enumerou 5 aulas (total=5) mas o Notion só
+    # tem 2 -> PARCIAL. Presença (2>0) NÃO conclui: RETOMA (re-enfileira). O guard antigo
+    # (qtd>0 -> CONCLUIDO) marcaria pronto e abandonaria 3 aulas.
+    ac = FakeAcesso(resolve="42", aulas=["no_notion"] * 5, notion_aulas=_aulas_notion(2))
+    voz = FakeVoz()
+    ex = FakeExecutor()
+    estado = {}
+    acao = captura.coordenar(_proj(), ac, voz, executor=ex, curso_url=URL,
+                             estado=estado, agora=AGORA)
+    assert estado.get("fase") != captura.FASE_CONCLUIDO   # NÃO pronto por presença
+    assert ex.disparos == [URL]                           # retomou a captura
+    assert acao.executada and not acao.escalar
+
+
+# ==========================================================================
 # FASE 1 — sessão morta pede reseed / anti-login (inviolável)
 # ==========================================================================
 def test_sessao_morta_pede_reseed_e_nao_dispara_captura():

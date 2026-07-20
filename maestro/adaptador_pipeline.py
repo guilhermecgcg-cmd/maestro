@@ -95,6 +95,19 @@ def pode_avancar(estado: EstadoPipeline, etapa: str) -> bool:
     return bool(getattr(estado, flag))
 
 
+def _ok(res) -> bool:
+    """Fail-closed ESTRITO: um estágio só passou se `.ok is True`. Um valor
+    truthy-mas-não-booleano (1, "sim", um objeto de status) NÃO conta — senão o
+    pipeline avançaria 'no escuro', que é exatamente o que a trava proíbe."""
+    return getattr(res, "ok", False) is True
+
+
+def _pronto(res) -> bool:
+    """Fail-closed ESTRITO do Portão POP: só libera com `.pronto is True`.
+    Qualquer coisa < `True` (inclusive truthy não-booleano) REPROVA."""
+    return getattr(res, "pronto", False) is True
+
+
 def _motivo_portao(res) -> str:
     return str(getattr(res, "motivo", "") or "Portão POP reprovou")
 
@@ -126,7 +139,7 @@ def rodar_pipeline(
 
     # 1) RECON autenticado. É o começo — sempre pode rodar.
     r_recon = recon(url)
-    if not getattr(r_recon, "ok", False):
+    if not _ok(r_recon):
         motivo = _motivo(r_recon, "recon falhou")
         trilha.append(EtapaTrilha("recon", False, motivo))
         return _para("recon", motivo)
@@ -135,7 +148,7 @@ def rodar_pipeline(
 
     # 2) PORTÃO POP #1 — obrigatório ANTES do spec (review do recon + código-base).
     p1 = portao(r_recon)
-    if not getattr(p1, "pronto", False):
+    if not _pronto(p1):
         motivo = _motivo_portao(p1)
         trilha.append(EtapaTrilha("portao_pre_spec", False, motivo))
         return _para("portao_pre_spec", motivo)
@@ -144,7 +157,7 @@ def rodar_pipeline(
     # 3) SPEC do adaptador (só depois do Portão limpo).
     assert pode_avancar(estado, "spec")  # trava: exige recon_ok
     r_spec = escrever_spec(r_recon)
-    if not getattr(r_spec, "ok", False):
+    if not _ok(r_spec):
         motivo = _motivo(r_spec, "spec falhou")
         trilha.append(EtapaTrilha("spec", False, motivo))
         return _para("spec", motivo)
@@ -154,7 +167,7 @@ def rodar_pipeline(
     # 4) BUILD via SUBAGENTE (TDD).
     assert pode_avancar(estado, "build")  # trava: exige spec_ok
     r_build = build(r_spec)
-    if not getattr(r_build, "ok", False):
+    if not _ok(r_build):
         motivo = _motivo(r_build, "build falhou")
         trilha.append(EtapaTrilha("build", False, motivo))
         return _para("build", motivo)
@@ -165,7 +178,7 @@ def rodar_pipeline(
     #    BLOQUEIA o deploy: review_ok só nasce de um Portão limpo.
     assert pode_avancar(estado, "review")  # trava: exige build_ok
     p2 = portao(r_build)
-    if not getattr(p2, "pronto", False):
+    if not _pronto(p2):
         motivo = _motivo_portao(p2)
         trilha.append(EtapaTrilha("review", False, motivo))
         return _para("review", motivo)
@@ -175,7 +188,7 @@ def rodar_pipeline(
     # 6) DEPLOY — só com review_ok (não basta build_ok).
     assert pode_avancar(estado, "deploy")  # trava: exige review_ok
     r_deploy = deploy(r_build)
-    if not getattr(r_deploy, "ok", False):
+    if not _ok(r_deploy):
         motivo = _motivo(r_deploy, "deploy falhou")
         trilha.append(EtapaTrilha("deploy", False, motivo))
         return _para("deploy", motivo)
@@ -185,7 +198,7 @@ def rodar_pipeline(
     # 7) VALIDAÇÃO ao vivo (I-1): sem prova, NÃO é pronto.
     assert pode_avancar(estado, "validar")  # trava: exige deploy_ok
     r_val = validar(r_deploy)
-    if not getattr(r_val, "ok", False):
+    if not _ok(r_val):
         motivo = _motivo(r_val, "validação ao vivo não confirmou")
         trilha.append(EtapaTrilha("validar", False, motivo))
         return _para("validar", motivo)

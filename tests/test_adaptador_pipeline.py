@@ -206,6 +206,50 @@ def test_validacao_falha_nao_declara_pronto():
     assert r.estado.deploy_ok and not r.estado.validado
 
 
+def test_ok_truthy_nao_booleano_nao_conta_como_sucesso():
+    """DENTES fail-closed: um estágio que devolve `ok` truthy-mas-não-`True`
+    (ex.: 1, "sim", um objeto de status) NÃO pode contar como sucesso. O gate
+    exige `is True` — senão o pipeline avança 'no escuro'."""
+    for valor in (1, "sim", ["x"], object()):
+        s = seams_felizes()
+        s["recon"] = Spy(retorno=SimpleNamespace(ok=valor, motivo="lixo truthy"))
+        r = rodar_pipeline("url", **s)
+        assert r.pronto is False and r.escalar is True
+        assert r.parou_em == "recon"
+        assert not r.estado.recon_ok
+        # nada a jusante foi tocado — nem o Portão.
+        assert s["portao"].n == 0
+        assert s["escrever_spec"].n == 0
+
+
+def test_portao_pronto_truthy_nao_booleano_nao_libera():
+    """DENTES fail-closed: o Portão POP só libera com `pronto is True`. Um
+    `pronto` truthy-não-booleano (pré-spec) BARRA — o spec não roda."""
+    for valor in (1, "clean", object()):
+        s = seams_felizes()
+        s["portao"] = Spy(SimpleNamespace(pronto=valor), clean())
+        r = rodar_pipeline("url", **s)
+        assert r.pronto is False and r.escalar is True
+        assert r.parou_em == "portao_pre_spec"
+        assert not r.estado.spec_ok
+        assert s["escrever_spec"].n == 0
+        assert s["deploy"].n == 0
+
+
+def test_review_pronto_truthy_nao_booleano_barra_o_deploy():
+    """DENTES fail-closed: no review (pós-build), um `pronto` truthy-não-`True`
+    NÃO pode liberar o deploy do adaptador numa plataforma real."""
+    s = seams_felizes()
+    s["portao"] = Spy(clean(), SimpleNamespace(pronto=1))  # review truthy-não-bool
+    r = rodar_pipeline("url", **s)
+    assert r.pronto is False and r.escalar is True
+    assert r.parou_em == "review"
+    assert not r.estado.review_ok
+    assert not r.estado.deploy_ok
+    assert s["build"].n == 1
+    assert s["deploy"].n == 0
+
+
 def test_trilha_registra_cada_etapa_executada_em_ordem():
     s = seams_felizes()
     r = rodar_pipeline("url", **s)

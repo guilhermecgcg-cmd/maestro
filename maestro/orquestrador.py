@@ -195,6 +195,13 @@ def orquestrar(estado, esperado, acoes, verificar, voz, *, agora=None,
     verdade agora). Curso é ASSÍNCRONO: enfileira a passada e confirma/escala em
     ciclos POSTERIORES via `voo`.
 
+    NOTA (decisão do dono): o DISPARO DE CAPTURA DE CURSO NÃO passa mais por aqui — o
+    dono é `orquestrar_captura`, que DELEGA a passada ao `captura.coordenar` (todas as
+    travas: sessão, anti-dup por completude, auto-ingest, Sintetizador, gate I-1). Esta
+    função permanece como o loop de feedback SÍNCRONO genérico (serviços/fila) e o
+    modelo de disparo-cru assíncrono (`disparar_passada` via AcoesAthena), ainda
+    exercitado em teste; o ramo de curso aqui não é o caminho de produção.
+
     `voo` é o estado que PERSISTE entre ciclos (o chamador — o loop — o cria uma vez
     e o passa DE VOLTA a cada ciclo). Mapeia curso -> passada em voo. Sem ele (None),
     um `voo` efêmero é criado: o disparo do ciclo atual não escala em falso, mas a
@@ -332,6 +339,133 @@ def _passada_em_voo(div, acoes, voz, voo, agora, max_tentativas, espera_s) -> Re
 def _escalar(voz, div, pedido: str) -> None:
     if voz is not None:
         voz.escalar(div, pedido)
+
+
+# =====================================================================
+# OWNER do disparo de captura de curso (a decisão do dono): o ORQUESTRADOR
+# (Camada 2) é o DONO do disparo — mas NÃO reimplementa nenhuma das travas do
+# coordenar. Ele DELEGA cada passada ao EXECUTOR (o `captura.coordenar`), que
+# carrega TODAS as travas testadas, e ENVOLVE-a com o que só a Camada 2 tem:
+# vigília de STALL pela FONTE DE VERDADE (Notion) e escalada honesta.
+# =====================================================================
+@dataclass(frozen=True)
+class ResultadoCurso:
+    """Desfecho de UMA passada de curso pela Camada 2 (o owner). `acao` é o que o
+    EXECUTOR (coordenar) reportou neste ciclo (Acao|None) — todas as travas a-d,f já
+    correram DENTRO dele. `concluido` só é True quando o Notion PROVA completude
+    (no_notion >= total, total>0): completude-por-Notion, nunca por flag nem por
+    presença. `stall_escalado` marca que o owner reconheceu ESTAGNAÇÃO (o Notion parou
+    de avançar) e escalou — o valor que a Camada 2 agrega sobre o coordenar, que fica
+    quieto para sempre. `progrediu` = o Notion avançou (a captura está andando)."""
+    curso: str
+    acao: object = None
+    concluido: bool = False
+    stall_escalado: bool = False
+    progrediu: bool = False
+
+
+def orquestrar_captura(cursos, passada_fn, notion_fn, voz, voo, *, agora=None,
+                       espera_s=1800.0) -> list:
+    """O ORQUESTRADOR como DONO do disparo de captura de curso. Para CADA curso, roda
+    UMA passada pelo EXECUTOR `passada_fn(curso)` — o `captura.coordenar`, que É o dono
+    testado das travas: (a) sessão VIVA (nunca loga sozinho), (b) anti-dup por
+    COMPLETUDE (no_notion>=total, não por presença), (c) auto-ingest confirmado, (d)
+    hook do Sintetizador/Cap C pós-captura, (f) completude-por-Notion (gate I-1). O
+    owner NÃO reimplementa nenhuma delas — só as INVOCA através do coordenar (reuso, não
+    duplicação). O gate de plataforma-nova (e) é aplicado ANTES desta chamada (no loop),
+    de modo que um curso sem adaptador nunca chega aqui.
+
+    O que o owner ADICIONA (o motivo de a Camada 2 ser o dono, e não o coordenar
+    sozinho): a VIGÍLIA DE STALL pela fonte de verdade. O coordenar, uma vez capturando,
+    fica quieto para sempre — nunca reconhece que a captura EMPACOU. O owner lê o
+    numerador REAL no Notion a cada ciclo (`notion_fn`), guarda-o cross-ciclo em `voo` e,
+    se um curso PARA de avançar por `espera_s`, ESCALA uma vez (latch anti-spam) — a
+    Athena não abandona em silêncio, mas também não martela.
+
+    INVIOLÁVEIS honrados aqui:
+      - ANTI-BAN: o owner NUNCA captura nem enfileira; quem enfileira é o coordenar
+        (idempotente por URL). Chamar a passada a cada ciclo NÃO re-enfileira um curso
+        já ativo (a fase do coordenar persiste em `estado`). Uma passada por ciclo.
+      - COMPLETUDE-POR-NOTION / anti-falso-pronto: `concluido` exige no_notion>=total
+        com total>0. total<=0 (enumeração transitoriamente indisponível — o worker
+        ainda não resolveu o course_id) NUNCA prova conclusão: o owner NÃO confirma e
+        NÃO julga stall (sem denominador confiável) — apenas AGUARDA. Isso mata o
+        falso-positivo de uma enum=0 transitória virar "curso concluído".
+
+    `passada_fn(curso) -> Acao|None`: uma passada do coordenar (todas as travas).
+    `notion_fn(curso) -> (no_notion|None, total)`: contagem REAL no Notion NESTE ciclo
+      (numerador) + total esperado (denominador). no_notion None => não deu para ler
+      agora — o owner não julga o curso às cegas (nem confirma, nem escala stall).
+    `voo`: store cross-ciclo por curso {desde, ultimo, avisado}. Criado UMA vez pelo
+      chamador e REINJETADO a cada ciclo — sem isso a vigília de stall (cross-ciclo)
+      nunca fecha. Um curso que conclui ou some é retirado do `voo`.
+    """
+    if voo is None:
+        voo = {}
+    if agora is None:
+        agora = time.time()
+
+    resultados = []
+    for curso in cursos:
+        # ---- EXECUTOR: a passada do coordenar (travas a-d, f correm AQUI DENTRO) ----
+        # O coordenar dirige a própria `voz` (pede reseed / avisa / escala honesto) e
+        # é idempotente por ciclo (a fase persiste em `estado`). Se a passada em si
+        # ESTOURA (bug/infra fora do tratamento do coordenar), o owner NÃO pode
+        # derrubar os demais cursos: reconhece, escala e segue (fail-closed).
+        try:
+            acao = passada_fn(curso)
+        except Exception as e:
+            _escalar(voz, Divergencia("captura_passada_estourou", curso, str(e)[:160]),
+                     f"[{curso}] a passada de captura ESTOUROU inesperadamente "
+                     f"({str(e)[:160]}) — segue os demais; re-tento no próximo ciclo.")
+            resultados.append(ResultadoCurso(curso, None, stall_escalado=True))
+            continue
+
+        # ---- VIGÍLIA DE STALL pela FONTE DE VERDADE (Notion) — só a Camada 2 ----
+        try:
+            no_notion, total = notion_fn(curso)
+        except Exception:
+            no_notion, total = None, 0
+        if no_notion is None:
+            resultados.append(ResultadoCurso(curso, acao))   # não leu o Notion: não julga
+            continue
+
+        no_notion, total = int(no_notion), int(total)
+        # completude-por-Notion: só conclui quando o Notion PROVA (>=total, total>0).
+        if total > 0 and no_notion >= total:
+            voo.pop(curso, None)                              # concluído: para de vigiar
+            resultados.append(ResultadoCurso(curso, acao, concluido=True))
+            continue
+        if total <= 0:
+            # enum transitória/desconhecida: SEM denominador confiável não se confirma
+            # NEM se julga stall (o falso-pronto por enum=0 morre aqui). Só aguarda.
+            resultados.append(ResultadoCurso(curso, acao))
+            continue
+
+        info = voo.get(curso)
+        if info is None:
+            voo[curso] = {"desde": agora, "ultimo": no_notion, "avisado": False}
+            resultados.append(ResultadoCurso(curso, acao))
+            continue
+        if no_notion > info["ultimo"]:                        # avançou: reinicia a janela
+            info["ultimo"] = no_notion
+            info["desde"] = agora
+            info["avisado"] = False
+            resultados.append(ResultadoCurso(curso, acao, progrediu=True))
+            continue
+        # sem avanço: dentro da janela -> aguarda; esgotada -> escala UMA vez (latch).
+        if agora - info["desde"] >= espera_s and not info["avisado"]:
+            info["avisado"] = True
+            espera = int(agora - info["desde"])
+            _escalar(voz, Divergencia("captura_estagnada", curso,
+                                      f"{no_notion}/{total} no Notion sem avanço"),
+                     f"[{curso}] captura ESTAGNADA: {no_notion}/{total} no Notion sem "
+                     f"avanço há {espera}s — a passada segue enfileirada mas o worker "
+                     f"não progride; precisa de olho humano (não abandono em silêncio).")
+            resultados.append(ResultadoCurso(curso, acao, stall_escalado=True))
+            continue
+        resultados.append(ResultadoCurso(curso, acao))        # aguardando (dentro da janela)
+    return resultados
 
 
 class AcoesAthena:

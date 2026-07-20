@@ -315,3 +315,30 @@ def test_rodar_persiste_offset_evita_reentrega_apos_restart():
     # fix, o primeiro get_updates do processo novo já pede a partir do offset
     # PERSISTIDO (6) — o Telegram nem reentrega o update antigo.
     assert tg2.offsets == [6]
+
+
+# --- offset ANCORADO em caminho ABSOLUTO (achado menor: relativo depende do cwd) ---
+from maestro.athena import resolver_offset_path
+
+
+def test_resolver_offset_path_relativo_ancora_no_base_dir():
+    # DENTE do achado 'offset em caminho relativo': um relativo depende do cwd; um
+    # restart de OUTRO diretório leria/gravaria outro arquivo e reprocessaria comandos.
+    # O resolver ancora o relativo no base_dir estável (o dir do registro) -> ABSOLUTO.
+    assert resolver_offset_path("athena_offset.txt", "/srv/maestro") == \
+        "/srv/maestro/athena_offset.txt"
+    # default (None/vazio) também ancora
+    assert resolver_offset_path(None, "/srv/maestro") == "/srv/maestro/athena_offset.txt"
+    assert resolver_offset_path("", "/srv/maestro") == "/srv/maestro/athena_offset.txt"
+
+
+def test_resolver_offset_path_absoluto_e_respeitado():
+    # Um caminho ABSOLUTO já é estável -> passa intacto (a escolha explícita do dono).
+    assert resolver_offset_path("/data/off.txt", "/srv/maestro") == "/data/off.txt"
+
+
+def test_resolver_offset_path_resultado_e_sempre_absoluto():
+    # A GARANTIA central: qualquer entrada relativa vira absoluta (imune ao cwd).
+    import os
+    assert os.path.isabs(resolver_offset_path("x/off.txt", "/srv/maestro"))
+    assert os.path.isabs(resolver_offset_path("off.txt", os.path.abspath(".")))

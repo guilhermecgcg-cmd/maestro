@@ -24,6 +24,7 @@ INVIOLÁVEL 3 (anti-login / arquitetura do usuário): /capturar só ENFILEIRA (u
 INSERT VPS-safe). NÃO abre Chrome, NÃO faz login. Quem executa o browser é o worker
 residencial que reivindica a fila; a sessão morta é detectada por ele no claim.
 """
+import os
 import time
 from dataclasses import dataclass
 
@@ -253,3 +254,16 @@ def offset_de_arquivo(caminho: str) -> dict:
             f.write(str(offset))
 
     return {"offset_load": _load, "offset_save": _save}
+
+
+def resolver_offset_path(valor, base_dir) -> str:
+    """Resolve o caminho do offset do Telegram para ABSOLUTO, ancorando um caminho
+    RELATIVO em `base_dir` (um diretório estável — o do registro, que não muda com o
+    cwd). Um caminho relativo depende do cwd do processo: um restart iniciado de OUTRO
+    diretório leria/gravaria um arquivo DIFERENTE (ou nenhum) e REPROCESSARIA comandos
+    antigos do Telegram — o exato bug que a persistência do offset existe para matar.
+    Expande '~'. Valor vazio/None => default 'athena_offset.txt' ancorado em base_dir."""
+    valor = os.path.expanduser((valor or "athena_offset.txt").strip())
+    if os.path.isabs(valor):
+        return valor
+    return os.path.join(base_dir, valor)

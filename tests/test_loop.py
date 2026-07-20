@@ -187,10 +187,16 @@ URL_ORQ = "https://plat/orq1"
 
 
 class _AcessoOrq(_Acesso):
-    """Modela o MECANISMO real do caminho orquestrador: o Notion (exec_app,
-    PROGRESSO_NOTION) reporta `no_notion`; o tracker (exec_sql) resolve course_id e
-    total esperado; o INSERT na fila é o enfileiramento da passada. `no_notion` é
-    mutado ENTRE ciclos (o worker residencial avançando a captura no Notion)."""
+    """Modela o MECANISMO real do caminho orquestrador AGORA que o EXECUTOR da passada
+    é o `captura.coordenar` (a decisão do dono). Portanto o dublê responde a TODAS as
+    consultas que o coordenar faz — não só ao INSERT da fila:
+      - sessão MORTA (fila_captura status): [] => 'desconhecida' (segue, não loga).
+      - anti-dup por COMPLETUDE (exec_app, JA_NO_NOTION): `no_notion` já no Notion.
+      - progresso do tracker (estado_aulas): pend = total - no_notion (>0 => ainda
+        capturando; 0 => tracker diz done, aí entra o gate I-1).
+      - gate I-1 (exec_app, PROGRESSO_NOTION): `no_notion` — a completude-por-Notion.
+      - auto-ingest (exec_app, reconcile): RECONCILE_OK.
+    `no_notion` é mutado ENTRE ciclos (o worker residencial avançando no Notion)."""
     def __init__(self, s, no_notion=10, total=18):
         super().__init__(s)
         self.no_notion = no_notion
@@ -206,14 +212,17 @@ class _AcessoOrq(_Acesso):
         if "coalesce(course_id" in sql:
             return ["cid1"]
         if "estado_aulas" in sql:
-            return [f"{self.total}|0"]
-        return []
+            pend = max(self.total - self.no_notion, 0)     # pend reflete o incompleto
+            return [f"{self.total}|{pend}"]
+        return []                                          # sessao_morta etc.: sem sinal
 
     def exec_app(self, container, comando, timeout=None):
         from maestro.adaptadores import captura
-        if captura.PROGRESSO_SENTINELA in comando:
+        if captura.NOTION_SENTINELA in comando:            # anti-dup por completude
+            return f"{captura.NOTION_SENTINELA} {self.no_notion}\n"
+        if captura.PROGRESSO_SENTINELA in comando:         # gate I-1 / vigília de stall
             return f"{captura.PROGRESSO_SENTINELA} {self.no_notion}\n"
-        return "RECONCILE_OK {}\n"       # rotina de reconcile do projeto conhecimento
+        return "RECONCILE_OK {}\n"                          # auto-ingest (reconcile)
 
 
 def _proj_orq():
@@ -223,46 +232,127 @@ def _proj_orq():
 
 
 def _cursos_de(resultados):
-    return [r for r in resultados if getattr(r, "divergencia", None) is not None]
+    # o owner devolve ResultadoCurso (curso + concluido/stall_escalado); filtra-os.
+    return [r for r in resultados if getattr(r, "curso", None) is not None]
 
 
-def test_orquestrador_cursos_voo_reinjetado_confirma_cross_ciclo_TEETH():
-    # DENTES do CONTRATO 1: com o MESMO `voo` reinjetado, uma passada enfileirada num
-    # ciclo (Notion 10/18 -> em voo, SEM escalar) é CONFIRMADA num ciclo POSTERIOR
-    # quando o worker avança o Notion para 18/18. Prova que o loop REALMENTE invoca a
-    # Camada 2 e que a confirmação é cross-ciclo — nunca no ciclo do disparo.
+def test_orquestrador_cursos_owner_dirige_coordenar_e_confirma_por_notion_TEETH():
+    # DENTES da DECISÃO DO DONO: o ORQUESTRADOR é o dono do disparo, mas o EXECUTOR da
+    # passada é o coordenar (travas reusadas). Ciclo 1 (Notion 10/18): o coordenar
+    # enfileira UMA vez (anti-dup por completude viu 10<18 -> RETOMA) e NÃO conclui; o
+    # owner marca o curso em vigília no `voo`, sem escalar. Só num ciclo POSTERIOR, com o
+    # Notion em 18/18, a conclusão é PROVADA (completude-por-Notion) — nunca no ciclo do
+    # disparo, nunca por flag. TEETH: se o owner disparasse cru (sem coordenar), a
+    # anti-dup/gate I-1 não correriam (nenhuma consulta JA_NO_NOTION/PROGRESSO_NOTION).
     a = _AcessoOrq({"worker": Servico("worker", up=True, restarting=False)})
     v = _Voz()
     proj = _proj_orq()
     voo = {}                                   # criado UMA vez, reinjetado nos dois ciclos
     r1 = ciclo(a, v, [proj], llm=lambda p: "{}", voo=voo, orquestrar_cursos=True)
     c1 = _cursos_de(r1)
-    assert c1 and c1[0].em_voo is True and c1[0].escalou is False
-    assert URL_ORQ in voo                       # a passada persiste "em voo"
-    assert a.inserts == 1                        # enfileirou UMA vez
+    assert c1 and c1[0].concluido is False and c1[0].stall_escalado is False
+    assert URL_ORQ in voo                       # curso em vigília (aguardando o Notion)
+    assert a.inserts == 1                        # o EXECUTOR (coordenar) enfileirou UMA vez
+    # a passada REALMENTE passou pelo coordenar: consultou anti-dup por completude
+    assert any("estado_aulas" in s for s in a.sqls)  # (total esperado p/ a régua de completude)
     assert v.escaladas == []                     # NÃO escalou no ciclo do disparo
 
-    a.no_notion = 18                             # worker residencial avança o Notion
+    a.no_notion = 18                             # worker residencial avança o Notion p/ 18/18
     r2 = ciclo(a, v, [proj], llm=lambda p: "{}", voo=voo, orquestrar_cursos=True)
     c2 = _cursos_de(r2)
-    assert c2 and c2[0].confirmado is True and c2[0].em_voo is False
-    assert URL_ORQ not in voo                    # saiu do voo ao confirmar
+    assert c2 and c2[0].concluido is True        # completude PROVADA no Notion (18>=18)
+    assert URL_ORQ not in voo                    # saiu da vigília ao concluir
     assert a.inserts == 1                        # NÃO re-enfileirou (anti-ban: não martela)
 
 
-def test_orquestrador_cursos_voo_NAO_reinjetado_nunca_confirma_TEETH():
-    # DENTES da REINJEÇÃO: se o loop criasse um `voo` NOVO a cada ciclo (não reinjetasse
-    # o mesmo dict), a passada em voo se perderia e a confirmação cross-ciclo NUNCA
-    # aconteceria. Aqui cada ciclo recebe um voo FRESCO -> o ciclo 2 (já completo no
-    # Notion) não confirma nada (a passada some). É o modo de falha que a reinjeção mata.
+def test_orquestrador_owner_enum_transitoria_zero_NAO_confirma_falso_TEETH():
+    # DENTES do achado 'enum transitória=0 falsa-confirmação': se a enumeração do total
+    # falha NESTE ciclo (course_id ainda não resolvido -> _total_esperado=0), o owner
+    # NÃO pode declarar o curso concluído (total<=0 nunca prova completude-por-Notion) —
+    # seria um falso-pronto. Deve apenas AGUARDAR. TEETH: no bug, total=0 tornava o curso
+    # 'não incompleto' e a confirmação cega o dava por concluído.
+    class _AcessoEnumZero(_AcessoOrq):
+        def exec_sql(self, container, sql, *, db, user="postgres", rows=True):
+            self.sqls.append(sql)
+            if "INSERT INTO fila_captura" in sql:
+                self.inserts += 1
+                return []
+            if "coalesce(course_id" in sql:
+                return [""]            # worker ainda não resolveu o course_id
+            if "estado_aulas" in sql:
+                return []              # sem course_id -> enumeração vazia -> total=0
+            return []
+    a = _AcessoEnumZero({"worker": Servico("worker", up=True, restarting=False)})
+    a.no_notion = 200                  # há aulas no Notion, mas o total é DESCONHECIDO
+    v = _Voz()
+    voo = {}
+    r = ciclo(a, v, [_proj_orq()], llm=lambda p: "{}", voo=voo, orquestrar_cursos=True)
+    c = _cursos_de(r)
+    assert c and c[0].concluido is False         # total desconhecido NUNCA conclui
+    assert URL_ORQ not in voo                     # sem denominador: nem vigia (só aguarda)
+
+
+def test_orquestrador_owner_vigia_stall_e_escala_uma_vez_TEETH():
+    # DENTES do valor da Camada 2 sobre o coordenar: o coordenar, uma vez capturando,
+    # fica QUIETO para sempre — nunca reconhece que a captura EMPACOU. O owner vigia o
+    # numerador no Notion e, se ele NÃO avança por `espera_s`, ESCALA uma vez (latch, sem
+    # spam). Aqui o Notion trava em 10/18 por ciclos além da janela -> uma escalada de
+    # estagnação; e o coordenar NÃO re-enfileira (anti-ban). TEETH: sem a vigília, um
+    # curso empacado ficaria eternamente em silêncio (0 escaladas).
     a = _AcessoOrq({"worker": Servico("worker", up=True, restarting=False)})
+    a.no_notion = 10                              # trava em 10/18 (worker não progride)
     v = _Voz()
     proj = _proj_orq()
-    ciclo(a, v, [proj], llm=lambda p: "{}", voo={}, orquestrar_cursos=True)  # voo efêmero
-    a.no_notion = 18
-    r2 = ciclo(a, v, [proj], llm=lambda p: "{}", voo={}, orquestrar_cursos=True)  # outro voo
-    c2 = _cursos_de(r2)
-    assert not any(r.confirmado for r in c2)     # sem reinjeção: confirmação se perde
+    voo = {}
+    # espera_s curta via override do orquestrador não é exposta pelo ciclo; simula-se com
+    # muitos ciclos e uma janela default alta -> em vez disso testamos o owner direto:
+    from maestro import orquestrador
+    from maestro.adaptadores import captura
+    executor = captura.FilaExecutor(a, proj)
+    cap_estado = {}
+    def passada(curso):
+        return captura.coordenar(proj, a, v, executor=executor, curso_url=curso,
+                                 estado=cap_estado.setdefault(curso, {}), agora=1000.0,
+                                 progresso_notion_fn=lambda u: captura.progresso_curso_no_notion(a, "cp_app", u))
+    def notion(curso):
+        return (captura.progresso_curso_no_notion(a, "cp_app", curso).no_notion,
+                captura._total_esperado(proj, a, curso, None))
+    # ciclo 0 (t=1000): enfileira, entra em vigília
+    orquestrador.orquestrar_captura([URL_ORQ], passada, notion, v, voo,
+                                    agora=1000.0, espera_s=600.0)
+    assert v.escaladas == []                      # ainda dentro da janela
+    # ciclo 1 (t além da janela, sem avanço): ESCALA estagnação UMA vez
+    r1 = orquestrador.orquestrar_captura([URL_ORQ], passada, notion, v, voo,
+                                         agora=1000.0 + 601, espera_s=600.0)
+    assert r1[0].stall_escalado is True
+    assert sum("ESTAGNADA" in e for e in v.escaladas) == 1
+    # ciclo 2 (ainda travado): latch -> NÃO re-escala (não spamma)
+    orquestrador.orquestrar_captura([URL_ORQ], passada, notion, v, voo,
+                                    agora=1000.0 + 1202, espera_s=600.0)
+    assert sum("ESTAGNADA" in e for e in v.escaladas) == 1
+    assert a.inserts == 1                          # o coordenar NÃO re-enfileirou (anti-ban)
+
+
+def test_orquestrador_ON_gate_plataforma_nova_escala_e_NAO_captura_TEETH():
+    # DENTES do achado IMPORTANTE da fiação: ligar o orquestrador BURLAVA o gate de
+    # plataforma-nova (ele só existia no ramo coordenar). Agora o gate está TAMBÉM no
+    # caminho do orquestrador: um curso Kiwify (sem adaptador) com orquestrar_cursos=True
+    # é ESCALADO e NÃO capturado (o coordenar nem é chamado). TEETH: sem o gate no ramo
+    # ON, o curso seria disparado numa plataforma que o motor não sabe raspar.
+    a = _AcessoOrq({"worker": Servico("worker", up=True, restarting=False)})
+    v = _Voz()
+    proj = _proj(servicos=("worker",), adaptador="conhecimento", db_container="cp_db",
+                 db_name="conhecimento", app_container="cp_app",
+                 cursos_desejados=("https://app.kiwify.com/curso/9",))
+    estado = {}
+    ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado, voo={}, orquestrar_cursos=True,
+          plataformas_suportadas=frozenset({"hotmart.com"}))
+    assert a.inserts == 0                              # NÃO enfileirou (não capturou)
+    assert any("PLATAFORMA NOVA" in e for e in v.escaladas)   # escalou o gatilho de B
+    # latch: 2º ciclo NÃO re-escala (não spamma)
+    ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado, voo={}, orquestrar_cursos=True,
+          plataformas_suportadas=frozenset({"hotmart.com"}))
+    assert sum("PLATAFORMA NOVA" in e for e in v.escaladas) == 1
 
 
 def test_ciclo_desligado_por_default_usa_coordenar_nao_orquestrador():
@@ -283,13 +373,12 @@ def test_ciclo_desligado_por_default_usa_coordenar_nao_orquestrador():
     assert estado["p1::captura"][URL_ORQ]["fase"] == "capturando"
 
 
-def test_run_reinjeta_voo_entre_ciclos_e_nao_martela_TEETH():
-    # DENTES da PLUMBAGEM em run(): run cria o voo UMA vez e o REINJETA a cada ciclo.
-    # ANTI-BAN: um curso que segue INCOMPLETO no Notion (o worker ainda captura) NÃO
-    # pode ser re-enfileirado ciclo a ciclo — a passada fica "em voo" e AGUARDA (dentro
-    # da janela de espera). Isso SÓ acontece se o mesmo `voo` sobrevive entre ciclos:
-    # se run recriasse o voo a cada ciclo, cada ciclo trataria o curso como "1ª vez" e
-    # RE-ENFILEIRARIA (martelar = violação anti-ban). 3 ciclos, 1 só INSERT = prova.
+def test_run_orquestrador_nao_martela_a_fila_em_3_ciclos_TEETH():
+    # DENTES ANTI-BAN da PLUMBAGEM em run(): um curso que segue INCOMPLETO no Notion (o
+    # worker ainda captura) NÃO pode ser re-enfileirado ciclo a ciclo. Com o coordenar
+    # como EXECUTOR, a fase persiste no `estado` (por-curso, entre ciclos): ciclo 1
+    # enfileira e vai a CAPTURANDO; ciclos 2-3 monitoram, NÃO re-enfileiram. A fase
+    # persiste porque run mantém o MESMO `estado` entre ciclos. 3 ciclos, 1 só INSERT.
     a = _AcessoOrq({"worker": Servico("worker", up=True, restarting=False)})
     a.no_notion = 10                       # segue incompleto (10/18) em todos os ciclos
     v = _Voz()

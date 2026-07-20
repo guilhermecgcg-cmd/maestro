@@ -5,7 +5,6 @@ doente -> Cérebro; problemas de adaptador -> adaptador) e reporta (Voz). Genér
 testável com dublês."""
 import asyncio
 import time
-from types import SimpleNamespace
 
 from maestro import sentinela, playbook, observador, orquestrador, adaptador_pipeline
 from maestro.cerebro import diagnosticar
@@ -132,17 +131,16 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None, voo=None,
                 (lambda u: captura.progresso_curso_no_notion(acesso, alvo_app, u))
                 if alvo_app else None)
             if orquestrar_cursos and alvo_app:
-                # CAMADA 2 (o CÉREBRO) sobre os cursos: lê o estado OBSERVADO (progresso
-                # REAL no Notion NESTE ciclo) + o ESPERADO (enumeração) e roda o feedback
-                # loop cross-ciclo com o `voo` REINJETADO. É AQUI que uma passada fica "em
-                # voo" e só confirma/escala em ciclos POSTERIORES. `estado.progresso`
-                # reflete o Notion lido agora (nunca flag). DESLIGADO por default: quando
-                # ligado, ELE (não o coordenar) é o dono do disparo dos cursos — ver a
-                # pendência de design registrada no relatório (coordenar ainda detém
-                # anti-dup por completude + checagem de sessão + auto-ingest).
+                # CAMADA 2 é o DONO do disparo (decisão do dono): o ORQUESTRADOR roda a
+                # passada de cada curso, mas o EXECUTOR da passada é o `captura.coordenar`
+                # — reuso das travas testadas (sessão viva, anti-dup por completude,
+                # auto-ingest, hook do Sintetizador, gate I-1), sem duplicá-las. O owner
+                # ADICIONA a vigília de STALL pela fonte de verdade (Notion) e o gate de
+                # plataforma-nova. PRIMÁRIO por default; fail-closed no `else`.
                 acoes.extend(_orquestrar_cursos(
-                    proj, acesso, voz, executor, prog_notion_fn,
-                    agora=snap["agora"], voo=voo))
+                    proj, acesso, voz, executor, prog_notion_fn, cap_estado,
+                    agora=snap["agora"], voo=voo, sintese_fn=sintese_fn,
+                    plataformas_suportadas=plataformas_suportadas))
             else:
                 for curso_url in proj.cursos_desejados:
                     st = cap_estado.setdefault(curso_url, {})
@@ -186,33 +184,52 @@ def _escalar_plataforma_nova(proj, voz, curso_url, st):
     return playbook.Acao("", False, True, pedido)
 
 
-# formas do estado OBSERVADO que o orquestrador (Camada 2) consome. Espelham
-# observador.ServicoObservado/ProgressoCurso no que o orquestrador de fato lê.
-def _prog_obs(curso, done, total):
-    return SimpleNamespace(curso=curso, done=int(done), total=int(total))
-
-
-def _orquestrar_cursos(proj, acesso, voz, executor, prog_notion_fn, *, agora, voo):
-    """Monta o snapshot OBSERVADO por-curso (done = contagem REAL no Notion; total =
-    enumeração esperada) e roda `orquestrador.orquestrar` com o `voo` reinjetado.
-    Curso cujo Notion/enumeração não dá para ler NESTE ciclo é PULADO (não vira
-    divergência às cegas). Devolve os Resultados (o `run` os ignora; testes os leem)."""
+def _orquestrar_cursos(proj, acesso, voz, executor, prog_notion_fn, cap_estado, *,
+                       agora, voo, sintese_fn=None, plataformas_suportadas=None):
+    """O ORQUESTRADOR como DONO do disparo de curso. Para cada curso desejado:
+      1. GATE DE PLATAFORMA-NOVA (Capacidade B) — AGORA TAMBÉM no caminho do
+         orquestrador (fecha o BYPASS do achado da fiação: ligar o orquestrador não
+         podia mais capturar numa plataforma sem adaptador). Mesmo latch/escala da via
+         coordenar; curso sem adaptador é PULADO (não vira passada).
+      2. A passada é EXECUTADA pelo `captura.coordenar` — reuso das travas testadas
+         (sessão viva, anti-dup por completude, auto-ingest, hook do Sintetizador, gate
+         I-1). O owner (`orquestrador.orquestrar_captura`) só as INVOCA e ENVOLVE-as com
+         a vigília de STALL pela fonte de verdade (Notion), com o `voo` reinjetado.
+    Devolve os ResultadoCurso (o `run` os ignora; os testes os leem)."""
     from maestro.adaptadores import captura
-    progresso, esperado_cursos = [], {}
+    acoes = []
+    cursos_ok = []
     for curso_url in proj.cursos_desejados:
+        st = cap_estado.setdefault(curso_url, {})
+        if (plataformas_suportadas is not None and
+                not adaptador_pipeline.plataforma_suportada(curso_url, plataformas_suportadas)):
+            acao = _escalar_plataforma_nova(proj, voz, curso_url, st)
+            if acao is not None:
+                acoes.append(acao)
+            continue
+        cursos_ok.append(curso_url)
+
+    # EXECUTOR: cada passada é UMA passada do coordenar, com o MESMO estado por-curso
+    # persistido entre ciclos (a fase do coordenar; idempotente por ciclo -> não
+    # martela a fila). Todas as travas a-d,f correm DENTRO desta chamada.
+    def passada_fn(curso):
+        return captura.coordenar(proj, acesso, voz, executor=executor, curso_url=curso,
+                                 estado=cap_estado[curso], agora=agora,
+                                 progresso_notion_fn=prog_notion_fn, sintese_fn=sintese_fn)
+
+    # numerador REAL no Notion NESTE ciclo (a fonte de verdade da vigília de stall) +
+    # denominador esperado (enumeração). Falha de leitura => (None, 0): o owner não
+    # julga o curso às cegas. total<=0 (enum transitória) nunca prova conclusão.
+    def notion_fn(curso):
         try:
-            no_notion = prog_notion_fn(curso_url).no_notion
+            no_notion = prog_notion_fn(curso).no_notion
         except Exception:
-            continue                      # não lê o Notion agora -> não diagnostica às cegas
-        total = captura._total_esperado(proj, acesso, curso_url, None)
-        progresso.append(_prog_obs(curso_url, no_notion, total))
-        esperado_cursos[curso_url] = total
-    est_obs = SimpleNamespace(servicos=(), progresso=tuple(progresso))
-    acoes_ath = orquestrador.AcoesAthena(acesso, proj, executor=executor)
-    # verificar só é consultado p/ serviços (efeito imediato); aqui só há cursos
-    # (assíncronos, confirmados via `voo`), então nunca é chamado.
-    return orquestrador.orquestrar(est_obs, {"cursos": esperado_cursos}, acoes_ath,
-                                   lambda div: False, voz, agora=agora, voo=voo)
+            return (None, 0)
+        return (no_notion, captura._total_esperado(proj, acesso, curso, None))
+
+    acoes.extend(orquestrador.orquestrar_captura(
+        cursos_ok, passada_fn, notion_fn, voz, voo, agora=agora))
+    return acoes
 
 
 async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=120.0,

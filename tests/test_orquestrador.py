@@ -649,3 +649,95 @@ def test_acoes_athena_sem_executor_recusa_disparo():
     acoes = orquestrador.AcoesAthena(FakeAcesso(), _projeto())
     with pytest.raises(Exception):
         acoes.disparar_passada(CURSO)
+
+
+# =====================================================================
+# 6 — orquestrar_captura: o ORQUESTRADOR como DONO do disparo, coordenar = EXECUTOR
+# =====================================================================
+def test_orquestrar_captura_delega_a_passada_ao_executor():
+    # O owner NÃO enfileira nem captura: ele DELEGA a passada ao executor (coordenar).
+    # Aqui `passada_fn` é o dublê do coordenar; o owner só o invoca e lê o Notion.
+    chamou = []
+    voz = FakeVoz()
+    voo = {}
+    res = orquestrador.orquestrar_captura(
+        [CURSO], lambda c: chamou.append(c) or "acao",
+        lambda c: (10, 18), voz, voo, agora=1000.0)
+    assert chamou == [CURSO]                 # a passada correu pelo EXECUTOR
+    assert res[0].concluido is False and res[0].stall_escalado is False
+    assert CURSO in voo                        # entrou em vigília (incompleto)
+    assert voz.escaladas == []
+
+
+def test_orquestrar_captura_conclui_so_quando_notion_prova():
+    voz = FakeVoz()
+    voo = {CURSO: {"desde": 0.0, "ultimo": 10, "avisado": False}}
+    res = orquestrador.orquestrar_captura(
+        [CURSO], lambda c: "acao", lambda c: (18, 18), voz, voo, agora=1000.0)
+    assert res[0].concluido is True            # 18>=18 no Notion -> PROVADO
+    assert CURSO not in voo                     # saiu da vigília
+
+
+def test_orquestrar_captura_total_zero_nunca_conclui_nem_vigia_TEETH():
+    # DENTES do achado enum=0: total<=0 (enum transitória) NUNCA prova completude —
+    # não conclui e não entra em vigília (sem denominador). Só aguarda.
+    voz = FakeVoz()
+    voo = {}
+    res = orquestrador.orquestrar_captura(
+        [CURSO], lambda c: "acao", lambda c: (200, 0), voz, voo, agora=1000.0)
+    assert res[0].concluido is False
+    assert CURSO not in voo
+    assert voz.escaladas == []
+
+
+def test_orquestrar_captura_notion_ilegivel_nao_julga_as_cegas():
+    # numerador None (não deu p/ ler o Notion agora) -> nem conclui, nem vigia stall.
+    voz = FakeVoz()
+    voo = {}
+    res = orquestrador.orquestrar_captura(
+        [CURSO], lambda c: "acao", lambda c: (None, 18), voz, voo, agora=1000.0)
+    assert res[0].concluido is False and res[0].stall_escalado is False
+    assert CURSO not in voo
+
+
+def test_orquestrar_captura_passada_que_estoura_nao_derruba_os_demais_TEETH():
+    # DENTES do fail-closed do owner: se a passada de UM curso ESTOURA (bug/infra fora
+    # do tratamento do coordenar), o owner NÃO pode abandonar os OUTROS — reconhece o
+    # que estourou (escala) e segue resolvendo o resto.
+    OUTRO = "https://hotmart.com/x/products/999"
+    voz = FakeVoz()
+    voo = {}
+
+    def passada(c):
+        if c == CURSO:
+            raise RuntimeError("coordenar estourou")
+        return "acao"
+
+    res = orquestrador.orquestrar_captura(
+        [CURSO, OUTRO], passada, lambda c: (5, 18), voz, voo, agora=1000.0)
+    por = {r.curso: r for r in res}
+    assert por[CURSO].stall_escalado is True     # o que estourou -> escalado
+    assert len(voz.escaladas) == 1
+    assert por[OUTRO].curso == OUTRO             # o outro NÃO foi abandonado
+    assert OUTRO in voo                           # e seguiu para a vigília normal
+
+
+def test_orquestrar_captura_stall_escala_uma_vez_e_progresso_reinicia_a_janela():
+    voz = FakeVoz()
+    voo = {}
+    # ciclo 0: enfileira a vigília
+    orquestrador.orquestrar_captura([CURSO], lambda c: "a", lambda c: (10, 18),
+                                    voz, voo, agora=1000.0, espera_s=600.0)
+    # ciclo 1: janela esgotada SEM avanço -> escala UMA vez
+    r1 = orquestrador.orquestrar_captura([CURSO], lambda c: "a", lambda c: (10, 18),
+                                         voz, voo, agora=1601.0, espera_s=600.0)
+    assert r1[0].stall_escalado is True and len(voz.escaladas) == 1
+    # ciclo 2: latch -> NÃO re-escala
+    orquestrador.orquestrar_captura([CURSO], lambda c: "a", lambda c: (10, 18),
+                                    voz, voo, agora=2202.0, espera_s=600.0)
+    assert len(voz.escaladas) == 1
+    # ciclo 3: o Notion AVANÇA (12) -> reinicia a janela, destrava o latch, sem escalar
+    r3 = orquestrador.orquestrar_captura([CURSO], lambda c: "a", lambda c: (12, 18),
+                                         voz, voo, agora=2803.0, espera_s=600.0)
+    assert r3[0].progrediu is True and len(voz.escaladas) == 1
+    assert voo[CURSO]["ultimo"] == 12 and voo[CURSO]["avisado"] is False

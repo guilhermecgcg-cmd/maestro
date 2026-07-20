@@ -12,7 +12,7 @@ from maestro.config import carregar
 from maestro.registro import carregar as carregar_registro
 from maestro.voz import Voz
 from maestro import loop
-from maestro.athena import Athena, offset_de_arquivo
+from maestro.athena import Athena, offset_de_arquivo, resolver_offset_path
 from maestro.adaptadores import captura
 from maestro.telegram_api import TelegramClient
 
@@ -81,13 +81,20 @@ def main():  # pragma: no cover
         tg_athena = TelegramClient(cfg.bot_token)
         athena = Athena(tg_athena, voz, acesso=acesso, executor=executor,
                         captura_fn=captura_fn, autorizados=cfg.autorizados)
-    offset_path = os.getenv("ATHENA_OFFSET_PATH", "athena_offset.txt")
+    # Offset do Telegram ANCORADO em caminho ABSOLUTO (o dir do registro, estável) —
+    # um relativo dependeria do cwd e um restart de outro diretório reprocessaria
+    # comandos antigos (a persistência do offset existe justamente p/ evitar isso).
+    offset_path = resolver_offset_path(
+        os.getenv("ATHENA_OFFSET_PATH"), os.path.dirname(os.path.abspath(cfg.registro_path)))
     offset_seam = offset_de_arquivo(offset_path)
 
-    # Camada 2 (orquestrador de cursos) DESLIGADA por default: pende a decisão de
-    # posse coordenar-vs-orquestrador (ver relatório da fiação). Liga via env quando
-    # o dono aprovar. O `voo` cross-ciclo e a plumbagem já existem no loop.
-    orquestrar_cursos = bool(os.getenv("ATHENA_ORQUESTRADOR"))
+    # Camada 2 (orquestrador) é o DONO PRIMÁRIO do disparo de curso (decisão do dono):
+    # ele roda a passada e o `captura.coordenar` é o EXECUTOR (todas as travas — sessão,
+    # anti-dup por completude, auto-ingest, Sintetizador, gate I-1), com o gate de
+    # plataforma-nova AGORA também no caminho do orquestrador. LIGADO por default;
+    # fail-closed: ATHENA_ORQUESTRADOR=0 volta ao caminho coordenar-direto (fallback).
+    orquestrar_cursos = os.getenv("ATHENA_ORQUESTRADOR", "1").strip().lower() not in (
+        "0", "false", "no", "off", "")
 
     # CAPACIDADE B (gatilho): plataformas com adaptador. Um curso desejado numa
     # plataforma FORA desta lista é ESCALADO (plataforma nova, sem adaptador) e NÃO

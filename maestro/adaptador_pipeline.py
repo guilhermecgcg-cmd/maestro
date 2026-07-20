@@ -33,6 +33,24 @@ As TRAVAS invioláveis (o que os testes trancam):
   4. I-1: só é `pronto` com a validação ao vivo confirmada (`validado`); deploy sem
      validação NÃO é pronto (mata o falso-pronto)."""
 from dataclasses import dataclass, replace
+from urllib.parse import urlparse
+
+
+def plataforma_de_url(url) -> str:
+    """Host 'nu' (sem 'www.', sem porta) da URL — a IDENTIDADE da plataforma que decide
+    se já existe adaptador. '' se não parsear (fail-closed: tratado como não-suportado)."""
+    host = (urlparse(str(url)).hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def plataforma_suportada(url, suportadas) -> bool:
+    """True se o host da URL casa (por SUFIXO, cobrindo subdomínios) alguma plataforma
+    já suportada. Host vazio/não-parseável -> False (fail-closed: escala, não captura
+    às cegas). É o GATILHO da Capacidade B: False => plataforma NOVA (sem adaptador)."""
+    host = plataforma_de_url(url)
+    if not host:
+        return False
+    return any(host == s or host.endswith("." + s) for s in suportadas)
 
 
 # A ordem canônica dos estágios cujo AVANÇO depende da etapa anterior. "recon" é o

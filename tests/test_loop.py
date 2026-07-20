@@ -371,3 +371,50 @@ def test_servir_ignora_comando_de_chat_nao_autorizado_TEETH():
                                athena_intervalo=0, athena_max_iters=2))
     assert a.restarts == []          # comando não-autorizado NÃO reiniciou nada
     assert tg.enviadas == []         # nem respondeu (anti-reflector)
+
+
+# --- CAPACIDADE B: gatilho de plataforma nova (detecta -> escala, não captura) ---
+def test_plataforma_nova_escala_e_NAO_captura_TEETH():
+    # DENTES: um curso desejado numa plataforma SEM adaptador (kiwify) não pode ser
+    # capturado às cegas — o motor só sabe Hotmart. O gatilho da Capacidade B ESCALA
+    # (uma vez) e PULA o curso; o coordenar (que enfileiraria) NÃO é chamado.
+    class _AcessoB(_AcessoOrq):
+        def __init__(self, s):
+            super().__init__(s); self.coordenou = False
+        def exec_app(self, container, comando, timeout=None):
+            self.coordenou = True                       # qualquer toque no Notion = coordenar rodou
+            return super().exec_app(container, comando, timeout)
+    a = _AcessoB({"worker": Servico("worker", up=True, restarting=False)})
+    v = _Voz()
+    proj = _proj(servicos=("worker",), adaptador="conhecimento", db_container="cp_db",
+                 db_name="conhecimento", app_container="cp_app",
+                 cursos_desejados=("https://app.kiwify.com/curso/9",))
+    estado = {}
+    ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado,
+          plataformas_suportadas=frozenset({"hotmart.com"}))
+    assert a.inserts == 0                              # NÃO enfileirou (não capturou)
+    assert any("PLATAFORMA NOVA" in e for e in v.escaladas)   # escalou o gatilho de B
+    # latch: um 2º ciclo NÃO re-escala (não spamma o operador)
+    ciclo(a, v, [proj], llm=lambda p: "{}", estado=estado,
+          plataformas_suportadas=frozenset({"hotmart.com"}))
+    assert sum("PLATAFORMA NOVA" in e for e in v.escaladas) == 1
+
+
+def test_plataforma_suportada_segue_para_coordenar():
+    # Contraprova: um curso Hotmart (suportado) NÃO é escalado como plataforma nova —
+    # segue para o coordenar normalmente (enfileira).
+    class _AcessoCoord(_AcessoOrq):
+        def exec_app(self, container, comando, timeout=None):
+            from maestro.adaptadores import captura
+            if captura.NOTION_SENTINELA in comando:
+                return f"{captura.NOTION_SENTINELA} 0\n"   # curso novo -> enfileira
+            return "RECONCILE_OK {}\n"
+    a = _AcessoCoord({"worker": Servico("worker", up=True, restarting=False)})
+    v = _Voz()
+    proj = _proj(servicos=("worker",), adaptador="conhecimento", db_container="cp_db",
+                 db_name="conhecimento", app_container="cp_app",
+                 cursos_desejados=("https://hotmart.com/club/x/products/9",))
+    ciclo(a, v, [proj], llm=lambda p: "{}", estado={},
+          plataformas_suportadas=frozenset({"hotmart.com"}))
+    assert not any("PLATAFORMA NOVA" in e for e in v.escaladas)   # não é plataforma nova
+    assert a.inserts == 1                                          # coordenou (enfileirou)

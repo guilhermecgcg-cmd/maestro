@@ -67,6 +67,24 @@ class EstadoSintese:
     motivo: str
 
 
+def portao_via_pop(revisar, verificar, corrigir, *, max_rodadas=10):
+    """Constrói o seam `portao` que `orquestrar_sintese` (Capacidade C) exige, DELEGANDO
+    à Capacidade A (Portão de Qualidade POP, `portao_pop.rodar_portao`). É a costura que
+    LIGA A a C: C não conhece o loop review->fix->review; ele só recebe um callable
+    `portao(artefato) -> ResultadoPortao(pronto, escalar)`. Aqui esse callable RODA o
+    Portão POP de verdade (que só devolve `pronto` após um review LIMPO) e traduz o
+    veredito para a forma que C lê. Assim o artefato do Sintetizador passa OBRIGATÓRIA-
+    mente pelo Portão A antes de ser registrado — a regra inviolável do dono."""
+    from maestro import portao_pop
+
+    def _portao(artefato):
+        res = portao_pop.rodar_portao(artefato, revisar=revisar, verificar=verificar,
+                                      corrigir=corrigir, max_rodadas=max_rodadas)
+        return ResultadoPortao(pronto=res.pronto, escalar=res.escalar)
+
+    return _portao
+
+
 def orquestrar_sintese(curso, *, classificar, sintetizar, portao, registrar):
     """Opera o Sintetizador no fluxo pós-captura. Devolve EstadoSintese. Fail-closed:
     NUNCA declara 'sintetizado' sem portão limpo + registro (mata o falso-pronto)."""

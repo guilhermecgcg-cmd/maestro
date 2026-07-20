@@ -557,3 +557,72 @@ def test_protocolo_completo_novo_ate_concluido():
 def test_seam_esteira_existe_e_e_noop():
     assert hasattr(captura, "_hooks_esteira")
     assert captura._hooks_esteira(_proj(), URL, {}) == []
+
+
+# ==========================================================================
+# CAPACIDADE C ligada PÓS-CAPTURA (via sintese_fn) + CAPACIDADE A (Portão POP)
+# ==========================================================================
+def test_capacidade_c_dispara_pos_captura_e_passa_pelo_portao_A_TEETH():
+    # DENTES: a Capacidade C (Sintetizador) só pode ser acionada DEPOIS do auto-ingest
+    # confirmado — nunca antes. Aqui um curso COMPLETA a captura e o `sintese_fn` (o
+    # gatilho de C) roda `orquestrar_sintese`, cujo portão é a Capacidade A REAL
+    # (portao_via_pop -> portao_pop.rodar_portao). Provamos: (1) C rodou pós-captura;
+    # (2) o artefato PASSOU pelo Portão A (review->fix->review) antes de registrar;
+    # (3) só registrou porque o Portão limpou.
+    from maestro import sintetizador_orq
+    from maestro.sintetizador_orq import Artefato
+
+    revisados, registrados = [], []
+    portao = sintetizador_orq.portao_via_pop(
+        revisar=lambda art: revisados.append(art) or [],   # review LIMPO (zero achados)
+        verificar=lambda a, art: True, corrigir=lambda a, art: None)
+
+    def sintese_fn(projeto, curso_url):
+        return sintetizador_orq.orquestrar_sintese(
+            curso_url, classificar=lambda c: True,          # how-to -> aciona
+            sintetizar=lambda c: Artefato(skill="s", agente="a", sistema="sis"),
+            portao=portao, registrar=lambda art: registrados.append(art))
+
+    ac = FakeAcesso(resolve="55", aulas=["no_notion"] * 10, reconcile="RECONCILE_OK {}")
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(),
+                             curso_url=URL, estado=estado, agora=AGORA,
+                             sintese_fn=sintese_fn)
+    assert acao.executada and estado["fase"] == captura.FASE_CONCLUIDO
+    # C rodou PÓS-captura: o portão A revisou o artefato e o registro só ocorreu depois
+    assert len(revisados) == 1                       # Portão A (rodar_portao) foi acionado
+    assert len(registrados) == 1                     # registrado após o Portão limpar
+    est_sint = estado["sintese"]
+    assert est_sint.sintetizado is True and est_sint.escalar is False
+
+
+def test_capacidade_c_nao_dispara_se_captura_nao_conclui():
+    # DENTES do gatilho: se a captura NÃO conclui (ainda pendente), C NÃO é acionada —
+    # o Sintetizador consome o pgvector, que só existe após o auto-ingest.
+    disparos_c = []
+    ac = FakeAcesso(resolve="777", aulas=["no_notion", "pendente"])   # ainda capturando
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(),
+                             curso_url=URL, estado=estado, agora=AGORA,
+                             sintese_fn=lambda p, u: disparos_c.append(u))
+    assert acao is None                              # quieto, ainda capturando
+    assert disparos_c == []                          # C NÃO disparou (captura não concluiu)
+
+
+def test_esteira_nunca_derruba_a_captura_se_sintese_falha_TEETH():
+    # DENTES do isolamento: uma falha na esteira (Sintetizador estoura) NÃO pode
+    # derrubar a captura — o curso JÁ está concluído e confirmado no Notion. A exceção
+    # é engolida e registrada no estado; a Acao de conclusão volta normal.
+    def sintese_boom(projeto, curso_url):
+        raise RuntimeError("sintetizador indisponível")
+
+    ac = FakeAcesso(resolve="55", aulas=["no_notion"] * 10, reconcile="RECONCILE_OK {}")
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(),
+                             curso_url=URL, estado=estado, agora=AGORA,
+                             sintese_fn=sintese_boom)
+    assert acao.executada and estado["fase"] == captura.FASE_CONCLUIDO   # captura OK
+    assert "sintetizador indisponível" in estado.get("sintese_erro", "")

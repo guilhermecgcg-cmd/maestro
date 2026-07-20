@@ -89,9 +89,18 @@ def main():  # pragma: no cover
     # o dono aprovar. O `voo` cross-ciclo e a plumbagem já existem no loop.
     orquestrar_cursos = bool(os.getenv("ATHENA_ORQUESTRADOR"))
 
+    # CAPACIDADE B (gatilho): plataformas com adaptador. Um curso desejado numa
+    # plataforma FORA desta lista é ESCALADO (plataforma nova, sem adaptador) e NÃO
+    # capturado — a criação autônoma do adaptador aguarda aprovação humana. Default
+    # 'hotmart' (a única que o motor sabe hoje). Vazio => desligado (todos passam).
+    plataformas = frozenset(
+        p for p in os.getenv("PLATAFORMAS_SUPORTADAS", "hotmart.com").replace(" ", "").split(",") if p)
+    plataformas_suportadas = plataformas or None
+
     asyncio.run(loop.servir(
         acesso, voz, projetos, llm=llm, athena=athena, db=db,
-        orquestrar_cursos=orquestrar_cursos, intervalo_s=cfg.intervalo_s,
+        orquestrar_cursos=orquestrar_cursos, plataformas_suportadas=plataformas_suportadas,
+        intervalo_s=cfg.intervalo_s,
         offset_load=offset_seam["offset_load"], offset_save=offset_seam["offset_save"]))
 
 

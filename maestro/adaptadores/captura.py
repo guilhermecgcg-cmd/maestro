@@ -394,7 +394,8 @@ def _total_esperado(projeto, acesso, curso_url, total_esperado_fn):
 
 
 def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
-              ja_no_notion=None, progresso_notion_fn=None, total_esperado_fn=None):
+              ja_no_notion=None, progresso_notion_fn=None, total_esperado_fn=None,
+              sintese_fn=None):
     """Coordena o PROTOCOLO DE CAPTURA de UM curso (identificado por `curso_url`), um
     passo por ciclo, avançando a máquina de estados em `estado` (dict por curso,
     mutável, persiste entre ciclos). Dirige a `voz` diretamente (pede reseed / avisa /
@@ -618,23 +619,33 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
             return acao
         estado["fase"] = FASE_CONCLUIDO
         voz.avisar_acao(acao)
-        # SEAM DA ESTEIRA (declarado, não implementado): classificador fino + Sintetizador.
-        _hooks_esteira(projeto, curso_url, estado)
+        # ESTEIRA pós-captura: dispara a Capacidade C (Sintetizador) SÓ agora, depois do
+        # auto-ingest confirmado (o Sintetizador consome o que ficou no pgvector).
+        _hooks_esteira(projeto, curso_url, estado, sintese_fn=sintese_fn)
         return acao
 
     return None
 
 
-def _hooks_esteira(projeto, curso_url, estado) -> list:
-    """SEAM da esteira downstream — ponto de extensão APÓS o auto-ingest confirmado.
-    Hoje é um NO-OP honesto (não faz nada e não finge que fez): devolve [] ações.
+def _hooks_esteira(projeto, curso_url, estado, *, sintese_fn=None) -> list:
+    """Esteira downstream — ponto de extensão APÓS o auto-ingest confirmado (nunca
+    antes: o Sintetizador precisa das aulas já ingeridas no pgvector).
 
-    Aqui entram, quando construídos (fora do escopo agora):
-      - CLASSIFICADOR FINO: hoje inline no motor; passará a rodar como etapa própria
-        na esteira, classificando o curso/aulas por tipo/intenção.
-      - SINTETIZADOR: só para cursos how_to — extrai passo-a-passo/skills/agentes a
-        partir das aulas já ingeridas.
-    Ambos consomem o que o auto-ingest deixou no pgvector; por isso o gancho é DEPOIS
-    da ingestão confirmada, nunca antes.
+    Capacidade C (Sintetizador) entra aqui via o seam `sintese_fn(projeto, curso_url)`:
+    a Athena classifica o curso (how-to?), aciona o Sintetizador e faz o artefato PASSAR
+    pelo Portão POP (Capacidade A) antes de registrar — toda a lógica vive em
+    `sintetizador_orq.orquestrar_sintese`; aqui só a DISPARAMOS no gatilho certo (pós-
+    captura). `sintese_fn` None => NO-OP honesto (retrocompatível; ligado só quando o
+    Sintetizador real estiver plugado).
+
+    ISOLAMENTO: a esteira NUNCA pode derrubar a captura. Uma falha do Sintetizador é
+    registrada no `estado` (auditoria) e engolida aqui — a captura do curso já está
+    concluída e confirmada no Notion; a síntese é um passo POSTERIOR e independente.
     """
+    if sintese_fn is None:
+        return []
+    try:
+        estado["sintese"] = sintese_fn(projeto, curso_url)
+    except Exception as e:                    # esteira NUNCA derruba a captura
+        estado["sintese_erro"] = str(e)[:200]
     return []

@@ -258,3 +258,24 @@ def test_trilha_registra_cada_etapa_executada_em_ordem():
         "recon", "portao_pre_spec", "spec", "build", "review", "deploy", "validar"
     ]
     assert all(t.ok for t in r.trilha)
+
+
+# --- Capacidade B: detecção de plataforma (o GATILHO ligado ao loop) --------
+import maestro.adaptador_pipeline as ap
+
+
+def test_plataforma_de_url_extrai_host_nu():
+    assert ap.plataforma_de_url("https://www.kiwify.com/curso/9") == "kiwify.com"
+    assert ap.plataforma_de_url("https://hotmart.com/club/x") == "hotmart.com"
+    assert ap.plataforma_de_url("lixo-sem-host") == ""     # não parseável -> ''
+
+
+def test_plataforma_suportada_por_sufixo_e_fail_closed():
+    sup = frozenset({"hotmart.com"})
+    assert ap.plataforma_suportada("https://hotmart.com/x", sup) is True
+    assert ap.plataforma_suportada("https://sub.hotmart.com/x", sup) is True   # subdomínio
+    assert ap.plataforma_suportada("https://kiwify.com/x", sup) is False       # nova
+    # DENTES fail-closed: host não-parseável NÃO pode passar como suportado.
+    assert ap.plataforma_suportada("lixo", sup) is False
+    # DENTES: 'evilhotmart.com' NÃO casa 'hotmart.com' (sufixo exige fronteira de ponto)
+    assert ap.plataforma_suportada("https://evilhotmart.com/x", sup) is False

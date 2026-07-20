@@ -7,7 +7,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
-from maestro import sentinela, playbook, observador, orquestrador
+from maestro import sentinela, playbook, observador, orquestrador, adaptador_pipeline
 from maestro.cerebro import diagnosticar
 
 
@@ -33,7 +33,7 @@ def _resolver(p, acesso, proj, llm):
 
 
 def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None, voo=None,
-          orquestrar_cursos=False) -> list:
+          orquestrar_cursos=False, sintese_fn=None, plataformas_suportadas=None) -> list:
     todas = acesso.servicos()
     acoes = []
     if estado is None:
@@ -146,12 +146,44 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None, voo=None,
             else:
                 for curso_url in proj.cursos_desejados:
                     st = cap_estado.setdefault(curso_url, {})
+                    # CAPACIDADE B (gatilho): plataforma NOVA (sem adaptador). Só checa
+                    # quando `plataformas_suportadas` é fornecido (None => desligado,
+                    # retrocompatível). Fail-closed CONSERVADOR: NÃO capturamos numa
+                    # plataforma sem adaptador (o motor só sabe Hotmart) e NÃO construímos
+                    # o adaptador sozinhos — recon/build/deploy na infra paga exigem
+                    # decisão humana. Escalamos UMA vez (latch) e pulamos o curso.
+                    if (plataformas_suportadas is not None and
+                            not adaptador_pipeline.plataforma_suportada(
+                                curso_url, plataformas_suportadas)):
+                        acao = _escalar_plataforma_nova(proj, voz, curso_url, st)
+                        if acao is not None:
+                            acoes.append(acao)
+                        continue
                     acao = captura.coordenar(proj, acesso, voz, executor=executor,
                                              curso_url=curso_url, estado=st, agora=snap["agora"],
-                                             progresso_notion_fn=prog_notion_fn)
+                                             progresso_notion_fn=prog_notion_fn,
+                                             sintese_fn=sintese_fn)
                     if acao is not None:
                         acoes.append(acao)
     return acoes
+
+
+def _escalar_plataforma_nova(proj, voz, curso_url, st):
+    """Gatilho da Capacidade B: escala UMA vez (latch por-curso) que a plataforma é
+    NOVA (sem adaptador). NÃO dispara o pipeline de criação de adaptador
+    (adaptador_pipeline.rodar_pipeline) — recon autenticado + build + deploy na infra
+    paga são decisão do humano; o pipeline existe e está pronto, mas o gatilho apenas
+    ESCALA e aguarda aprovação (conservador, fail-closed)."""
+    if st.get("plataforma_nova_avisada"):
+        return None
+    plat = adaptador_pipeline.plataforma_de_url(curso_url)
+    pedido = (f"[{proj.nome}] {curso_url} está numa PLATAFORMA NOVA "
+              f"('{plat or 'desconhecida'}', sem adaptador). NÃO capturo sem adaptador; "
+              f"criar o adaptador (recon->Portão POP->build->deploy) precisa da SUA "
+              f"aprovação — pipeline pronto, gatilho aguardando decisão.")
+    voz.escalar(sentinela.Problema("plataforma_nova", curso_url, pedido, "aviso"), pedido)
+    st["plataforma_nova_avisada"] = True
+    return playbook.Acao("", False, True, pedido)
 
 
 # formas do estado OBSERVADO que o orquestrador (Camada 2) consome. Espelham
@@ -184,7 +216,8 @@ def _orquestrar_cursos(proj, acesso, voz, executor, prog_notion_fn, *, agora, vo
 
 
 async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=120.0,
-              max_iters=None, db=None, orquestrar_cursos=False):
+              max_iters=None, db=None, orquestrar_cursos=False, sintese_fn=None,
+              plataformas_suportadas=None):
     i = 0
     estado = {}
     # `voo` (Camada 2): criado UMA vez e REINJETADO a cada ciclo. É o store cross-ciclo
@@ -195,7 +228,8 @@ async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=12
         i += 1
         try:
             ciclo(acesso, voz, projetos, llm=llm, estado=estado, db=db, voo=voo,
-                  orquestrar_cursos=orquestrar_cursos)
+                  orquestrar_cursos=orquestrar_cursos, sintese_fn=sintese_fn,
+                  plataformas_suportadas=plataformas_suportadas)
         except Exception:
             pass
         await sleep(intervalo_s)
@@ -203,8 +237,9 @@ async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=12
 
 
 async def servir(acesso, voz, projetos, *, llm, athena=None, db=None,
-                 orquestrar_cursos=False, intervalo_s=120.0, max_iters=None,
-                 sleep_saude=asyncio.sleep, athena_intervalo=25, athena_max_iters=None,
+                 orquestrar_cursos=False, sintese_fn=None, plataformas_suportadas=None,
+                 intervalo_s=120.0, max_iters=None, sleep_saude=asyncio.sleep,
+                 athena_intervalo=25, athena_max_iters=None,
                  offset_load=None, offset_save=None):
     """Entrelaça a Camada 1+2 (loop de saúde/orquestração) com a Camada 3 (listener
     de comandos da Athena no Telegram) como tarefas CONCORRENTES. O listener é
@@ -217,7 +252,8 @@ async def servir(acesso, voz, projetos, *, llm, athena=None, db=None,
     loop de saúde (retrocompatível)."""
     tarefas = [run(acesso, voz, projetos, llm=llm, sleep=sleep_saude,
                    intervalo_s=intervalo_s, max_iters=max_iters, db=db,
-                   orquestrar_cursos=orquestrar_cursos)]
+                   orquestrar_cursos=orquestrar_cursos, sintese_fn=sintese_fn,
+                   plataformas_suportadas=plataformas_suportadas)]
     if athena is not None:
         kw = {"intervalo": athena_intervalo, "max_iters": athena_max_iters}
         if offset_load is not None:

@@ -119,8 +119,21 @@ def rodar_portao(artefato, *, revisar, verificar, corrigir, max_rodadas=10):
                 False, True,
                 "bug confirmado sem correção-com-dentes — portão não avança",
                 tuple(historico))
-        # Todos os confirmados foram corrigidos com dentes. Regra 5: re-revisa
-        # (o laço continua) — só um review limpo na próxima volta declara pronto.
+        if not confirmados:
+            # Nenhum bug CONFIRMADO nesta rodada: todos os achados foram
+            # descartados como falso-positivo (regra 4). Ninguém corrigiu nada,
+            # então o artefato está BYTE-A-BYTE igual — um review determinístico
+            # (o real) devolveria EXATAMENTE os mesmos achados na próxima volta.
+            # Re-revisar aqui não é 'checar de novo', é laço infinito até esgotar
+            # o orçamento e ESCALAR um artefato limpo por engano. Falso-positivo
+            # não bloqueia: zero bugs confirmados = pronto.
+            return ResultadoPortao(
+                True, False,
+                "achados todos falso-positivo (zero bugs confirmados) — pronto",
+                tuple(historico))
+        # Houve confirmados e TODOS foram corrigidos com dentes -> o artefato
+        # MUDOU. Regra 5: re-revisa (o laço continua) — só um review limpo (ou uma
+        # rodada sem bug confirmado) na próxima volta declara pronto.
 
     # Esgotou o orçamento ainda achando bug: NÃO minta 'pronto' (fail-closed).
     return ResultadoPortao(

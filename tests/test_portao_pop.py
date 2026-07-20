@@ -39,6 +39,20 @@ class RevisorRoteirado:
         return []  # depois do roteiro, review limpo
 
 
+class RevisorDeterministico:
+    """Modela um agente de review REAL: sempre devolve os MESMOS achados enquanto
+    o artefato não muda (review é função do código). Ao contrário do Roteirado,
+    NÃO 'esvazia' sozinho — se ninguém corrigiu nada, a próxima volta acha o
+    mesmo. É o dublê com dentes pro caso do falso-positivo teimoso."""
+    def __init__(self, achados):
+        self._achados = list(achados)
+        self.chamadas = 0
+
+    def __call__(self, artefato):
+        self.chamadas += 1
+        return list(self._achados)
+
+
 class Verificador:
     """Modela 'verificar o achado contra o código antes de implementar'. IDs em
     `falsos_positivos` são descartados (review errou). Registra o que verificou."""
@@ -131,6 +145,50 @@ def test_dentes_falso_positivo_nao_e_corrigido_nem_bloqueia():
     assert "FP" in verif.verificados          # foi verificado
     assert "FP" not in corr.corrigidos        # NÃO foi corrigido (era falso-positivo)
     assert res.pronto is True                 # não bloqueou
+
+
+# --- DENTES: falso-positivo TEIMOSO (review determinístico) -> pronto, não escala
+def test_dentes_falso_positivo_teimoso_converge_pronto_sem_escalar():
+    """Teste-com-dentes: reintroduzi 'só um review VAZIO declara pronto' (o loop
+    re-revisa após TODA rodada, mesmo quando nada foi corrigido). Um review REAL é
+    determinístico: se o achado é falso-positivo e ninguém mexeu no código, ele
+    reaparece em TODA rodada. Contra o loop ingênuo isto esgota o orçamento e
+    ESCALA por engano — com o artefato limpo. Exigimos: rodada sem NENHUM bug
+    confirmado (tudo falso-positivo) declara pronto na hora, não chama o fix, e
+    não desperdiça re-reviews. Logo, tem dentes."""
+    rev = RevisorDeterministico([_achado("FP")])  # reaparece toda rodada
+    verif = Verificador(falsos_positivos={"FP"})
+    corr = Corretor()
+    res = portao_pop.rodar_portao(
+        "art", revisar=rev, verificar=verif, corrigir=corr, max_rodadas=10)
+    assert res.pronto is True        # zero bugs confirmados = pronto
+    assert res.escalar is False      # NÃO escala um artefato limpo
+    assert corr.corrigidos == []     # falso-positivo nunca vai ao fix
+    assert rev.chamadas == 1         # convergiu já na 1ª rodada (sem re-review inútil)
+
+
+# --- DENTES: bug real corrigido + falso-positivo teimoso na mesma esteira ---
+def test_dentes_bug_corrigido_e_fp_teimoso_convergem():
+    """Um review determinístico que sempre acusa REAL (some após corrigido) e FP
+    (falso-positivo, nunca some). Rodada 1: corrige REAL com dentes -> artefato
+    muda -> re-revisa. Rodada 2: review determinístico ainda acusa FP (só ele);
+    zero confirmados -> pronto. O loop ingênuo (re-revisa sempre) ficaria preso no
+    FP até escalar. Exigimos convergência para pronto."""
+    class RevSomeReal:
+        def __init__(self):
+            self.chamadas = 0
+        def __call__(self, artefato):
+            self.chamadas += 1
+            return [_achado("REAL"), _achado("FP")] if self.chamadas == 1 else [_achado("FP")]
+    rev = RevSomeReal()
+    verif = Verificador(falsos_positivos={"FP"})
+    corr = Corretor(aplicada=True, com_dentes=True)
+    res = portao_pop.rodar_portao(
+        "art", revisar=rev, verificar=verif, corrigir=corr, max_rodadas=10)
+    assert res.pronto is True
+    assert res.escalar is False
+    assert corr.corrigidos == ["REAL"]   # só o confirmado foi ao fix
+    assert rev.chamadas == 2             # 1 review + 1 re-review (após o fix real)
 
 
 # --- Verificar ANTES de corrigir, e só corrigir o confirmado ---------------

@@ -32,6 +32,15 @@ class TelegramClient:
             msg = u.get("message")            # só mensagens novas (não edições)
             if not msg or "text" not in msg:
                 continue
+            # SEGURANÇA: só chat PRIVADO chega à Athena. A autorização de comando
+            # é por chat_id (Athena._autorizados); num chat privado chat.id ==
+            # user.id, então autorizar o chat É autorizar a pessoa. Num GRUPO,
+            # chat.id é único e COMPARTILHADO por todos os membros — deixar
+            # passar autorizaria qualquer membro do grupo, não só o operador.
+            # Rejeitar aqui (na borda de I/O) fecha o buraco sem a Athena
+            # precisar saber de from.id/chat.type.
+            if msg.get("chat", {}).get("type") != "private":
+                continue
             out.append(Update(update_id=u["update_id"],
                              chat_id=msg["chat"]["id"], texto=msg["text"]))
         return out

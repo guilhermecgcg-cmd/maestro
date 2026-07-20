@@ -70,10 +70,12 @@ class Athena:
         self._executor = executor        # .disparar(url) -> confirmação (contrato captura)
         self._captura_fn = captura_fn    # () -> str p/ a seção de captura do /status
         self._prioridades = prioridades if prioridades is not None else []
-        # SEGURANÇA: chats que PODEM comandar a infra. None = sem restrição (uso
-        # confiável/legado); produção DEVE passar o(s) chat(s) do operador —
-        # senão qualquer um que ache o bot dispara /restart, /capturar.
-        self._autorizados = set(autorizados) if autorizados is not None else None
+        # SEGURANÇA (fail-closed): chats que PODEM comandar a infra. autorizados
+        # é OBRIGATÓRIO na prática — None (o default) NEGA TUDO, não abre pra
+        # todo mundo. Produção DEVE passar o(s) chat(s) do operador explicitamente
+        # (ex.: MaestroConfig.autorizados / env TELEGRAM_AUTORIZADOS); sem isso, a
+        # interface fica muda (nenhum comando é atendido) em vez de aberta.
+        self._autorizados = frozenset(autorizados) if autorizados is not None else frozenset()
 
     # -- resposta SOLICITADA: vai ao remetente do comando ---------------------
     def _responder(self, chat_id, texto: str) -> None:
@@ -84,12 +86,14 @@ class Athena:
 
     # -- despacho de UM comando ----------------------------------------------
     def atender(self, chat_id, texto: str):
-        # SEGURANÇA: só o operador comanda a infra. Comando de um chat estranho é
-        # IGNORADO — sem agir e SEM responder (não confirmamos sequer que o bot
-        # existe: nada de virar reflector/alvo de flood). Gate opt-in: se
-        # `autorizados` é None (uso confiável), atende todos. rodar() passa todo
-        # update por aqui, então este é o ÚNICO ponto de entrada a proteger.
-        if self._autorizados is not None and chat_id not in self._autorizados:
+        # SEGURANÇA (fail-closed): só o operador comanda a infra. Comando de um
+        # chat fora da whitelist é IGNORADO — sem agir e SEM responder (não
+        # confirmamos sequer que o bot existe: nada de virar reflector/alvo de
+        # flood). Sem whitelist configurada (`autorizados` None -> frozenset()
+        # vazio), NENHUM chat passa — não há modo "atende todo mundo". rodar()
+        # passa todo update por aqui, então este é o ÚNICO ponto de entrada a
+        # proteger.
+        if chat_id not in self._autorizados:
             return None
         cmd = parse_comando(texto)
         try:
@@ -198,12 +202,21 @@ class Athena:
             Problema(evento.tipo, evento.alvo, evento.detalhe, "aviso"), pedido)
         return True
 
-    # -- laço de recepção: long-poll, despacha, AVANÇA o offset --------------
-    def rodar(self, *, intervalo=25, max_iters=None, sleep=time.sleep):
+    # -- laço de recepção: long-poll, despacha, AVANÇA e PERSISTE o offset ---
+    def rodar(self, *, intervalo=25, max_iters=None, sleep=time.sleep,
+              offset_load=lambda: 0, offset_save=lambda offset: None):
         """Long-poll dos updates via o seam TelegramClient. Avança o offset para
         cada update tratado — senão o mesmo comando seria reprocessado sempre.
-        Tolerante a falha por-update e por-ciclo (um erro não derruba o laço)."""
-        offset = 0
+        Tolerante a falha por-update e por-ciclo (um erro não derruba o laço).
+
+        PERSISTÊNCIA do offset: `offset_load`/`offset_save` são um seam
+        INJETÁVEL (callable load/save — sem acoplar a nenhum DB pesado; ver
+        `offset_de_arquivo` pra um store file-backed pronto). Sem isso, um
+        restart do PROCESSO (deploy, crash) reinicia offset=0 e o Telegram
+        REENTREGA até 24h de comandos antigos — replay de /restart, /capturar
+        stale. Os defaults no-op preservam o comportamento anterior (offset=0,
+        sem persistência) pra quem não injeta um store."""
+        offset = offset_load()
         i = 0
         while max_iters is None or i < max_iters:
             i += 1
@@ -218,6 +231,25 @@ class Athena:
                 except Exception:
                     pass                 # um comando ruim não pode matar o laço
                 offset = max(offset, u.update_id + 1)
+                offset_save(offset)      # persiste a CADA update — sobrevive a um crash no meio do lote
             if not updates:
                 sleep(min(intervalo, 1))
         return i
+
+
+def offset_de_arquivo(caminho: str) -> dict:
+    """Fábrica de um store file-backed SIMPLES (um inteiro em texto, sem DB) pra
+    injetar em `rodar(**offset_de_arquivo(caminho))`. Ausência do arquivo (1º
+    boot) carrega 0."""
+    def _load() -> int:
+        try:
+            with open(caminho) as f:
+                return int(f.read().strip() or 0)
+        except (FileNotFoundError, ValueError):
+            return 0
+
+    def _save(offset: int) -> None:
+        with open(caminho, "w") as f:
+            f.write(str(offset))
+
+    return {"offset_load": _load, "offset_save": _save}

@@ -211,12 +211,19 @@ def test_comando_do_operador_autorizado_age_normalmente():
     assert _para(tg, 100)
 
 
-def test_autorizados_none_nao_restringe():
-    # Uso confiável/legado: sem allow-list configurada, atende todo mundo (o
-    # gate é opt-in; produção DEVE wirar o chat do operador).
+def test_autorizados_none_nega_tudo_fail_closed():
+    # DENTE (fail-closed): sem allow-list configurada, NADA é atendido — nem
+    # sequer o chat que seria o "operador" nos outros testes (100). O gate deixa
+    # de ser opt-in: autorizados=None NEGA tudo, exigindo whitelist explícita.
+    # (Antes deste fix, autorizados=None ATENDIA qualquer chat — inclusive um
+    # estranho como 66666 — que é exatamente o comportamento que este teste
+    # existia pra consagrar; foi reescrito porque o comportamento antigo era o
+    # bug, não uma garantia a preservar.)
     ath, tg, runner = _montar(autorizados=None)
     ath.atender(66666, "/restart worker")
-    assert [c for c in runner.calls if "docker restart" in c and "worker" in c]
+    ath.atender(100, "/restart worker")
+    assert [c for c in runner.calls if "docker restart" in c] == []
+    assert tg.enviadas == []
 
 
 # --- HONESTIDADE: handler que quebra não vira silêncio ----------------------
@@ -271,3 +278,40 @@ def test_rodar_processa_update_e_avanca_offset():
     assert _para(tg, 100)                            # o /status foi atendido
     # DENTE: sem avançar o offset, o mesmo update seria reprocessado pra sempre.
     assert tg.offsets == [0, 6]                      # 6 = update_id(5) + 1
+
+
+# --- PERSISTÊNCIA do offset: sobrevive a um restart do PROCESSO -------------
+def test_rodar_persiste_offset_evita_reentrega_apos_restart():
+    # DECISÃO DE ARQUITETURA: hoje rodar() sempre começa com offset=0 -> após um
+    # restart do processo (deploy, crash, restart manual), o Telegram REENTREGA
+    # até 24h de updates antigos, e a Athena reprocessaria /restart, /capturar
+    # etc. já executados uma vez (replay). O fix: offset_load/offset_save são um
+    # seam INJETÁVEL (callable load/save, sem acoplar a nenhum DB) — quem chama
+    # rodar() injeta um store simples (aqui, um dict — em produção, um arquivo).
+    store = {}
+
+    def carregar():
+        return store.get("offset", 0)
+
+    def salvar(offset):
+        store["offset"] = offset
+
+    # "processo 1": recebe e processa o update 5, e PERSISTE o offset resultante.
+    tg_roteiro = [[Update(update_id=5, chat_id=100, texto="/status")]]
+    ath, tg, _ = _montar(roteiro=tg_roteiro, captura_fn=lambda: "ok")
+    ath.rodar(max_iters=1, sleep=lambda s: None,
+              offset_load=carregar, offset_save=salvar)
+    assert tg.offsets == [0]          # 1º boot: nada persistido ainda -> começa do zero
+    assert store["offset"] == 6       # processou o update 5 -> persistiu 6
+    assert _para(tg, 100)             # de fato tratou o /status
+
+    # "processo 2" = RESTART: nova instância da Athena (processo novo), mas o
+    # MESMO store persistido (sobrevive ao restart, ao contrário da memória).
+    ath2, tg2, _ = _montar(roteiro=[[]], captura_fn=lambda: "ok")
+    ath2.rodar(max_iters=1, sleep=lambda s: None,
+               offset_load=carregar, offset_save=salvar)
+    # DENTE: sem a persistência, offset2 recomeçaria em 0 -> pediria ao Telegram
+    # os updates a partir do zero de novo (replay de update_id=5 incluso). Com o
+    # fix, o primeiro get_updates do processo novo já pede a partir do offset
+    # PERSISTIDO (6) — o Telegram nem reentrega o update antigo.
+    assert tg2.offsets == [6]

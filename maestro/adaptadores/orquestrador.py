@@ -11,10 +11,14 @@ de aulas, cada uma pegando o que a anterior não pegou:
     3. embed    (Vimeo/HLS)       — resolve aulas que ficaram `sem_video`
     4. não-vídeo(documento/texto) — resolve aulas que ficaram `sem_embed`/`sem_audio`
 
-Esta cabeça lê o CENSO por-estado do curso (fonte de verdade: o tracker/Notion, nunca
-uma flag), decide a PRÓXIMA passada da cascata, dispara-a por um SEAM residencial
-(`disparar_passe`) e só declara 100% quando a verdade prova. Ela NÃO abre Chrome nem
-roda captura — delega, igual `coordenar` (inviolável anti-ban: browser só no residencial).
+Esta cabeça lê o CENSO por-estado do curso (do TRACKER/estado_aulas) para ESTRUTURAR a
+decisão — há parede? falta disparar uma passada? — decide a PRÓXIMA passada da cascata e
+dispara-a por um SEAM residencial (`disparar_passe`). Mas o censo é FLAG (o motor ACHA
+que escreveu no Notion): declarar 100% por ele seria o falso-pronto. Por isso a conclusão
+passa por um GATE que CRUZA a contagem REAL do Notion (`progresso_notion_fn`), a MESMA
+régua do gate I-1 em `captura.coordenar` (completo <=> no_notion >= total). Ela NÃO abre
+Chrome nem roda captura — delega, igual `coordenar` (inviolável anti-ban: browser só no
+residencial).
 
 ────────────────────────────────────────────────────────────────────────────────────
 O DISJUNTOR (o núcleo, `classificar`): duas coisas "não geraram vídeo" e são OPOSTAS —
@@ -173,22 +177,28 @@ def diagnosticar(estados: dict, passes_disparados=()) -> Diagnostico:
 
 
 def orquestrar(projeto, voz, *, censo_fn, disparar_passe, curso_url, estado,
-               agora=None):
+               agora=None, progresso_notion_fn=None):
     """Um passo por ciclo da CABEÇA DE CAPTURA de UM curso. Lê o censo (verdade), aplica
     o disjuntor e faz UMA coisa: escala parede, OU dispara a próxima passada, OU declara
     100%, OU aguarda. Avança a máquina de estados em `estado` (dict por curso, persiste
     entre ciclos). Dono do próprio reporte (dirige a `voz`); devolve a Acao (ou None).
 
     Seams (NUNCA roda captura de verdade):
-      - `censo_fn(curso_url) -> dict[estado, contagem]`: a verdade por-estado (tracker/
-        Notion). Default de produção: liga em `censo_estados`.
+      - `censo_fn(curso_url) -> dict[estado, contagem]`: o retrato por-estado do TRACKER
+        (estado_aulas). Serve para ESTRUTURAR a decisão (parede? passada pendente?), mas
+        'capturada' aqui é o STATUS que o motor ACHA que escreveu — não é prova.
       - `disparar_passe(passe, curso_url) -> confirmação truthy`: enfileira a passada no
         residencial (nunca Chrome na VPS). Levanta/retorna falsy em falha -> escala honesto.
+      - `progresso_notion_fn(curso_url) -> ProgressoNotion`: a CONTAGEM REAL de aulas do
+        curso já no Notion — a MESMA prova que `captura.coordenar` usa no gate I-1. É o
+        que autoriza declarar 100%. None => FAIL-CLOSED: NÃO declara pronto (não confia
+        no flag do tracker); produção DEVE ligar este seam (mesma régua em captura.py e
+        aqui: completo <=> no_notion >= total).
 
     INVIOLÁVEIS cravados aqui:
       - PAREDE anti-ban -> não declara pronto (mata o falso-pronto) e segura a captura;
       - captura sempre pelo seam residencial (anti-ban);
-      - 100% só quando a verdade prova (I-1), nunca por flag;
+      - 100% só quando o NOTION PROVA (I-1: no_notion >= total), NUNCA por flag do tracker;
       - nenhuma passada é dada como disparada sem confirmação."""
     agora = time.time() if agora is None else agora
     if estado.get("orq_fase") == ORQ_CONCLUIDO:
@@ -245,12 +255,62 @@ def orquestrar(projeto, voz, *, censo_fn, disparar_passe, curso_url, estado,
         voz.avisar_acao(acao)
         return acao
 
-    # ---- 100% MEDIDO no Notion --------------------------------------------
+    # ---- 100% — só declara com a VERDADE do Notion (gate I-1), nunca por flag ----
+    # O censo (tracker/estado_aulas) diz que ESTRUTURALMENTE acabou: sem parede, sem
+    # passada pendente, tudo é capturada-claim ou não-vídeo-claim. Mas 'capturada' é o
+    # STATUS que o motor ACHA que escreveu no Notion — a MESMA fonte-flag que já mentiu
+    # pronto (é por isso que captura.coordenar tem o gate I-1). Antes de gravar
+    # ORQ_CONCLUIDO, CRUZA contra a contagem REAL do Notion, a MESMA régua de captura.py:
+    # no_notion >= total (diag.total). Isto mata DOIS falsos-prontos:
+    #   [3] conclusão por FLAG do tracker (censo diz capturada mais do que o Notion tem);
+    #   [4] não-vídeo contado por passada apenas ENFILEIRADA e ainda não processada — as
+    #       aulas ainda não estão no Notion, então no_notion < total: NÃO declaramos 100%
+    #       nem LATCHAMOS ORQ_CONCLUIDO, e o ciclo seguinte RE-OBSERVA (uma parede que
+    #       apareça depois é vista e escalada, não engolida por um latch prematuro).
     if diag.completo:
+        if progresso_notion_fn is None:
+            # Sem a costura de verdade não dá para PROVAR completude -> FAIL-CLOSED: NÃO
+            # declara 100% (declarar por flag do tracker é o falso-pronto do Inviolável 4).
+            # Reporta uma vez (latch) e aguarda; produção DEVE ligar progresso_notion_fn.
+            if not estado.get("conclusao_sem_prova_reportada"):
+                pedido = (f"[{projeto.nome}] {curso_url}: censo diz 100% mas falta a costura "
+                          f"de contagem no Notion (progresso_notion_fn) — NÃO declaro pronto "
+                          f"por flag do tracker (Inviolável 4)")
+                voz.escalar(Problema("conclusao_sem_prova_notion", curso_url, pedido, "aviso"),
+                            pedido)
+                estado["conclusao_sem_prova_reportada"] = True
+            return Acao("", False, True,
+                        f"[{projeto.nome}] {curso_url}: conclusão retida (sem prova no Notion)")
+        try:
+            prog_notion = progresso_notion_fn(curso_url)
+        except Exception as e:
+            pedido = (f"[{projeto.nome}] {curso_url}: censo diz 100% mas NÃO consegui "
+                      f"confirmar no Notion (gate I-1): {str(e)[:140]} — NÃO declaro pronto")
+            voz.escalar(Problema("conclusao_notion_inacessivel", curso_url, pedido, "aviso"),
+                        pedido)
+            return Acao("", False, True, pedido)
+        from maestro import auditor
+        laudo = auditor.auditar_conclusao(curso_url, prog_notion, diag.total)
+        if not laudo.aprovado:
+            # FALSO-PRONTO: o tracker diz 100% mas o Notion prova menos (flag mentiu, ou
+            # não-vídeo ainda não processado). NÃO declara, NÃO latcha (re-observa). Reporta
+            # uma vez (latch de reporte), destravando quando o Notion alcançar o total.
+            falta = max(diag.total - prog_notion.no_notion, 0)
+            if not estado.get("falso_pronto_reportado"):
+                pedido = (f"[{projeto.nome}] {curso_url} censo diz 100% mas o Notion tem "
+                          f"{prog_notion.no_notion}/{diag.total} — {falta} faltando "
+                          f"(falso-pronto REJEITADO, I-1); NÃO declaro pronto")
+                voz.escalar(Problema("falso_pronto", curso_url, pedido, "critico"), pedido)
+                estado["falso_pronto_reportado"] = True
+            return Acao("", False, True,
+                        f"[{projeto.nome}] {curso_url}: conclusão REJEITADA — Notion tem "
+                        f"{prog_notion.no_notion}/{diag.total} ({falta} faltando)")
+        estado["falso_pronto_reportado"] = False
         estado["orq_fase"] = ORQ_CONCLUIDO
-        acao = Acao(f"[{projeto.nome}] {curso_url} 100% capturado e MEDIDO no Notion "
-                    f"({diag.capturadas} em Notion + {diag.nao_video} não-vídeo, "
-                    f"0 parede) — todas as passadas concluídas", True, False)
+        acao = Acao(f"[{projeto.nome}] {curso_url} 100% capturado e PROVADO no Notion "
+                    f"({prog_notion.no_notion}/{diag.total}; {diag.capturadas} capturada(s) + "
+                    f"{diag.nao_video} não-vídeo, 0 parede) — todas as passadas concluídas",
+                    True, False)
         voz.avisar_acao(acao)
         return acao
 

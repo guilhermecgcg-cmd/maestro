@@ -356,8 +356,45 @@ class FilaExecutor:
     # não muda.
 
 
+def _total_esperado(projeto, acesso, curso_url, total_esperado_fn):
+    """Total ESPERADO de aulas do curso — o DENOMINADOR da régua de completude
+    (no_notion >= total), a MESMA régua do gate I-1 (ProgressoNotion.completo) e da
+    cabeça de captura. Fonte: `total_esperado_fn` injetado; senão, a ENUMERAÇÃO do
+    tracker (count(estado_aulas) do course_id resolvido pela fila). Devolve 0 quando
+    NÃO dá para determinar (sem course_id / exec falha).
+
+    O 0 é FAIL-CLOSED de propósito: o chamador (guard anti-dup) NUNCA declara completo
+    com total desconhecido — trata como RETOMAR (re-captura idempotente), nunca como
+    'pular'. O lado seguro do erro é re-capturar, jamais abandonar um curso parcial
+    declarando-o pronto (Inviolável 4).
+
+    LIMITAÇÃO CONHECIDA (achado [6], resíduo documentado do Inviolável 4): o total vem
+    da enumeração do PRÓPRIO tracker. Uma enumeração CURTA (ex.: 65 linhas para um curso
+    de 537) faz total=65; o Notion com 65 então SATISFAZ 65>=65 e o guard pula — um
+    falso-pronto por SUB-ENUMERAÇÃO que a checagem-contra-Notion, por construção, não
+    consegue pegar (o numerador é verificado no Notion, mas o denominador ainda é o
+    tracker). Não há, na arquitetura atual, um oráculo INDEPENDENTE de quantas aulas o
+    curso tem na plataforma; inventar um número seria pior que a limitação. O
+    fail-closed cobre o total DESCONHECIDO (0 -> retoma); a sub-enumeração silenciosa
+    (total presente porém baixo) fica como limitação registrada até existir uma
+    enumeração independente da plataforma para servir de denominador."""
+    if total_esperado_fn is not None:
+        try:
+            return max(int(total_esperado_fn(curso_url)), 0)
+        except Exception:
+            return 0
+    try:
+        course_id = resolver_course_id(projeto, acesso, curso_url)
+        if not course_id:
+            return 0
+        total, _done, _pend = progresso(projeto, acesso, course_id)
+        return total
+    except Exception:
+        return 0
+
+
 def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
-              ja_no_notion=None, progresso_notion_fn=None):
+              ja_no_notion=None, progresso_notion_fn=None, total_esperado_fn=None):
     """Coordena o PROTOCOLO DE CAPTURA de UM curso (identificado por `curso_url`), um
     passo por ciclo, avançando a máquina de estados em `estado` (dict por curso,
     mutável, persiste entre ciclos). Dirige a `voz` diretamente (pede reseed / avisa /
@@ -369,15 +406,22 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
       - sessão morta -> NÃO dispara captura; pede reseed (nunca loga sozinho);
       - captura SEMPRE via `executor` residencial (nunca Chrome na VPS — anti-ban);
       - nenhuma etapa é dada como sucesso sem confirmação (disparo, ingest);
-      - ANTI-DUPLICIDADE: nunca enfileira um curso que o Notion (fonte da verdade
-        durável) já mostra capturado — resiliente a restart (checa a cada ciclo);
+      - ANTI-DUPLICIDADE POR COMPLETUDE (não por presença): só pula um curso que o
+        Notion (fonte da verdade durável) prova COMPLETO (no_notion >= total_esperado,
+        a régua do gate I-1); um curso PARCIAL é RETOMADO, nunca declarado pronto —
+        resiliente a restart (checa a cada ciclo);
       - COMPLETUDE POR NOTION, NÃO POR FLAG (gate I-1): quando o tracker diz 'done',
         a conclusão só é DECLARADA se o Auditor CONFIRMAR contra o Notion; falso-pronto
         é REJEITADO e escalado, e o curso NÃO é marcado CONCLUIDO (nem ingerido).
 
     `ja_no_notion`: seam injetável (curso_url)->(tem_aulas, qtd). Default = checar o
     Notion real via `curso_ja_no_notion` (exec_app no container do app). Injetável
-    para os testes passarem um dublê sem tocar Notion/docker.
+    para os testes passarem um dublê sem tocar Notion/docker. `qtd` (no_notion) é o
+    NUMERADOR da régua de completude do guard anti-dup.
+
+    `total_esperado_fn`: seam injetável (curso_url)->int — o DENOMINADOR (total esperado)
+    do guard anti-dup. Default = enumeração do tracker (`_total_esperado`). 0/incerto =>
+    fail-closed (retoma, nunca conclui por presença).
 
     `progresso_notion_fn`: seam injetável (curso_url)->ProgressoNotion — a contagem-
     verdade do Notion para o gate de conclusão (I-1). None => gate DESLIGADO (conclui
@@ -400,7 +444,7 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
     # Notion (durável), e não de memória local, ela sobrevive ao restart (stateless).
     if fase == FASE_NOVO:
         try:
-            tem_aulas, qtd = ja_no_notion(curso_url)
+            _tem, qtd = ja_no_notion(curso_url)
         except Exception as e:
             # Não deu para confirmar: NÃO enfileira às cegas (evita re-captura) e
             # ESCALA honesto; a fase segue NOVO -> o próximo ciclo re-tenta.
@@ -410,16 +454,42 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
             voz.escalar(Problema("antidup_notion_inacessivel", curso_url, pedido, "aviso"),
                         pedido)
             return Acao("", False, True, pedido)
-        if tem_aulas:
-            # JÁ capturado: pula o enfileiramento. Marca CONCLUIDO só para não
-            # re-reportar a cada ciclo DESTE processo — a correção NÃO depende disso:
-            # numa instância nova (pós-restart) a fase volta a NOVO e o Notion re-decide
-            # o skip do zero.
-            estado["fase"] = FASE_CONCLUIDO
-            acao = Acao(f"[{projeto.nome}] {curso_url} JÁ capturado ({qtd} aulas no Notion) "
-                        f"— pulo o enfileiramento (anti-duplicidade)", True, False)
-            voz.avisar_acao(acao)
-            return acao
+        # PRESENÇA (qtd>0) NÃO É COMPLETUDE. Só pula (marca CONCLUIDO) quando o Notion
+        # PROVA completude: no_notion >= total_esperado (a MESMA régua do gate I-1 /
+        # ProgressoNotion.completo). O bug que isto mata: um curso interrompido em
+        # 200/537 (Mac-off / restart do Maestro) tinha qtd=200>0 e era declarado
+        # CONCLUIDO por PRESENÇA — falso-pronto que NUNCA re-enfileirava e abandonava
+        # 337 aulas (viola Inviolável 4). Agora:
+        #   - qtd == 0            -> curso NOVO: segue para a captura (FASE 1/2);
+        #   - qtd >= total (>0)   -> COMPLETO provado no Notion: pula (CONCLUIDO);
+        #   - 0 < qtd < total, ou total DESCONHECIDO -> PARCIAL/incerto: RETOMA (cai na
+        #     captura, enfileiramento idempotente + gate I-1), JAMAIS conclui por presença.
+        # Fail-closed: sem total confiável, o lado seguro é re-capturar, nunca abandonar.
+        if qtd > 0:
+            total_esp = _total_esperado(projeto, acesso, curso_url, total_esperado_fn)
+            if ProgressoNotion(curso_url, qtd, agora).completo(total_esp):
+                # COMPLETO comprovado (no_notion >= total): pula. Marca CONCLUIDO só para
+                # não re-reportar a cada ciclo DESTE processo — a decisão é durável
+                # (Notion + enumeração), então pós-restart a fase volta a NOVO e o skip
+                # é re-decidido do zero pela MESMA prova.
+                estado["fase"] = FASE_CONCLUIDO
+                acao = Acao(f"[{projeto.nome}] {curso_url} JÁ capturado e COMPLETO "
+                            f"({qtd}/{total_esp} aulas no Notion) — pulo o enfileiramento "
+                            f"(anti-duplicidade)", True, False)
+                voz.avisar_acao(acao)
+                return acao
+            # PARCIAL ou total incerto: NÃO conclui por presença. Reporta a RETOMADA
+            # uma vez (latch por-curso, não spamma) e SEGUE para a captura (retomada
+            # idempotente). O gate I-1 na FASE_CAPTURANDO só declarará pronto quando o
+            # Notion alcançar o total.
+            if not estado.get("retomada_avisada"):
+                denom = total_esp if total_esp > 0 else "?"
+                acao_r = Acao(f"[{projeto.nome}] {curso_url} PARCIAL no Notion "
+                              f"({qtd}/{denom}) — NÃO declaro pronto por presença; "
+                              f"RETOMO a captura (anti-falso-pronto, Inviolável 4)",
+                              True, False)
+                voz.avisar_acao(acao_r)
+                estado["retomada_avisada"] = True
 
     # ---- FASE 1: checar a sessão ANTES de qualquer disparo -----------------
     if fase == FASE_NOVO:
@@ -505,14 +575,29 @@ def coordenar(projeto, acesso, voz, *, executor, curso_url, estado, agora=None,
                             pedido)
                 return Acao("", False, True, pedido)
             from maestro import auditor
-            laudo = auditor.auditar_conclusao(curso_url, prog_notion, total, voz=voz)
+            # SEM voz aqui: o Auditor só emite o laudo. A ESCALAÇÃO é nossa, com LATCH
+            # por-curso — senão um curso preso (ex.: aulas 'falhou' por parede anti-ban,
+            # terminais, que zeram `pend` mas nunca chegam ao Notion) re-escalaria um
+            # 'falso_pronto' CRÍTICO a cada ciclo (120s), inundando o Telegram e
+            # dessensibilizando o operador à categoria crítica. Espelha o latch
+            # `parede_reportada` da cabeça de captura: reporta UMA vez por episódio.
+            laudo = auditor.auditar_conclusao(curso_url, prog_notion, total)
             if not laudo.aprovado:
-                # FALSO-PRONTO: auditar_conclusao já escalou o gap honesto. NÃO ingere,
-                # NÃO marca CONCLUIDO — a fase segue CAPTURANDO (re-tenta).
+                # FALSO-PRONTO: NÃO ingere, NÃO marca CONCLUIDO — a fase segue CAPTURANDO
+                # (re-tenta quando o Notion alcançar `total`).
                 falta = max(total - prog_notion.no_notion, 0)
+                if not estado.get("falso_pronto_reportado"):
+                    pedido = (f"[{projeto.nome}] {curso_url} reportado PRONTO pelo tracker "
+                              f"mas o Notion tem {prog_notion.no_notion}/{total} — {falta} "
+                              f"faltando (falso-pronto REJEITADO, I-1); NÃO declaro concluído")
+                    voz.escalar(Problema("falso_pronto", curso_url, pedido, "critico"), pedido)
+                    estado["falso_pronto_reportado"] = True
                 return Acao("", False, True,
                             f"[{projeto.nome}] conclusão de {curso_url} REJEITADA pelo Auditor "
                             f"(Notion tem {prog_notion.no_notion}/{total} — {falta} faltando)")
+            # aprovado: o Notion alcançou o total -> destrava o latch (novo episódio
+            # futuro poderá re-escalar honesto).
+            estado["falso_pronto_reportado"] = False
 
         # ---- FASE 4: curso completo -> AUTO-INGEST reusando reconciliar ----
         # REUSO (não reimplementa): forço o disparo AGORA passando ultimo bem no

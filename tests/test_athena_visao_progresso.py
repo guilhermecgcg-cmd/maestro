@@ -268,6 +268,42 @@ def test_integracao_gate_rejeita_falso_pronto_nao_marca_concluido():
     assert "8/10" in voz.escaladas[0][1]
 
 
+def test_integracao_gate_falso_pronto_escala_uma_vez_com_latch():
+    # DENTES (achado [5]): um curso preso (tracker diz done — ex.: aulas 'falhou' por
+    # parede anti-ban, terminais, zeram pend — mas o Notion só tem 8/10) roda o gate I-1
+    # a CADA ciclo. Sem latch, re-escalaria 'falso_pronto' CRÍTICO a cada 120s, inundando
+    # o Telegram e dessensibilizando o operador. Com latch: escala UMA vez por episódio.
+    ac = FakeAcessoTracker(resolve="777", aulas=["no_notion"] * 10)
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    prog_notion_fn = lambda url: _prog(8, url=url)   # Notion prova só 8 de 10 (persistente)
+    for _ in range(3):                                # três ciclos com o mesmo estado preso
+        acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(),
+                                 curso_url=CURSO, estado=estado, agora=AGORA,
+                                 progresso_notion_fn=prog_notion_fn)
+        assert acao is not None and acao.escalar     # segue rejeitando (não finge pronto)
+    assert estado["fase"] != captura.FASE_CONCLUIDO
+    assert len(voz.escaladas) == 1                   # LATCH: um único crítico, não três
+    assert voz.escaladas[0][0].tipo == "falso_pronto"
+    assert "8/10" in voz.escaladas[0][1]
+
+
+def test_integracao_gate_latch_destrava_quando_notion_alcanca_o_total():
+    # O latch não pode ENGOLIR um episódio futuro: quando o Notion alcança o total, o
+    # curso conclui; se voltasse a ficar preso, um novo crítico é legítimo. Aqui: preso
+    # (8/10) escala uma vez, depois o Notion completa (10/10) e o curso CONCLUI.
+    ac = FakeAcessoTracker(resolve="777", aulas=["no_notion"] * 10)
+    voz = FakeVoz()
+    estado = {"fase": captura.FASE_CAPTURANDO}
+    captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(), curso_url=CURSO,
+                      estado=estado, agora=AGORA, progresso_notion_fn=lambda u: _prog(8))
+    assert len(voz.escaladas) == 1
+    acao = captura.coordenar(_proj(), ac, voz, executor=FakeExecutor(), curso_url=CURSO,
+                             estado=estado, agora=AGORA,
+                             progresso_notion_fn=lambda u: _prog(10))
+    assert acao.executada and estado["fase"] == captura.FASE_CONCLUIDO
+
+
 def test_integracao_gate_confirma_quando_notion_prova_conclui():
     ac = FakeAcessoTracker(resolve="777", aulas=["no_notion"] * 10)
     voz = FakeVoz()

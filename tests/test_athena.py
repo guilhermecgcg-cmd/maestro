@@ -59,7 +59,8 @@ _PROJ = Projeto(nome="conhecimento", projeto_easypanel="conh",
                 db_container="conh_db", db_name="conh", db_user="postgres")
 
 
-def _montar(roteiro=None, captura_fn=None, prioridades=None, executor="real"):
+def _montar(roteiro=None, captura_fn=None, prioridades=None, executor="real",
+            autorizados=(100,)):
     tg = FakeTG(roteiro)
     runner = Runner()
     acesso = Acesso(run_cmd=runner)
@@ -67,7 +68,8 @@ def _montar(roteiro=None, captura_fn=None, prioridades=None, executor="real"):
     if executor == "real":
         executor = captura.FilaExecutor(acesso, _PROJ)
     ath = Athena(tg, voz, acesso=acesso, executor=executor,
-                 captura_fn=captura_fn, prioridades=prioridades)
+                 captura_fn=captura_fn, prioridades=prioridades,
+                 autorizados=autorizados)   # 100 = o operador que comanda nos testes
     return ath, tg, runner
 
 
@@ -188,6 +190,50 @@ def test_comando_desconhecido_responde_sem_agir():
     assert runner.calls == []                       # nenhuma ação disparada
     assert _para(tg, 100)                           # respondeu (ao remetente)
     assert _para(tg, 999) == []                     # sem broadcast
+
+
+# --- SEGURANÇA: só o operador comanda a infra -------------------------------
+def test_comando_de_chat_nao_autorizado_e_ignorado():
+    # DENTE: um /restart vindo de um chat que NÃO é o operador não pode virar
+    # `docker restart` — nem sequer uma resposta (anti-reflector: não confirma
+    # que o bot existe). Sem esse gate, qualquer um que ache o bot mexe na infra.
+    ath, tg, runner = _montar()                 # autorizados = {100}
+    ath.atender(66666, "/restart worker")       # 66666 = estranho
+    assert [c for c in runner.calls if "docker restart" in c] == []   # não agiu
+    assert tg.enviadas == []                                          # nem respondeu
+
+
+def test_comando_do_operador_autorizado_age_normalmente():
+    # Contraprova do gate: o operador (100) continua comandando de verdade.
+    ath, tg, runner = _montar()
+    ath.atender(100, "/restart worker")
+    assert [c for c in runner.calls if "docker restart" in c and "worker" in c]
+    assert _para(tg, 100)
+
+
+def test_autorizados_none_nao_restringe():
+    # Uso confiável/legado: sem allow-list configurada, atende todo mundo (o
+    # gate é opt-in; produção DEVE wirar o chat do operador).
+    ath, tg, runner = _montar(autorizados=None)
+    ath.atender(66666, "/restart worker")
+    assert [c for c in runner.calls if "docker restart" in c and "worker" in c]
+
+
+# --- HONESTIDADE: handler que quebra não vira silêncio ----------------------
+def test_handler_que_quebra_responde_erro_ao_remetente_sem_silencio():
+    # DENTE: se servicos() explode (docker sumiu), /status NÃO pode LEVANTAR nem
+    # SILENCIAR — o operador tem que saber que engasgou (senão confia numa falha
+    # invisível). O erro vai ao REMETENTE, não é broadcast ao operador (999).
+    tg = FakeTG()
+    def boom(cmd, timeout=None):
+        raise RuntimeError("docker sumiu")
+    acesso = Acesso(run_cmd=boom)
+    voz = Voz(tg, [999])
+    ath = Athena(tg, voz, acesso=acesso, autorizados={100})
+    ath.atender(100, "/status")                 # não pode propagar exceção
+    txt = _para(tg, 100)
+    assert txt and "falhei" in txt[0].lower()   # respondeu o erro, honesto
+    assert _para(tg, 999) == []                 # não vazou como broadcast
 
 
 # --- NOTIFICAR: mensagem só sai quando há DECISÃO real ----------------------

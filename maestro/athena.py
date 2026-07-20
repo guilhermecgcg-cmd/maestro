@@ -63,13 +63,17 @@ def parse_comando(texto: str) -> Comando:
 
 class Athena:
     def __init__(self, tg, voz, *, acesso, executor=None, captura_fn=None,
-                 prioridades=None):
+                 prioridades=None, autorizados=None):
         self._tg = tg                    # seam de I/O (entrada + resposta ao remetente)
         self._voz = voz                  # saída/escalação (broadcast ao operador)
         self._acesso = acesso            # servicos() + restart()
         self._executor = executor        # .disparar(url) -> confirmação (contrato captura)
         self._captura_fn = captura_fn    # () -> str p/ a seção de captura do /status
         self._prioridades = prioridades if prioridades is not None else []
+        # SEGURANÇA: chats que PODEM comandar a infra. None = sem restrição (uso
+        # confiável/legado); produção DEVE passar o(s) chat(s) do operador —
+        # senão qualquer um que ache o bot dispara /restart, /capturar.
+        self._autorizados = set(autorizados) if autorizados is not None else None
 
     # -- resposta SOLICITADA: vai ao remetente do comando ---------------------
     def _responder(self, chat_id, texto: str) -> None:
@@ -80,15 +84,31 @@ class Athena:
 
     # -- despacho de UM comando ----------------------------------------------
     def atender(self, chat_id, texto: str):
+        # SEGURANÇA: só o operador comanda a infra. Comando de um chat estranho é
+        # IGNORADO — sem agir e SEM responder (não confirmamos sequer que o bot
+        # existe: nada de virar reflector/alvo de flood). Gate opt-in: se
+        # `autorizados` é None (uso confiável), atende todos. rodar() passa todo
+        # update por aqui, então este é o ÚNICO ponto de entrada a proteger.
+        if self._autorizados is not None and chat_id not in self._autorizados:
+            return None
         cmd = parse_comando(texto)
-        if cmd.tipo == "status":
-            return self._cmd_status(chat_id)
-        if cmd.tipo == "capturar":
-            return self._cmd_capturar(chat_id, cmd.arg)
-        if cmd.tipo == "restart":
-            return self._cmd_restart(chat_id, cmd.arg)
-        if cmd.tipo == "prioridade":
-            return self._cmd_prioridade(chat_id, cmd.arg)
+        try:
+            if cmd.tipo == "status":
+                return self._cmd_status(chat_id)
+            if cmd.tipo == "capturar":
+                return self._cmd_capturar(chat_id, cmd.arg)
+            if cmd.tipo == "restart":
+                return self._cmd_restart(chat_id, cmd.arg)
+            if cmd.tipo == "prioridade":
+                return self._cmd_prioridade(chat_id, cmd.arg)
+        except Exception as e:
+            # HONESTIDADE (I-1): um handler que quebra NÃO pode virar silêncio —
+            # o operador precisa distinguir "nada a dizer" de "engasguei", senão
+            # confia numa falha invisível. Responde o erro ao REMETENTE e segue;
+            # o offset avança no rodar (sem retry cego que poderia, ex., reiniciar
+            # duas vezes um serviço numa falha transiente).
+            self._responder(chat_id, f"❌ falhei ao processar /{cmd.tipo}: {str(e)[:160]}")
+            return Acao("", False, True, f"/{cmd.tipo} falhou")
         self._responder(chat_id, "🤔 não entendi. comandos: /status, "
                                  "/capturar <link>, /restart <serviço>, /prioridade")
         return None

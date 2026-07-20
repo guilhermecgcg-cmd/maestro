@@ -50,11 +50,21 @@ CLASSE_PENDENTE = "pendente"     # ainda precisa de uma passada, ou captura-base
 
 ORQ_CONCLUIDO = "concluido"      # fase do estado por-curso: 100% medido e declarado
 
-# --- O MAPA estado-do-tracker -> (classe, passada_que_resolve, benigno) -------
-# `benigno` = é um endpoint 'sem X' que, DEPOIS que sua passada rodou e ele seguiu
-# 'sem X', vira não-vídeo (done). Estados em VOO/desconhecidos NÃO são benignos: nunca
-# viram done sozinhos (sem isso, um estado novo/errado do motor poderia virar falso-
-# pronto). Fonte dos nomes: aula/motor/tracker.py (mesma lista de captura.ESTADOS_*).
+# --- O MAPA estado-do-tracker -> (classe, passada_que_resolve, endpoint_nao_video) ----
+# DOIS eixos INDEPENDENTES para um estado 'sem X' pendente:
+#   • `passada_que_resolve` (2º campo, != None): a passada da cascata que o DISPARA.
+#     TODOS os quatro 'sem X' têm uma — todos são disparáveis.
+#   • `endpoint_nao_video` (3º campo): SÓ True nos endpoints da cascata (sem_embed/
+#     sem_audio, que a passada nao_video resolve). DEPOIS que a passada rodou e o estado
+#     seguiu 'sem X', um endpoint vira NÃO-VÍDEO legítima (done). NÃO-endpoints
+#     (sem_legenda/sem_video) são estados INTERMEDIÁRIOS: a aula TEM vídeo (só falta
+#     transcrição/embed). Se o motor a deixa presa ali depois da passada, contá-la como
+#     done seria FALSO-PRONTO — então ela BLOQUEIA (fail-closed), nunca completa sozinha.
+# Por que separar: o disjuntor canônico (docstring do módulo) diz que SÓ sem_embed/
+# sem_audio, após a passada nao_video, são não-vídeo. Marcar sem_legenda/sem_video como
+# 'done' contradiz isso e abre o falso-pronto. Estados em VOO/desconhecidos não são nem
+# disparáveis nem endpoint (passada None, endpoint False): bloqueiam honestamente.
+# Fonte dos nomes: aula/motor/tracker.py (mesma lista de captura.ESTADOS_*).
 _MAPA = {
     # sucesso terminal = provado no Notion
     "no_notion": (CLASSE_CAPTURADA, None, False),
@@ -62,9 +72,10 @@ _MAPA = {
     # falhas reais = PAREDE (nunca 'feito')
     "falhou": (CLASSE_PAREDE, None, False),
     "audio_erro": (CLASSE_PAREDE, None, False),
-    # 'sem X' benignos: apontam a passada da cascata que os resolve
-    "sem_legenda": (CLASSE_PENDENTE, PASSE_AUDIO, True),
-    "sem_video": (CLASSE_PENDENTE, PASSE_EMBED, True),
+    # 'sem X' INTERMEDIÁRIOS: disparáveis, mas NÃO endpoint — têm vídeo, nunca viram done
+    "sem_legenda": (CLASSE_PENDENTE, PASSE_AUDIO, False),
+    "sem_video": (CLASSE_PENDENTE, PASSE_EMBED, False),
+    # 'sem X' ENDPOINT da cascata: após a passada nao_video, são não-vídeo legítima (done)
     "sem_embed": (CLASSE_PENDENTE, PASSE_NAO_VIDEO, True),
     "sem_audio": (CLASSE_PENDENTE, PASSE_NAO_VIDEO, True),
     # passada de embed TRABALHANDO: em voo, aguarda (não é 'sem X', não vira done)
@@ -73,12 +84,14 @@ _MAPA = {
 
 
 def classificar(estado: str):
-    """DISJUNTOR (núcleo): estado do tracker -> (classe, passada_que_resolve, benigno).
+    """DISJUNTOR (núcleo): estado -> (classe, passada_que_resolve, endpoint_nao_video).
 
-    Estado desconhecido/não-terminal cai no default SEGURO: PENDENTE não-benigno,
-    passada None = captura-base em voo. NUNCA CAPTURADA nem PAREDE — um estado que o
-    motor invente não pode nem virar falso-pronto (done sem prova) nem falso anti-ban
-    (escalar à toa). Fica bloqueando honestamente até virar um estado conhecido."""
+    O 2º campo (!= None) diz qual passada DISPARA o estado; o 3º diz se, exaurida a
+    passada, ele vira NÃO-VÍDEO legítima (só sem_embed/sem_audio). Estado desconhecido/
+    não-terminal cai no default SEGURO: PENDENTE, passada None (captura-base em voo),
+    endpoint False. NUNCA CAPTURADA nem PAREDE — um estado que o motor invente não pode
+    nem virar falso-pronto (done sem prova) nem falso anti-ban (escalar à toa). Fica
+    bloqueando honestamente até virar um estado conhecido."""
     return _MAPA.get(estado, (CLASSE_PENDENTE, None, False))
 
 
@@ -119,27 +132,34 @@ class Diagnostico:
 def diagnosticar(estados: dict, passes_disparados=()) -> Diagnostico:
     """Aplica o disjuntor a cada bucket do censo e soma o retrato do curso.
 
-    Uma aula 'sem X' benigna:
+    Uma aula 'sem X' disparável (2º campo != None):
       - se a passada que a resolve AINDA não foi disparada -> PENDENTE (dispare-a);
-      - se a passada JÁ foi disparada e ela segue 'sem X' -> teve a chance, é não-vídeo
-        legítima (done). Este é o passo que impede o falso-negativo (não-vídeo travando
-        para sempre) SEM abrir a porta pro falso-pronto (parede é classe à parte, nunca
-        benigna, então nunca cai aqui)."""
+      - se a passada JÁ foi disparada e ela segue 'sem X':
+          · ENDPOINT (sem_embed/sem_audio, endpoint True) -> teve a chance, é não-vídeo
+            legítima (done). Impede o falso-negativo (não-vídeo travando para sempre).
+          · INTERMEDIÁRIO (sem_legenda/sem_video, endpoint False) -> a aula TEM vídeo;
+            marcá-la done seria FALSO-PRONTO. BLOQUEIA (em_voo), fail-closed. Um motor
+            sadio já a teria movido adiante; presa aqui é anomalia que NÃO se completa.
+    Parede é classe à parte (nunca disparável aqui), então nunca cai neste ramo."""
     disparados = set(passes_disparados)
     total = cap = nao_video = paredes = em_voo = 0
     pend = {p: 0 for p in PASSES_EXTRAS}
     for est, n in estados.items():
         n = int(n)
         total += n
-        classe, passe, benigno = classificar(est)
+        classe, passe, endpoint = classificar(est)
         if classe == CLASSE_CAPTURADA:
             cap += n
         elif classe == CLASSE_PAREDE:
             paredes += n
-        elif benigno:
-            # endpoint 'sem X': done se a passada já rodou; senão, pendente pra disparar.
+        elif passe is not None:
+            # 'sem X' disparável: done só se ENDPOINT e a passada já rodou; senão pendente
+            # pra disparar; se INTERMEDIÁRIO persistindo pós-passada, bloqueia (fail-closed).
             if passe in disparados:
-                nao_video += n
+                if endpoint:
+                    nao_video += n
+                else:
+                    em_voo += n
             else:
                 pend[passe] += n
         else:

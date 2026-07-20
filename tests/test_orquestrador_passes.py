@@ -157,6 +157,38 @@ def test_diagnostico_sem_x_pendente_ate_a_passada_ter_sua_chance():
     assert d.completo is False
 
 
+def test_diagnostico_sem_legenda_apos_audio_nao_vira_feito():
+    # TEETH (falso-pronto): sem_legenda TEM vídeo — só falta a transcrição. Se persiste
+    # DEPOIS que o passe audio rodou, NÃO é 'não-vídeo legítima': contá-la como done
+    # declararia o curso 100% com um buraco silencioso (o falso-pronto que o usuário
+    # odeia). Só sem_embed/sem_audio DEPOIS do passe nao_video são não-vídeo. Fail-closed:
+    # sem_legenda persistente BLOQUEIA a conclusão, não completa.
+    d = orq.diagnosticar({"no_notion": 17, "sem_legenda": 1},
+                         passes_disparados=(orq.PASSE_AUDIO,))
+    assert d.nao_video == 0            # NÃO virou não-vídeo
+    assert d.completo is False         # bloqueia (não declara 100%)
+
+
+def test_diagnostico_sem_video_apos_embed_nao_vira_feito():
+    # TEETH (falso-pronto): idem sem_video — é estado INTERMEDIÁRIO da cascata (o motor
+    # sadio o move para sem_embed, que é o endpoint não-vídeo). Se o motor o deixa preso
+    # em sem_video, contá-lo como done é falso-pronto. Bloqueia.
+    d = orq.diagnosticar({"no_notion": 17, "sem_video": 1},
+                         passes_disparados=(orq.PASSE_AUDIO, orq.PASSE_EMBED))
+    assert d.nao_video == 0
+    assert d.completo is False
+
+
+def test_diagnostico_apenas_sem_embed_e_sem_audio_sao_endpoints_nao_video():
+    # o disjuntor canônico (docstring do módulo): SÓ sem_embed/sem_audio, depois do passe
+    # nao_video, viram não-vídeo. sem_legenda/sem_audio no MESMO censo, ambos com seus
+    # passes rodados: só sem_audio conta como done; sem_legenda bloqueia.
+    d = orq.diagnosticar({"no_notion": 10, "sem_audio": 2, "sem_legenda": 1},
+                         passes_disparados=(orq.PASSE_AUDIO, orq.PASSE_NAO_VIDEO))
+    assert d.nao_video == 2            # só o sem_audio
+    assert d.completo is False         # o sem_legenda ainda bloqueia
+
+
 def test_diagnostico_total_zero_nunca_e_completo():
     # censo vazio (curso não enumerado ainda) NUNCA prova conclusão (fail-closed).
     d = orq.diagnosticar({})
@@ -287,6 +319,32 @@ def test_orquestrar_nao_video_chega_a_100_sem_falso_negativo():
                         curso_url=CURSO, estado=estado, agora=AGORA)
     assert a2.executada and estado["orq_fase"] == orq.ORQ_CONCLUIDO
     assert voz.escaladas == []                          # não-vídeo NÃO é anti-ban
+
+
+def test_orquestrar_sem_legenda_persistente_nao_declara_falso_pronto():
+    # TEETH ponta-a-ponta: um curso onde uma aula fica presa em sem_legenda mesmo depois
+    # do passe audio ter rodado (motor não a moveu para no_notion nem para audio_erro).
+    # A cabeça dispara audio, e no ciclo seguinte NÃO pode declarar 100% — sem_legenda
+    # tem vídeo, completar seria falso-pronto. Não escala anti-ban (não é parede), só
+    # segura a conclusão (fail-closed honesto).
+    voz = FakeVoz()
+    disparo = FakeDisparo()
+    estado = {}
+    seq = [
+        {"no_notion": 17, "sem_legenda": 1},   # dispara audio
+        {"no_notion": 17, "sem_legenda": 1},   # audio 'rodou' mas segue sem_legenda
+    ]
+    caixa = {"i": 0}
+    censo = lambda url: dict(seq[caixa["i"]])
+    caixa["i"] = 0
+    orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
+                   curso_url=CURSO, estado=estado, agora=AGORA)
+    assert disparo.disparos == [(orq.PASSE_AUDIO, CURSO)]
+    caixa["i"] = 1
+    a2 = orq.orquestrar(_proj(), voz, censo_fn=censo, disparar_passe=disparo,
+                        curso_url=CURSO, estado=estado, agora=AGORA)
+    assert estado.get("orq_fase") != orq.ORQ_CONCLUIDO   # NÃO declara falso-pronto
+    assert voz.escaladas == []                            # não é parede anti-ban
 
 
 def test_orquestrar_falha_ao_disparar_passada_escala_e_nao_marca_disparada():

@@ -619,6 +619,15 @@ class LocalExecutor:
                 f"plataforma {meta.plataforma!r} sem módulo de motor conhecido — "
                 f"fail-closed, não capturo {meta.url}")
         cmd = [self._motor_python, "-m", modulo, meta.url]
+        # REFINO 1 — --audio SÓ no caminho HOTMART (motor.cli). Sem ele, uma aula
+        # Hotmart SEM legenda termina em 'sem_legenda' (terminal benigno) e NUNCA
+        # chega ao Notion — a completude-por-Notion desse curso jamais fecha. O passe
+        # de áudio (Whisper/Groq) transcreve essas aulas e as leva ao Notion. Memberkit
+        # é ÁUDIO-NATIVO (motor.memberkit próprio) e NÃO aceita --audio: passar a flag
+        # ao módulo errado seria argumento desconhecido. Amarrado ao módulo (motor.cli),
+        # não à string 'hotmart', para casar exatamente o caminho que tem a flag.
+        if modulo == "motor.cli":
+            cmd.append("--audio")
         env = dict(os.environ)
         # extra_env PRIMEIRO (base overridável); os INVIOLÁVEIS entram DEPOIS para VENCER
         # o extra_env — senão um extra_env poderia clobberar WHISPER_BACKEND/HEADLESS (o

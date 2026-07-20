@@ -95,8 +95,9 @@ def test_dispara_o_motor_direto_com_url_backend_groq_e_cwd():
     assert conf                                            # confirmação truthy
     assert len(sp.calls) == 1
     call = sp.calls[0]
-    # DENTES: comando é `<motor_python> -m motor.cli <url>` (chama o motor, não INSERT)
-    assert call["cmd"] == [PY, "-m", "motor.cli", C1]
+    # DENTES: comando é `<motor_python> -m motor.cli <url> --audio` (chama o motor,
+    # não INSERT; --audio resgata aulas Hotmart sem legenda — ver REFINO 1).
+    assert call["cmd"] == [PY, "-m", "motor.cli", C1, "--audio"]
     assert call["env"]["WHISPER_BACKEND"] == "groq"        # INVIOLÁVEL Groq
     assert call["cwd"] == DIR                              # cwd p/ motor.config achar .env
 
@@ -106,6 +107,28 @@ def test_memberkit_usa_o_modulo_proprio():
     _exec(captura.CursoLocal(url=MK, conta="mk", plataforma="memberkit"),
           spawn=sp).disparar(MK)
     assert sp.calls[0]["cmd"] == [PY, "-m", "motor.memberkit", MK]
+
+
+# ==========================================================================
+# REFINO 1 — --audio SÓ no caminho HOTMART (motor.cli). Sem ele, uma aula
+# Hotmart SEM legenda vira terminal 'sem_legenda' e NUNCA chega ao Notion (a
+# completude-por-Notion nunca fecha). O passe de áudio (Groq) é o que resgata
+# essas aulas. Memberkit é ÁUDIO-NATIVO (motor.memberkit) e NÃO leva --audio.
+# ==========================================================================
+def test_hotmart_leva_flag_audio():
+    sp = FakeSpawn()
+    _exec(_hot(C1), spawn=sp).disparar(C1)
+    # DENTES: sem o --audio, aula Hotmart sem legenda não chega ao Notion.
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.cli", C1, "--audio"]
+
+
+def test_memberkit_NAO_leva_flag_audio():
+    sp = FakeSpawn()
+    _exec(captura.CursoLocal(url=MK, conta="mk", plataforma="memberkit"),
+          spawn=sp).disparar(MK)
+    # DENTES: memberkit é áudio-nativo; --audio aqui seria flag desconhecida do
+    # módulo errado. O comando NÃO pode conter --audio.
+    assert "--audio" not in sp.calls[0]["cmd"]
 
 
 # ==========================================================================

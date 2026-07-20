@@ -6,7 +6,7 @@ testável com dublês."""
 import asyncio
 import time
 
-from maestro import sentinela, playbook
+from maestro import sentinela, playbook, observador
 from maestro.cerebro import diagnosticar
 
 
@@ -31,11 +31,28 @@ def _resolver(p, acesso, proj, llm):
     return acao
 
 
-def ciclo(acesso, voz, projetos, *, llm, estado=None) -> list:
+def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None) -> list:
     todas = acesso.servicos()
     acoes = []
     if estado is None:
         estado = {}
+
+    # CAMADA 1 (os olhos): quando um store durável `db` é injetado, grava um
+    # snapshot carimbado do estado REAL a cada ciclo (serviços up/health +
+    # recursos). É a correção da CEGUEIRA (P1): o estado passa a ser uma série
+    # temporal — o cérebro pergunta "ficou up nos últimos N min?" (flapping/
+    # estado_estavel), não "está up neste instante?" (sonda). db=None -> desligado
+    # (retrocompatível; nada muda no loop atual). fila_fn/progresso_fn ficam como
+    # pontos de injeção (a contagem-verdade do Notion é costura futura).
+    if db is not None:
+        alvos = {}
+        for proj in projetos:
+            alvos.update(getattr(proj, "saude", {}) or {})
+        try:
+            observador.registrar(
+                db, observador.coletar_estado(acesso, alvos, time.time()))
+        except Exception:
+            pass  # observar nunca pode derrubar o loop de saúde
     for proj in projetos:
         servs = {n: s for n, s in todas.items() if n in proj.servicos}
         snap = {"servicos": servs, "saude": acesso.saude_http(proj.saude),
@@ -92,13 +109,14 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None) -> list:
     return acoes
 
 
-async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=120.0, max_iters=None):
+async def run(acesso, voz, projetos, *, llm, sleep=asyncio.sleep, intervalo_s=120.0,
+              max_iters=None, db=None):
     i = 0
     estado = {}
     while max_iters is None or i < max_iters:
         i += 1
         try:
-            ciclo(acesso, voz, projetos, llm=llm, estado=estado)
+            ciclo(acesso, voz, projetos, llm=llm, estado=estado, db=db)
         except Exception:
             pass
         await sleep(intervalo_s)

@@ -56,6 +56,26 @@ def test_projeto_monitorado_so_avisa_nao_age():
     assert v.escaladas                              # só avisou
 
 
+# --- Camada 1: observação plugada no ciclo (opt-in via `db`) ----------------
+from tests.test_observador import FakeDB
+
+
+def test_ciclo_persiste_observacao_quando_db_injetado():
+    a = _Acesso({"api": Servico("api", up=True, restarting=False)}); v = _Voz()
+    db = FakeDB()
+    ciclo(a, v, [_proj(saude={"api": "http://x/health"})],
+          llm=lambda p: "{}", db=db)
+    assert db.store["criada"] >= 1                       # tabela criada
+    assert any(r[1] == "api" for r in db.store["rows"])  # snapshot gravado
+
+
+def test_ciclo_sem_db_nao_observa_retrocompativel():
+    a = _Acesso({"api": Servico("api", up=True, restarting=False)}); v = _Voz()
+    # sem db -> nada de observação; loop idêntico ao deployado (não levanta)
+    ciclo(a, v, [_proj()], llm=lambda p: "{}")
+    assert v.avisos == [] and v.escaladas == []     # saudável + sem db: silêncio
+
+
 def test_captura_vazia_do_adaptador_escala_sem_agir():
     # o loop precisa ROTEAR 'captura_vazia' pro adaptador conhecimento (senão cai
     # no playbook genérico como 'não-mapeado'); o adaptador escala sem agir.

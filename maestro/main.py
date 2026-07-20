@@ -1,6 +1,7 @@
 """Entrypoint (pragma no cover — I/O real). Monta Acesso/Voz/llm e roda o loop
 universal sobre os projetos do registro."""
 import asyncio
+import os
 import subprocess
 
 import anthropic
@@ -47,8 +48,19 @@ def main():  # pragma: no cover
                                    messages=[{"role": "user", "content": prompt}])
         return "".join(b.text for b in m.content if getattr(b, "type", "") == "text")
 
+    # CAMADA 1 (observabilidade): store durável do estado REAL. Só liga se um DSN
+    # próprio da Athena for configurado (OBSERVADOR_DSN) — sem ele, db=None e o
+    # loop segue idêntico ao deployado (a observação é opt-in, não quebra nada).
+    # Fábrica estilo psycopg3: `with db() as conn`.
+    db = None
+    dsn = os.getenv("OBSERVADOR_DSN", "")
+    if dsn:
+        import psycopg
+        db = lambda: psycopg.connect(dsn)
+
     projetos = carregar_registro(cfg.registro_path)
-    asyncio.run(loop.run(acesso, voz, projetos, llm=llm, intervalo_s=cfg.intervalo_s))
+    asyncio.run(loop.run(acesso, voz, projetos, llm=llm,
+                         intervalo_s=cfg.intervalo_s, db=db))
 
 
 if __name__ == "__main__":  # pragma: no cover

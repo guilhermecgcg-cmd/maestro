@@ -46,18 +46,26 @@ def estado(servicos=(), progresso=(), fila_travada=()):
                            fila_travada=list(fila_travada))
 
 
+def observar_curso(mundo, curso):
+    """O snapshot que a Camada 1 (observador) LÊ do Notion NESTE ciclo — construído do
+    MESMO store (mundo.cursos) que o worker residencial escreve entre ciclos. É assim
+    que a assincronia entra no teste: o disparo NÃO muda este snapshot; só um
+    worker_avanca_no_notion() ANTES do próximo ciclo muda."""
+    done, total = mundo.cursos.get(curso, [0, 0])
+    return estado(progresso=[Prog(curso, done, total)])
+
+
 class MundoFake:
     """O mundo real: a fonte de verdade. Ações mutam o store; verificação o relê."""
 
     def __init__(self, *, servicos=None, cursos=None, filas=None,
-                 restart_conserta=True, redeploy_conserta=True, captura_conclui=True,
+                 restart_conserta=True, redeploy_conserta=True,
                  fila_destrava=True, conserta_na_tentativa=None):
         self.servicos = dict(servicos or {})    # nome -> up(bool)  [fonte: observador]
         self.cursos = dict(cursos or {})         # url  -> [done, total]  [fonte: Notion]
         self.filas = dict(filas or {})           # alvo -> travado(bool)
         self.restart_conserta = restart_conserta
         self.redeploy_conserta = redeploy_conserta
-        self.captura_conclui = captura_conclui
         self.fila_destrava = fila_destrava
         self.conserta_na_tentativa = conserta_na_tentativa  # int|None -> flaky
         self._n = {}
@@ -91,11 +99,21 @@ class MundoFake:
         return f"enfileirado:{alvo}"
 
     def disparar_passada(self, alvo):
+        # ASSÍNCRONO — MODELA O MECANISMO REAL: só ENFILEIRA. A captura roda no worker
+        # residencial (minutos a horas); o Notion (self.cursos) NÃO é tocado aqui —
+        # só ENTRE ciclos, via worker_avanca_no_notion(). Concluir o curso aqui dentro
+        # (o dublê ANTIGO fazia isso) é o dublê MENTINDO sobre a assincronia — foi o que
+        # escondeu o falso-negativo do disparar+verificar-no-mesmo-ciclo.
         self.chamadas.append(("disparar_passada", alvo))
-        if self._ok(alvo, self.captura_conclui):
-            _done, total = self.cursos.get(alvo, [0, 0])
-            self.cursos[alvo] = [total, total]
-        return f"passada disparada:{alvo}"
+        self.cursos.setdefault(alvo, [0, 0])
+        return f"passada enfileirada:{alvo}"
+
+    def worker_avanca_no_notion(self, alvo, done):
+        """Simula o worker residencial escrevendo o progresso no Notion ENTRE ciclos
+        (a captura assíncrona finalmente refletindo na FONTE DE VERDADE). É o único
+        caminho pelo qual um curso avança — NUNCA de dentro de disparar_passada."""
+        _done, total = self.cursos.get(alvo, [0, 0])
+        self.cursos[alvo] = [done, total]
 
     # ---- FONTE DE VERDADE ----
     def servico_up(self, alvo):
@@ -362,28 +380,149 @@ def test_servico_doente_redeploy_confirma_pela_fonte():
     assert ("redeploy", "app") in mundo.chamadas
 
 
-def test_curso_incompleto_dispara_passada_confirma_no_notion():
-    # captura roda e o Notion PROVA a conclusão -> confirmado.
-    mundo = MundoFake(cursos={CURSO: [10, 18]}, captura_conclui=True)
+# ------- CURSO É ASSÍNCRONO: enfileira num ciclo, confirma/escala em ciclos futuros
+def test_curso_disparo_e_confirmacao_atravessam_ciclos_TEETH():
+    # (i)+(ii) juntos, o CAMINHO FELIZ da decisão de arquitetura. Ciclo 1: a passada é
+    # ENFILEIRADA e fica EM VOO — o Notion ainda diz 10/18, mas NÃO se escala (a captura
+    # é assíncrona; escalar aqui é o falso-negativo). Só ENTRE os ciclos o worker
+    # residencial escreve no Notion; o ciclo 2 observa 18/18 e CONFIRMA.
+    # TEETH: no código velho (disparar+verificar no MESMO ciclo), com o dublê assíncrono
+    # o ciclo 1 releria o Notion 10/18, não confirmaria e ESCALARIA -> escaladas==1.
+    mundo = MundoFake(cursos={CURSO: [10, 18]})
     voz = FakeVoz()
-    res = orquestrador.resolver(_div("curso_incompleto", CURSO), mundo,
-                                make_verificar(mundo), voz)
-    assert res.acao == "disparar_passada"
-    assert res.confirmado is True
-    assert mundo.curso_done_total(CURSO) == (18, 18)
+    esp = {"cursos": {CURSO: 18}}
+    voo = {}
+
+    # ---- CICLO 1: enfileira, fica em voo, NÃO escala (i) ----
+    r1 = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                 make_verificar(mundo), voz, voo=voo)
+    assert [(a) for a in mundo.chamadas] == [("disparar_passada", CURSO)]
+    assert len(r1) == 1 and r1[0].em_voo is True
+    assert r1[0].confirmado is False and r1[0].escalou is False
+    assert voz.escaladas == []                    # NÃO escalou no mesmo ciclo do disparo
+    assert CURSO in voo                            # a passada persiste "em voo"
+    assert mundo.curso_done_total(CURSO) == (10, 18)  # disparo NÃO mexeu no Notion
+
+    # ---- entre ciclos: o worker residencial finalmente escreve no Notion ----
+    mundo.worker_avanca_no_notion(CURSO, 18)
+
+    # ---- CICLO 2: observa 18/18 e CONFIRMA (ii) ----
+    r2 = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                 make_verificar(mundo), voz, voo=voo)
+    assert len(r2) == 1 and r2[0].confirmado is True
+    assert r2[0].escalou is False and r2[0].em_voo is False
+    assert CURSO not in voo                        # saiu do voo ao confirmar
+    # não re-disparou no ciclo 2 (já concluído): um único disparo no total
+    assert mundo.chamadas.count(("disparar_passada", CURSO)) == 1
 
 
-def test_curso_falso_pronto_passada_roda_mas_notion_nao_prova_escala_TEETH():
-    # TEETH FALSO-PRONTO: disparar_passada responde "passada disparada" (instante
-    # truthy) MAS o Notion continua 10/18. A verdade é o Notion -> NÃO confirma ->
-    # escala. Sem reler o Notion, isto viraria um falso 'concluído'.
-    mundo = MundoFake(cursos={CURSO: [10, 18]}, captura_conclui=False)
+def test_curso_mesmo_ciclo_do_disparo_nunca_escala_falso_TEETH():
+    # (i) isolado, o coração do redesenho. Um curso capturando (Notion 10/18) NÃO pode
+    # escalar no mesmo ciclo do disparo — só enfileira e fica em voo. Chamado SEM `voo`
+    # (default): mesmo assim o disparo do ciclo atual não pode escalar em falso.
+    # TEETH (roda no código VELHO tal-e-qual): o velho disparava e RELIA o Notion no
+    # mesmo ciclo; com o dublê assíncrono o Notion segue 10/18 -> escalaria.
+    mundo = MundoFake(cursos={CURSO: [10, 18]})
     voz = FakeVoz()
-    res = orquestrador.resolver(_div("curso_incompleto", CURSO), mundo,
-                                make_verificar(mundo), voz, max_tentativas=2)
-    assert res.confirmado is False
-    assert res.escalou is True
-    assert mundo.curso_done_total(CURSO) == (10, 18)  # continua incompleto — honesto
+    esp = {"cursos": {CURSO: 18}}
+    res = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                  make_verificar(mundo), voz, max_tentativas=3)
+    assert len(res) == 1
+    assert res[0].escalou is False and res[0].em_voo is True
+    assert voz.escaladas == []                     # ZERO escaladas no ciclo do disparo
+    assert mundo.chamadas.count(("disparar_passada", CURSO)) == 1  # enfileirou UMA vez
+
+
+def test_curso_ciclo_futuro_ainda_incompleto_continua_aguardando_TEETH():
+    # (iii): um ciclo POSTERIOR que ainda vê o Notion incompleto NÃO abandona nem
+    # spamma — continua aguardando (dentro da janela de espera), sem novo disparo e
+    # sem escalar. TEETH: se o mesmo-ciclo escalasse (bug), o 1º ciclo já escalaria;
+    # e um re-disparo a cada ciclo (spam) apareceria em chamadas.
+    mundo = MundoFake(cursos={CURSO: [10, 18]})
+    voz = FakeVoz()
+    esp = {"cursos": {CURSO: 18}}
+    voo = {}
+    # espera_s alto: a captura demora; ciclos seguidos não re-disparam nem escalam.
+    for ciclo in range(3):
+        orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                make_verificar(mundo), voz,
+                                agora=1000.0 + ciclo * 120.0, voo=voo,
+                                espera_s=3600.0, max_tentativas=2)
+    assert mundo.chamadas.count(("disparar_passada", CURSO)) == 1  # UM disparo, sem spam
+    assert voz.escaladas == []                     # não abandonou (não escalou à toa)
+    assert CURSO in voo                            # segue em voo, aguardando o Notion
+
+
+def test_curso_parada_sem_avanco_reempurra_e_por_fim_escala():
+    # Honestidade do "não abandona": se a passada PARA (Notion não avança) e a janela
+    # de espera esgota, re-empurra até max_tentativas e, aí sim, ESCALA — não fica
+    # eternamente em voo em silêncio.
+    mundo = MundoFake(cursos={CURSO: [10, 18]})
+    voz = FakeVoz()
+    esp = {"cursos": {CURSO: 18}}
+    voo = {}
+    base = 1000.0
+    espera = 600.0
+    # ciclo 0: enfileira (tentativa 1)
+    orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                            make_verificar(mundo), voz, agora=base, voo=voo,
+                            espera_s=espera, max_tentativas=2)
+    # ciclo 1: janela esgotada sem avanço -> RE-empurra (tentativa 2)
+    r1 = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                 make_verificar(mundo), voz, agora=base + espera + 1,
+                                 voo=voo, espera_s=espera, max_tentativas=2)
+    assert r1[0].em_voo is True and r1[0].escalou is False
+    assert mundo.chamadas.count(("disparar_passada", CURSO)) == 2  # re-empurrou UMA vez
+    assert voz.escaladas == []
+    # ciclo 2: janela esgotada de novo, tentativas exauridas -> ESCALA (honesto)
+    r2 = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                 make_verificar(mundo), voz,
+                                 agora=base + 2 * (espera + 1), voo=voo,
+                                 espera_s=espera, max_tentativas=2)
+    assert r2[0].escalou is True and r2[0].em_voo is False
+    assert mundo.chamadas.count(("disparar_passada", CURSO)) == 2  # NÃO disparou de novo
+    assert len(voz.escaladas) == 1
+    assert CURSO not in voo
+
+
+def test_curso_avanco_no_notion_reinicia_a_janela_e_nao_escala():
+    # Se o Notion AVANÇA (done sobe) mesmo sem completar, a captura está progredindo:
+    # reinicia a janela de espera, NÃO re-dispara e NÃO escala (progresso != parada).
+    mundo = MundoFake(cursos={CURSO: [5, 18]})
+    voz = FakeVoz()
+    esp = {"cursos": {CURSO: 18}}
+    voo = {}
+    base = 1000.0
+    espera = 600.0
+    orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                            make_verificar(mundo), voz, agora=base, voo=voo,
+                            espera_s=espera, max_tentativas=2)
+    mundo.worker_avanca_no_notion(CURSO, 12)       # progrediu 5 -> 12 (não concluiu)
+    r = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                make_verificar(mundo), voz, agora=base + espera + 1,
+                                voo=voo, espera_s=espera, max_tentativas=2)
+    assert r[0].em_voo is True and r[0].escalou is False
+    assert mundo.chamadas.count(("disparar_passada", CURSO)) == 1  # não re-disparou
+    assert voz.escaladas == []
+    assert voo[CURSO]["ultimo_done"] == 12         # registrou o avanço
+
+
+def test_curso_falha_ao_enfileirar_escala_e_nao_marca_em_voo():
+    # Se o ENFILEIRAR em si estoura (fila/executor off), escala honesto e NÃO marca em
+    # voo — o próximo ciclo re-tenta o disparo. Nunca finge que enfileirou.
+    class MundoFilaOff(MundoFake):
+        def disparar_passada(self, alvo):
+            self.chamadas.append(("disparar_passada", alvo))
+            raise RuntimeError("fila/executor off")
+
+    mundo = MundoFilaOff(cursos={CURSO: [10, 18]})
+    voz = FakeVoz()
+    esp = {"cursos": {CURSO: 18}}
+    voo = {}
+    res = orquestrador.orquestrar(observar_curso(mundo, CURSO), esp, mundo,
+                                  make_verificar(mundo), voz, voo=voo)
+    assert res[0].escalou is True and res[0].em_voo is False
+    assert CURSO not in voo                         # não marcou em voo
     assert len(voz.escaladas) == 1
 
 
@@ -400,28 +539,43 @@ def test_fila_travada_reenqueue_confirma_quando_destrava():
 # 4 — orquestrar: integração sobre TODAS as divergências de um snapshot
 # =====================================================================
 def test_orquestrar_resolve_o_que_da_e_escala_o_que_nao_da():
+    # MISTO num só snapshot: serviços fecham o loop SÍNCRONO no ciclo; o curso é
+    # ASSÍNCRONO (fica em voo, confirma depois). worker sobe no restart; app NÃO sobe
+    # no redeploy (mundo quebrado p/ app) -> escala; curso 10/18 -> enfileira e em voo.
     est = estado(
         servicos=[Serv("worker", up=False, health=False),   # cai -> restart confirma
                   Serv("app", up=True, health=False)],       # doente -> redeploy QUEBRADO
-        progresso=[Prog(CURSO, done=10, total=18)],          # incompleto -> passada confirma
+        progresso=[Prog(CURSO, done=10, total=18)],          # incompleto -> passada em voo
     )
     esp = {"servicos": {"worker": {"up": True, "health": True},
                         "app": {"up": True, "health": True}},
            "cursos": {CURSO: 18}}
-    # worker sobe no restart; app NÃO sobe no redeploy (mundo quebrado p/ app); curso conclui
     mundo = MundoFake(servicos={"worker": False, "app": False},
                       cursos={CURSO: [10, 18]},
-                      restart_conserta=True, redeploy_conserta=False,
-                      captura_conclui=True)
+                      restart_conserta=True, redeploy_conserta=False)
     voz = FakeVoz()
+    voo = {}
     resultados = orquestrador.orquestrar(est, esp, mundo, make_verificar(mundo), voz,
-                                         max_tentativas=2)
+                                         max_tentativas=2, voo=voo)
     por_alvo = {r.divergencia.alvo: r for r in resultados}
     assert por_alvo["worker"].confirmado is True and por_alvo["worker"].escalou is False
-    assert por_alvo[CURSO].confirmado is True
+    # curso NÃO é declarado done no mesmo ciclo — fica em voo (assíncrono)
+    assert por_alvo[CURSO].em_voo is True
+    assert por_alvo[CURSO].confirmado is False and por_alvo[CURSO].escalou is False
     # o app não confirmou -> reconhecido como falha e escalado, não declarado ok
     assert por_alvo["app"].confirmado is False and por_alvo["app"].escalou is True
-    assert len(voz.escaladas) == 1                   # só o app escalou
+    assert len(voz.escaladas) == 1                   # só o app escalou (curso não escala)
+
+    # ciclo posterior: worker residencial concluiu o curso no Notion -> confirma
+    mundo.worker_avanca_no_notion(CURSO, 18)
+    est2 = estado(servicos=[Serv("worker", up=True, health=True),
+                            Serv("app", up=True, health=True)],
+                  progresso=[Prog(CURSO, done=18, total=18)])
+    r2 = orquestrador.orquestrar(est2, esp, mundo, make_verificar(mundo), voz,
+                                 max_tentativas=2, voo=voo)
+    por_alvo2 = {r.divergencia.alvo: r for r in r2}
+    assert por_alvo2[CURSO].confirmado is True and por_alvo2[CURSO].em_voo is False
+    assert CURSO not in voo
 
 
 def test_orquestrar_tudo_saudavel_nao_age_nem_escala():

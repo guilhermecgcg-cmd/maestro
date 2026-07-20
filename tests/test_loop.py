@@ -93,6 +93,63 @@ def test_captura_vazia_do_adaptador_escala_sem_agir():
     assert any("falso-sucesso" in e for e in v.escaladas)  # escalou claro
 
 
+class _AcessoContado(_Acesso):
+    """Conta as sondas de /health e df/free e devolve saúde por-nome (modela o
+    mecanismo real: saude_http fatiável por alvo, recursos global)."""
+    def __init__(self, servicos, saude_map=None):
+        super().__init__(servicos)
+        self._saude_map = saude_map or {}
+        self.saude_calls = 0
+        self.recursos_calls = 0
+        self.saude_alvos = []
+
+    def saude_http(self, alvos):
+        self.saude_calls += 1
+        self.saude_alvos.append(dict(alvos))
+        return {n: self._saude_map.get(n, False) for n in alvos}
+
+    def recursos(self):
+        self.recursos_calls += 1
+        return {"disco_pct": 10, "ram_pct": 10}
+
+
+def test_ciclo_nao_sonda_saude_recursos_em_dobro_TEETH():
+    # TEETH (achado [7]): com db ligado e N projetos, o /health e o df/free eram
+    # sondados em DOBRO — o observador sondava e o laço por-projeto sondava de novo os
+    # MESMOS endpoints (1 na coletar + N por-projeto). Com a sonda única por ciclo,
+    # saude_http roda UMA vez (sobre a união) e recursos() UMA vez. No código velho
+    # este teste vê 3 e 3 (1 união + 2 projetos), não 1 e 1.
+    a = _AcessoContado({"api": Servico("api", up=True, restarting=False),
+                        "web": Servico("web", up=True, restarting=False)},
+                       saude_map={"api": True, "web": False})
+    v = _Voz()
+    db = FakeDB()
+    p1 = _proj(nome="p1", servicos=("api",), saude={"api": "http://a/health"})
+    p2 = _proj(nome="p2", servicos=("web",), saude={"web": "http://w/health"})
+    ciclo(a, v, [p1, p2], llm=lambda p: "{}", db=db)
+    assert a.saude_calls == 1        # UMA sonda de /health no ciclo (não 1+N)
+    assert a.recursos_calls == 1     # UMA leitura de df/free no ciclo (não 1+N)
+    # a sonda única cobriu a UNIÃO dos alvos (cada projeto fatia o seu depois)
+    assert a.saude_alvos[0] == {"api": "http://a/health", "web": "http://w/health"}
+    # SÉRIE INTACTA: o observador gravou os dois serviços com o health CERTO reusado
+    linhas = {r[1]: r for r in db.store["rows"]}          # servico -> (ts, sv, up, health, det)
+    assert {"api", "web"} <= set(linhas)
+    assert linhas["api"][3] is True and linhas["web"][3] is False
+
+
+def test_ciclo_reusa_saude_doente_ainda_detecta_por_projeto_TEETH():
+    # TEETH da CORRETUDE: o valor de /health reusado (da sonda única) tem de chegar ao
+    # checar POR-PROJETO — o dedup não pode cegar a doença. Serviço Up-mas-doente
+    # (health False) deve ser detectado (o loop lê os logs dele pra diagnosticar).
+    a = _AcessoContado({"api": Servico("api", up=True, restarting=False)},
+                       saude_map={"api": False})          # Up mas /health falhou
+    v = _Voz()
+    ciclo(a, v, [_proj(servicos=("api",), saude={"api": "http://a/health"})],
+          llm=lambda p: '{"acao":"nada","escalar":true,"diagnostico":"?"}')
+    assert "api" in a.logs_lidos      # doente detectado via saude reusada -> diagnosticou
+    assert a.saude_calls == 1         # e sondou o /health só uma vez
+
+
 def test_loop_coordena_cursos_desejados_por_url():
     # C4 wiring: o loop itera cursos_desejados do PROJETO conhecimento e dispara a
     # captura por course_url (sem criar entrada nova no registro), guardando estado

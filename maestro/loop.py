@@ -37,26 +37,39 @@ def ciclo(acesso, voz, projetos, *, llm, estado=None, db=None) -> list:
     if estado is None:
         estado = {}
 
+    # SONDA ÚNICA POR CICLO (dedup): /health e df/free são idempotentes mas custam
+    # rede/IO na VPS. Sondá-los UMA vez e REUSAR mata a sondagem dupla que existia
+    # (o observador da Camada 1 sondava, e o laço por-projeto sondava de novo os
+    # MESMOS /health e df/free). `todas` (docker ps) já veio acima. saude_http vai
+    # UMA vez sobre a UNIÃO dos alvos de todos os projetos — cada projeto fatia o
+    # seu depois; recursos() é global -> uma leitura basta.
+    alvos_saude = {}
+    for proj in projetos:
+        alvos_saude.update(getattr(proj, "saude", {}) or {})
+    saude_all = acesso.saude_http(alvos_saude) if alvos_saude else {}
+    recursos_all = acesso.recursos()
+
     # CAMADA 1 (os olhos): quando um store durável `db` é injetado, grava um
     # snapshot carimbado do estado REAL a cada ciclo (serviços up/health +
     # recursos). É a correção da CEGUEIRA (P1): o estado passa a ser uma série
     # temporal — o cérebro pergunta "ficou up nos últimos N min?" (flapping/
     # estado_estavel), não "está up neste instante?" (sonda). db=None -> desligado
-    # (retrocompatível; nada muda no loop atual). fila_fn/progresso_fn ficam como
-    # pontos de injeção (a contagem-verdade do Notion é costura futura).
+    # (retrocompatível; nada muda no loop atual). Reusa a sonda única do ciclo
+    # (servicos/saude/recursos) — não re-sonda; carimba tudo com seu próprio `agora`.
     if db is not None:
-        alvos = {}
-        for proj in projetos:
-            alvos.update(getattr(proj, "saude", {}) or {})
         try:
             observador.registrar(
-                db, observador.coletar_estado(acesso, alvos, time.time()))
+                db, observador.coletar_estado(
+                    acesso, alvos_saude, time.time(), servicos_raw=todas,
+                    saude=saude_all, recursos_raw=recursos_all))
         except Exception:
             pass  # observar nunca pode derrubar o loop de saúde
     for proj in projetos:
         servs = {n: s for n, s in todas.items() if n in proj.servicos}
-        snap = {"servicos": servs, "saude": acesso.saude_http(proj.saude),
-                "recursos": acesso.recursos(), "agora": time.time()}
+        saude_proj = {n: saude_all.get(n, False)
+                      for n in (getattr(proj, "saude", {}) or {})}
+        snap = {"servicos": servs, "saude": saude_proj,
+                "recursos": recursos_all, "agora": time.time()}
         problemas = list(sentinela.checar(snap))
         if proj.adaptador == "conhecimento":
             from maestro.adaptadores import conhecimento

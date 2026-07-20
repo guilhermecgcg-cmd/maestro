@@ -75,21 +75,29 @@ class EstadoObservado:
 
 
 # --- Coleta: monta o snapshot a partir das costuras injetadas ---------------
-def coletar_estado(acesso, alvos_saude, agora, *, fila_fn=None, progresso_fn=None
+def coletar_estado(acesso, alvos_saude, agora, *, fila_fn=None, progresso_fn=None,
+                   servicos_raw=None, saude=None, recursos_raw=None
                    ) -> EstadoObservado:
     """Monta o snapshot carimbado do estado REAL, lendo SÓ as costuras de `acesso`
     (não abre docker/HTTP/DB novo). `agora` vai em TODO campo — é o eixo do tempo
     da série. `fila_fn`/`progresso_fn` são seams: fila = estado da fila de captura
     (default: `acesso.fila()` se existir); progresso = contagem-verdade por curso,
-    plugada pelo chamador (nunca o Notion aqui)."""
-    servs_raw = acesso.servicos()
-    saude = acesso.saude_http(alvos_saude) if alvos_saude else {}
+    plugada pelo chamador (nunca o Notion aqui).
+
+    `servicos_raw`/`saude`/`recursos_raw` são valores JÁ SONDADOS pelo chamador NESTE
+    ciclo (docker ps, /health, df/free) — quando passados, o observador os REUSA em
+    vez de re-sondar (evita a sondagem dupla quando o mesmo ciclo já os coletou para o
+    laço por-projeto). Não altera a série: os valores continuam carimbados com `agora`.
+    Ausentes (None) -> o observador sonda por conta própria (retrocompatível)."""
+    servs_raw = acesso.servicos() if servicos_raw is None else servicos_raw
+    if saude is None:
+        saude = acesso.saude_http(alvos_saude) if alvos_saude else {}
     servicos = tuple(
         ServicoObservado(nome=s.nome, up=s.up, health=bool(saude.get(nome, False)),
                          restarting=s.restarting, ts=agora)
         for nome, s in servs_raw.items())
 
-    r = acesso.recursos()
+    r = acesso.recursos() if recursos_raw is None else recursos_raw
     recursos = Recursos(disco_pct=r.get("disco_pct", 0.0),
                         ram_pct=r.get("ram_pct", 0.0), ts=agora)
 

@@ -525,3 +525,122 @@ def test_mesma_conta_stoa_serializa():
 def test_lock_dir_padrao_e_duravel_nao_no_tempdir():
     assert tempfile.gettempdir() not in captura._LOCK_DIR_PADRAO
     assert captura._LOCK_DIR_PADRAO.startswith(os.path.expanduser("~"))
+
+
+# ==========================================================================
+# STDERR FIADO (a causa-raiz do flap): o executor tee'a stdout+stderr do motor
+# por CONTA e ANEXA o path ao óbito -> a autópsia (vigia) lê o TAIL e a causa
+# deixa de ser 'desconhecida'. Teste-com-DENTES: falha contra o DEVNULL antigo.
+# ==========================================================================
+def test_disparar_fia_stderr_tee_por_conta_no_env_privado():
+    sp = FakeSpawn()
+    ex = _exec(_hot(C1, "conta-A"), spawn=sp)
+    ex.disparar(C1)
+    env = sp.calls[0]["env"]
+    # a chave PRIVADA aponta o arquivo de tee da conta (mesmo slug do lock).
+    assert env[captura._ENV_STDERR_TEE] == ex._stderr_path("conta-A")
+    assert env[captura._ENV_STDERR_TEE].endswith(".err")
+
+
+def test_obito_carrega_stderr_path_e_vigia_le_o_tail(tmp_path):
+    from maestro import vigia
+    logdir = tmp_path / "motor-logs"
+    sp = FakeSpawn()
+    ex = _exec(_hot(C1, "conta-A"), spawn=sp, motor_log_dir=str(logdir))
+    ex.disparar(C1)
+    # o motor (dublê) escreveu no arquivo de tee da conta ANTES de morrer.
+    errp = ex._stderr_path("conta-A")
+    os.makedirs(os.path.dirname(errp), exist_ok=True)
+    with open(errp, "w") as f:
+        f.write("Traceback...\nSESSÃO MORTA: cookie TGC expirou\n")
+    sp.procs[0].encerrar(3)                                 # SessionDead (exit 3)
+    obitos = ex.drenar_obitos()
+    assert obitos["conta-A"]["stderr_path"] == errp         # DENTES: falha no DEVNULL antigo
+    # a autópsia consome o dict e LÊ o tail do arquivo -> causa vira classificável.
+    obs = vigia.autopsia(str(tmp_path / "locks"), obitos, autopsia_dir=str(tmp_path / "aut"))
+    assert len(obs) == 1
+    assert "SESSÃO MORTA" in obs[0].stderr_tail
+
+
+def test_spawn_popen_real_teea_stderr_e_popa_a_chave_do_filho(tmp_path):
+    import sys
+    errp = tmp_path / "logs" / "child.err"
+    envdump = tmp_path / "envdump.txt"
+    code = ("import sys,os;"
+            "open(%r,'w').write(repr(os.environ.get('_ATHENA_MOTOR_STDERR')));"
+            "sys.stderr.write('BOOM session expired\\n')" % str(envdump))
+    env = dict(os.environ)
+    env[captura._ENV_STDERR_TEE] = str(errp)
+    proc = captura._spawn_popen([sys.executable, "-c", code], env=env, cwd=str(tmp_path))
+    proc.wait(timeout=30)
+    assert "BOOM session expired" in errp.read_text()       # tee funcionou
+    assert envdump.read_text() == "None"                    # chave POPADA (filho não herdou)
+
+
+# ==========================================================================
+# CAUSA-RAIZ DO FLAP (ProcessSingleton): os 3 Memberkit (contas distintas) NÃO
+# podem mais partilhar o `.chrome-profile` default com o Hotmart — cada tenant
+# ganha perfil DEDICADO. Hotmart FIXA `.chrome-profile` (perfil do launcher
+# manual, sessão restaura cookies do próprio perfil). Testes-com-DENTES: falham
+# contra o perfil compartilhado (o bug que os matava na largada sob o daemon).
+# ==========================================================================
+def test_hotmart_mantem_perfil_historico_chrome_profile():
+    # Hotmart conta ÚNICA: fixa `.chrome-profile` (não vira per-conta — arriscaria a
+    # sessão, que restaura cookies do próprio perfil). Sozinho nele => não colide.
+    sp = FakeSpawn()
+    _exec(_hot(C1, "hotmart-principal"), spawn=sp).disparar(C1)
+    assert sp.calls[0]["env"]["CHROME_USER_DATA_DIR"] == ".chrome-profile"
+
+
+def test_memberkit_contas_distintas_perfis_distintos():
+    # o EXATO cenário do flap: 3 tenants Memberkit em paralelo. Perfis TÊM de diferir.
+    a = captura.CursoLocal(url="https://a.memberkit.com.br/", conta="mk-a",
+                           plataforma="memberkit")
+    b = captura.CursoLocal(url="https://b.memberkit.com.br/", conta="mk-b",
+                           plataforma="memberkit")
+    sp = FakeSpawn()
+    ex = _exec(a, b, spawn=sp)
+    ex.disparar(a.url)
+    ex.disparar(b.url)
+    p0 = sp.calls[0]["env"]["CHROME_USER_DATA_DIR"]
+    p1 = sp.calls[1]["env"]["CHROME_USER_DATA_DIR"]
+    assert p0 != p1                                        # DENTES: sem isto, colidem = flap
+    assert p0 == ".chrome-profile-mk-a" and p1 == ".chrome-profile-mk-b"
+
+
+def test_hotmart_e_memberkit_nao_partilham_perfil():
+    # O cerne do fix: Hotmart e Memberkit rodam em PARALELO sem colidir no perfil.
+    # Hotmart em `.chrome-profile`; Memberkit no SEU dedicado — diretórios distintos.
+    sp = FakeSpawn()
+    hot = _hot(C1, "hotmart-principal")
+    mk = captura.CursoLocal(url=MK, conta="mk-x", plataforma="memberkit")
+    ex = _exec(hot, mk, spawn=sp)
+    ex.disparar(C1)
+    ex.disparar(MK)
+    perfis = {c["env"]["CHROME_USER_DATA_DIR"] for c in sp.calls}
+    assert perfis == {".chrome-profile", ".chrome-profile-mk-x"}  # distintos: não colidem
+
+
+def test_stoa_kajabi_mantem_perfil_do_spec_intacto():
+    sp = FakeSpawn()
+    _exec(_stoa(), spawn=sp, motor_dir_por_plataforma={"stoa": STOA_DIR}).disparar(STOA)
+    assert sp.calls[0]["env"]["CHROME_USER_DATA_DIR"] == ".chrome-profile-stoa"
+    sp2 = FakeSpawn()
+    _exec(_kajabi(), spawn=sp2).disparar(KAJABI)
+    assert sp2.calls[0]["env"]["CHROME_USER_DATA_DIR"] == ".chrome-profile-kajabi"
+
+
+def test_disparar_limpa_singleton_orfao_do_perfil_da_conta(tmp_path):
+    # simula um crash anterior: SingletonLock órfão no perfil (Hotmart => `.chrome-profile`).
+    motor_dir = tmp_path / "aula"
+    perfil = motor_dir / ".chrome-profile"
+    perfil.mkdir(parents=True)
+    lock = perfil / "SingletonLock"
+    lock.write_text("stale")
+    sp = FakeSpawn()
+    ex = captura.LocalExecutor(
+        [_hot(C1, "hotmart-principal")], motor_python=PY, motor_dir=str(motor_dir),
+        spawn=sp, lock_dir=str(tmp_path / "locks"), pid_vivo=sp.mundo.vivo,
+        motor_log_dir=str(tmp_path / "logs"))
+    ex.disparar(C1)
+    assert not lock.exists()                              # DENTES: lock órfão foi removido

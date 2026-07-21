@@ -431,7 +431,18 @@ class PlataformaSpec:
 #   - stoa/kajabi: adaptadores próprios, áudio-nativo, HEADED, Chromium ISOLADO (perfil
 #     dedicado por conta) — nunca channel=chrome (colidiria com o Hotmart no singleton).
 _PLATAFORMAS = {
-    "hotmart": PlataformaSpec("motor.cli", audio=True),
+    # Hotmart FIXA seu perfil histórico `.chrome-profile` (o MESMO do launcher manual que
+    # PRODUZ): a sessão Hotmart restaura cookies DO PRÓPRIO PERFIL ("restaurando N cookie(s)
+    # do perfil") além do storage_state, então um perfil NOVO/vazio arriscaria a sessão. Não
+    # colide: é conta ÚNICA (hotmart-principal) e os 3 Memberkit (que partilhavam este mesmo
+    # default) agora têm perfis DEDICADOS — Hotmart fica sozinho no `.chrome-profile`.
+    "hotmart": PlataformaSpec(
+        "motor.cli", audio=True,
+        env=(("CHROME_USER_DATA_DIR", ".chrome-profile"),)),
+    # Memberkit: 3 tenants (contas distintas) — SEM perfil no spec => cada conta ganha o seu
+    # (`.chrome-profile-<conta>`) em `_montar`. É o fix do flap: os 3 + Hotmart caíam todos
+    # no `.chrome-profile` e colidiam no ProcessSingleton. Sessão é storage_state (provado:
+    # os 3 injetam cookies e enumeram o próprio tenant), então perfil dedicado não perde login.
     "memberkit": PlataformaSpec("motor.memberkit", headless=True),
     "stoa": PlataformaSpec(
         "motor.stoa", chromium=True, url_env="STOA_URL",
@@ -443,14 +454,44 @@ _PLATAFORMAS = {
 }
 
 
+# Chave PRIVADA de env pela qual o executor diz ao spawn default ONDE tee'ar o stderr do
+# filho. É POPADA dentro do `_spawn_popen` ANTES do exec — o motor NUNCA a herda (não é
+# config dele; é fiação interna do supervisor). O seam de spawn injetado (testes) ignora
+# a chave, então o contrato `(cmd, *, env, cwd)` fica intacto.
+_ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
+
+
 def _spawn_popen(cmd, *, env, cwd):  # pragma: no cover — processo REAL do motor
     """Spawn REAL não-bloqueante (o motor roda minutos-horas; o disparo retorna já).
     `start_new_session` desacopla a captura do processo da Athena (uma reinicialização
-    do loop não mata uma captura em andamento). stdout/err vão pro DEVNULL — produção
-    pode injetar um spawn que loga por curso; este é o default enxuto."""
+    do loop não mata uma captura em andamento).
+
+    STDERR FIADO (a causa-raiz do flap vive AQUI): se `env[_ENV_STDERR_TEE]` aponta um
+    arquivo, stdout+stderr do filho são TEE'D para ele (o motor imprime tanto os abortos
+    controlados — 'SESSÃO MORTA', 'RUN INTERROMPIDO' — no stdout quanto tracebacks no
+    stderr; capturar OS DOIS é o que dá à autópsia/causa-raiz o sinal real, em vez de
+    'causa desconhecida'). Sem a chave, cai no DEVNULL enxuto de antes (retrocompat). A
+    chave é REMOVIDA do env do filho — é fiação do supervisor, não config do motor."""
     import subprocess
-    return subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+    env = dict(env)
+    err_path = env.pop(_ENV_STDERR_TEE, None)
+    saida = subprocess.DEVNULL
+    if err_path:
+        try:
+            os.makedirs(os.path.dirname(err_path), exist_ok=True)
+            saida = open(err_path, "wb")   # trunca a cada disparo: o TAIL é do run atual
+        except OSError:
+            saida = subprocess.DEVNULL
+    try:
+        return subprocess.Popen(cmd, env=env, cwd=cwd, stdout=saida,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+    finally:
+        # o filho já dup'ou o fd; o pai fecha a sua cópia para não vazar handle.
+        if saida not in (subprocess.DEVNULL, None):
+            try:
+                saida.close()
+            except OSError:
+                pass
 
 
 def _pid_vivo(pid) -> bool:
@@ -479,6 +520,43 @@ def _pid_vivo(pid) -> bool:
 # captura (ou re-semeado) poderia ser re-disparado na mesma conta = ban. O HOME persiste.
 # (Env ATHENA_LOCK_DIR sobrepõe; ver LocalExecutor / athena_local.main.)
 _LOCK_DIR_PADRAO = os.path.join(os.path.expanduser("~"), ".athena-local", "locks")
+
+# Onde o stderr+stdout de CADA motor spawnado é tee'd (um arquivo por CONTA, sobrescrito
+# a cada disparo — o TAIL é sempre do run mais recente). Mora sob o mesmo ~/.athena-local
+# do lock/autópsia. É a EVIDÊNCIA que a autópsia (vigia) lê via `stderr_path` para a
+# causa-raiz deixar de ser 'desconhecida'. Env ATHENA_MOTOR_LOG_DIR sobrepõe.
+_MOTOR_LOG_DIR_PADRAO = os.path.join(
+    os.path.expanduser("~"), ".athena-local", "motor-logs")
+
+
+# Arquivos de singleton que o Chrome cria DENTRO do user-data-dir. Um crash/SIGKILL do
+# motor pode deixar o SingletonLock ÓRFÃO; o próximo run da MESMA conta então falharia com
+# "Failed to create a ProcessSingleton ... File exists (17)" mesmo SEM concorrência. Como
+# o guard 1-por-conta garante que, ao disparar, NENHUM motor daquela conta está vivo, um
+# Singleton* presente no perfil dela é necessariamente OBSOLETO e pode ser removido.
+_SINGLETON_NOMES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+
+
+def _perfil_de_conta(conta) -> str:
+    """Diretório de perfil Chrome DEDICADO da conta (RELATIVO ao cwd=motor_dir, como os
+    perfis de Stoa/Kajabi). Sanitiza a conta p/ um nome de dir seguro. Contas distintas =>
+    perfis distintos => nunca colidem no ProcessSingleton do Chrome (a causa do flap)."""
+    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(conta)) or "conta"
+    return ".chrome-profile-" + slug
+
+
+def _limpar_singleton_orfao(profile_dir):  # pragma: no cover — I/O de arquivo real
+    """Remove Singleton* ÓRFÃOS do `profile_dir` (crash deixou o lock). Chamado só no
+    disparo, quando o guard 1-por-conta já garante que nenhum motor da conta está vivo —
+    logo o lock é obsoleto. Best-effort: falha de remoção não impede o disparo."""
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return
+    for nome in _SINGLETON_NOMES:
+        p = os.path.join(profile_dir, nome)
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 class LocalExecutor:
@@ -520,7 +598,7 @@ class LocalExecutor:
 
     def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
                  extra_env=None, lock_dir=None, pid_vivo=None,
-                 motor_dir_por_plataforma=None):
+                 motor_dir_por_plataforma=None, motor_log_dir=None):
         self._meta = {c.url: c for c in cursos}
         self._motor_python = motor_python
         self._motor_dir = motor_dir
@@ -531,6 +609,10 @@ class LocalExecutor:
         self._groq_key = groq_key
         self._extra_env = dict(extra_env or {})
         self._procs = {}                       # course_url -> handle de processo vivo
+        # STDERR FIADO: por CONTA, o arquivo onde o motor daquela conta tee'a stdout+stderr.
+        # `disparar` grava; `_reap` anexa o path ao óbito (a autópsia lê o TAIL de lá). Por
+        # conta (não por curso) porque o óbito e o guard anti-ban são chaveados por conta.
+        self._motor_log_dir = motor_log_dir or _MOTOR_LOG_DIR_PADRAO
         # ÓBITOS colhidos: {conta -> {conta, course_url, exit_code, pid}}. Populado no
         # `_reap` quando um filho encerra; DRENADO (e zerado) pelo loop a cada ciclo para
         # alimentar a autópsia (maestro.vigia). Guardar o exit_code REAL do filho ANTES de
@@ -547,6 +629,13 @@ class LocalExecutor:
         # nome de arquivo estável e seguro a partir da conta (que pode ter espaços/barras).
         slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
         return os.path.join(self._lock_dir, slug + ".lock")
+
+    def _stderr_path(self, conta) -> str:
+        """Arquivo de stderr+stdout tee'd do motor DESTA conta (mesmo slug do lock, para
+        casar 1:1 com o guard anti-ban por conta). É o que `disparar` passa ao spawn e o
+        que `_reap` anexa ao óbito (a autópsia lê o TAIL)."""
+        slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self._motor_log_dir, slug + ".err")
 
     def _ler_lock(self, conta):
         """Lê o lock da conta e devolve o dict {pid, course_url, conta} SE o PID ainda
@@ -607,7 +696,11 @@ class LocalExecutor:
             self._obitos[str(meta.conta)] = {
                 "conta": str(meta.conta), "course_url": url,
                 "exit_code": getattr(proc, "returncode", None),
-                "pid": getattr(proc, "pid", None)}
+                "pid": getattr(proc, "pid", None),
+                # EVIDÊNCIA: onde o motor desta conta tee'ou stdout+stderr. A autópsia
+                # (vigia._coerce_fonte) lê o TAIL deste arquivo -> a causa deixa de ser
+                # 'desconhecida'. Só o path (o arquivo pode ser grande); o vigia faz o tail.
+                "stderr_path": self._stderr_path(meta.conta)}
             path = self._lock_path(meta.conta)
             try:
                 with open(path) as f:
@@ -625,7 +718,8 @@ class LocalExecutor:
         na drenagem seguinte, então não infla o flapping (contrato do vigia)."""
         self._reap()
         out = {c: {"conta": d["conta"], "curso": d.get("course_url", ""),
-                   "exit_code": d.get("exit_code"), "pid": d.get("pid")}
+                   "exit_code": d.get("exit_code"), "pid": d.get("pid"),
+                   "stderr_path": d.get("stderr_path")}
                for c, d in self._obitos.items()}
         self._obitos = {}
         return out
@@ -674,6 +768,18 @@ class LocalExecutor:
                 f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
                 f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
         cmd, env, cwd = self._montar(meta)                 # fail-closed ANTES de qualquer spawn
+        # STDERR FIADO: diz ao spawn default ONDE tee'ar stdout+stderr do motor (por conta).
+        # O `_spawn_popen` POPA esta chave antes do exec — o motor não a herda. Spawns
+        # injetados (testes) a ignoram (contrato `(cmd, *, env, cwd)` intacto).
+        env[_ENV_STDERR_TEE] = self._stderr_path(meta.conta)
+        # SINGLETON ÓRFÃO: se um run anterior DESTA conta crashou, pode ter deixado o
+        # SingletonLock no perfil — e o próximo run falharia na largada mesmo sem
+        # concorrência. O guard 1-por-conta já provou que nenhum motor da conta está vivo
+        # AGORA, então qualquer Singleton* no perfil dela é obsoleto: limpa antes de subir.
+        perfil = env.get("CHROME_USER_DATA_DIR")
+        if perfil:
+            _limpar_singleton_orfao(perfil if os.path.isabs(perfil)
+                                    else os.path.join(cwd, perfil))
         # TOCTOU (fix do achado MÉDIO): grava o lock de INTENÇÃO (pid=None) ANTES do spawn.
         # Se o loop crashar na janela sub-ms entre o spawn e a escrita do PID, a captura
         # órfã (start_new_session) segue viva SEM que seu PID tenha sido registrado — mas o
@@ -718,8 +824,23 @@ class LocalExecutor:
         # INVIOLÁVEIS por último (Groq/HEADLESS/MOTOR_BROWSER vencem tudo — o exato anti-ban
         # que este executor existe para cravar).
         env.update(self._extra_env)
+        spec_env = dict(spec.env)
         for k, v in spec.env:                              # perfil dedicado, LESSON_TIMEOUT_S
             env[k] = v
+        # PERFIL DEDICADO POR CONTA (fix da causa-raiz do FLAP — ProcessSingleton):
+        # `make_context` faz `launch_persistent_context(CHROME_USER_DATA_DIR)`, e o Chrome
+        # cria um SingletonLock POR user-data-dir — só UM processo por diretório de perfil.
+        # Sem esta linha, Hotmart e os 3 Memberkit (channel=chrome) caíam TODOS no default
+        # `.chrome-profile` e, rodando em PARALELO sob o daemon (contas distintas), o 2º+ a
+        # subir batia em "Failed to create a ProcessSingleton" e MORRIA na largada = o flap.
+        # Damos a CADA conta seu próprio perfil (o storage_state/sessão é injetado à parte,
+        # de `.hotmart-session.json`/MEMBERKIT_SESSION_PATH — trocar o perfil NÃO perde o
+        # login). Plataformas cujo spec JÁ define um perfil (Stoa/Kajabi, Chromium isolado,
+        # conta única) são mantidas intactas — não colidem e têm sessão viva nesse perfil.
+        # FORÇA (não setdefault): um CHROME_USER_DATA_DIR herdado do ambiente do daemon
+        # NÃO pode fazer duas contas partilharem perfil (seria o mesmo ban por trás).
+        if "CHROME_USER_DATA_DIR" not in spec_env:
+            env["CHROME_USER_DATA_DIR"] = _perfil_de_conta(meta.conta)
         if spec.url_env:                                   # STOA_URL / KAJABI_URL = meta.url
             env[spec.url_env] = meta.url
         # PYTHONPATH = a árvore do motor DESTA plataforma, p/ o `python -m <modulo>`

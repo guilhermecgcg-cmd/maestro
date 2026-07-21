@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.athena.vigia — o vigia EXTERNO (P6: "quem vigia o vigia").
+  Processo SEPARADO do daemon com.athena.local: se o daemon travar (livelock), este
+  NÃO trava junto. A cada 5 min (StartInterval=300) roda scripts/vigia_externo.sh, que
+  lê a idade do heartbeat ~/.athena-local/pulso.json e, se >900s com o daemon carregado,
+  dá bounce no loop (SIGTERM; KeepAlive do com.athena.local ressuscita; motores intactos).
+
+  Instalação (o controlador faz, DEPOIS do merge do vigia no checkout do daemon e de o
+  heartbeat estar sendo escrito em pulso.json):
+    cp scripts/com.athena.vigia.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.athena.vigia.plist
+  Reversível: launchctl unload ~/Library/LaunchAgents/com.athena.vigia.plist && rm dele.
+
+  NÃO tem KeepAlive de propósito: é uma tarefa periódica (roda, decide, sai), não um
+  daemon. StartInterval reagenda; RunAtLoad dispara a 1ª no load.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.athena.vigia</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guilhermerodrigues/teste/maestro-athlocal/scripts/vigia_externo.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/guilhermerodrigues/.athena-local/vigia.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/guilhermerodrigues/.athena-local/vigia.err</string>
+</dict>
+</plist>

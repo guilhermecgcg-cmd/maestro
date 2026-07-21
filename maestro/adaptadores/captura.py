@@ -531,6 +531,11 @@ class LocalExecutor:
         self._groq_key = groq_key
         self._extra_env = dict(extra_env or {})
         self._procs = {}                       # course_url -> handle de processo vivo
+        # ÓBITOS colhidos: {conta -> {conta, course_url, exit_code, pid}}. Populado no
+        # `_reap` quando um filho encerra; DRENADO (e zerado) pelo loop a cada ciclo para
+        # alimentar a autópsia (maestro.vigia). Guardar o exit_code REAL do filho ANTES de
+        # descartar o handle dá à causa-raiz (maestro.causa) o sinal FORTE de morte.
+        self._obitos = {}
         # Guard DURÁVEL: dir estável (sobrevive a restart) + sonda de PID injetável (os
         # testes de RESTART simulam o processo antigo ainda vivo sem um pid real).
         self._lock_dir = lock_dir or _LOCK_DIR_PADRAO
@@ -592,10 +597,17 @@ class LocalExecutor:
         para sempre. poll() reapa o zumbi do próprio filho — essencial: um filho encerrado
         e não-colhido continuaria 'vivo' para `os.kill(pid, 0)`."""
         for url in [u for u, p in self._procs.items() if p.poll() is not None]:
-            del self._procs[url]
+            proc = self._procs.pop(url)
             meta = self._meta.get(url)
             if meta is None:
                 continue
+            # ÓBITO: grava o exit_code REAL do filho ANTES de descartar o handle. É o
+            # sinal FORTE que a autópsia (vigia) e a causa-raiz (causa) consomem para
+            # distinguir saída limpa (exit 0), SIGKILL/OOM (-9/137) e falha genérica.
+            self._obitos[str(meta.conta)] = {
+                "conta": str(meta.conta), "course_url": url,
+                "exit_code": getattr(proc, "returncode", None),
+                "pid": getattr(proc, "pid", None)}
             path = self._lock_path(meta.conta)
             try:
                 with open(path) as f:
@@ -604,6 +616,19 @@ class LocalExecutor:
                 continue
             if data.get("course_url") == url:    # só remove o lock SE ainda for deste curso
                 self._remover_lock(path)
+
+    def drenar_obitos(self) -> dict:
+        """Colhe (via `_reap`) e ZERA os óbitos dos filhos que ESTA encarnação spawnou e
+        que encerraram desde a última drenagem. Devolve {conta -> {conta, curso,
+        exit_code, pid}} — a fonte por-conta que `maestro.vigia.autopsia` consome
+        (`_coerce_fonte` aceita o dict). Idempotente entre ciclos: a MESMA morte não volta
+        na drenagem seguinte, então não infla o flapping (contrato do vigia)."""
+        self._reap()
+        out = {c: {"conta": d["conta"], "curso": d.get("course_url", ""),
+                   "exit_code": d.get("exit_code"), "pid": d.get("pid")}
+               for c, d in self._obitos.items()}
+        self._obitos = {}
+        return out
 
     def curso_ativo(self, curso_url) -> bool:
         self._reap()

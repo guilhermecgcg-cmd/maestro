@@ -21,8 +21,19 @@ from maestro.adaptadores import captura
 C1 = "https://hotmart.com/pt-br/marketplace/produtos/x/products/111"
 C2 = "https://hotmart.com/pt-br/marketplace/produtos/y/products/222"
 MK = "https://minha.memberkit.com.br/321"
+STOA = "https://educacao.stoa.com.br/meus-cursos"
+KAJABI = "https://nepq-training.mykajabi.com/"
 PY = "/opt/aula/.venv/bin/python"
 DIR = "/opt/aula"
+STOA_DIR = "/opt/worktrees/adaptador-stoa"          # árvore CORRIGIDA da Stoa (worktree)
+
+
+def _stoa(conta="stoa"):
+    return captura.CursoLocal(url=STOA, conta=conta, plataforma="stoa")
+
+
+def _kajabi(conta="kajabi"):
+    return captura.CursoLocal(url=KAJABI, conta=conta, plataforma="kajabi")
 
 
 class FakeProc:
@@ -411,6 +422,99 @@ def test_spawn_falho_remove_o_lock_de_intencao(tmp_path):
     ex2 = _exec(_hot(C1, "conta-A"), spawn=sp_ok, lock_dir=lock, pid_vivo=sp_ok.mundo.vivo)
     assert ex2.disparar(C1) == f"local_iniciada:{C1}"
     assert len(sp_ok.calls) == 1
+
+
+# ==========================================================================
+# STOA — o executor supervisiona a captura da Stoa: motor.stoa + Chromium ISOLADO
+# (nunca channel=chrome, senão colide com o Hotmart no singleton do macOS) + perfil
+# DEDICADO + STOA_URL + LESSON_TIMEOUT_S + cwd na árvore CORRIGIDA (worktree).
+# ==========================================================================
+def test_stoa_monta_motor_stoa_chromium_url_e_timeout():
+    sp = FakeSpawn()
+    ex = _exec(_stoa(), spawn=sp, motor_dir_por_plataforma={"stoa": STOA_DIR})
+    conf = ex.disparar(STOA)
+    assert conf
+    call = sp.calls[0]
+    # DENTES: módulo Stoa e a URL da conta (home do tenant) como argv.
+    assert call["cmd"] == [PY, "-m", "motor.stoa", STOA]
+    assert "--audio" not in call["cmd"]                    # Stoa é áudio-nativo
+    env = call["env"]
+    assert env["MOTOR_BROWSER"] == "chromium"              # ISOLADO — NUNCA channel=chrome
+    assert env["STOA_URL"] == STOA
+    assert env["CHROME_USER_DATA_DIR"] == ".chrome-profile-stoa"  # perfil dedicado
+    assert env["LESSON_TIMEOUT_S"] == "1800"
+    assert env["WHISPER_BACKEND"] == "groq"                # INVIOLÁVEL Groq
+    assert "HEADLESS" not in env                           # HEADED (captura de áudio do player)
+    # DENTES: cwd/PYTHONPATH na árvore CORRIGIDA (worktree), não em /aula — é o que
+    # REUSA a sessão viva e o tracker idempotente da Stoa.
+    assert call["cwd"] == STOA_DIR
+    assert env["PYTHONPATH"] == STOA_DIR
+
+
+def test_stoa_nunca_channel_chrome():
+    # A regra anti-colisão: Stoa JAMAIS pode sair como channel=chrome (colidiria com o
+    # Chrome do sistema do Hotmart). MOTOR_BROWSER tem de ser 'chromium', mesmo se um
+    # valor 'chrome' vazar do ambiente/extra_env.
+    sp = FakeSpawn()
+    _exec(_stoa(), spawn=sp, extra_env={"MOTOR_BROWSER": "chrome"}).disparar(STOA)
+    assert sp.calls[0]["env"]["MOTOR_BROWSER"] == "chromium"
+
+
+def test_hotmart_nunca_vira_chromium_e_fica_channel_chrome():
+    # O espelho: o Hotmart NUNCA pode virar chromium. Mesmo com MOTOR_BROWSER=chromium
+    # vazando do ambiente, o executor o REMOVE -> channel=chrome (o inviolável do Hotmart).
+    sp = FakeSpawn()
+    _exec(_hot(C1), spawn=sp, extra_env={"MOTOR_BROWSER": "chromium"}).disparar(C1)
+    assert "MOTOR_BROWSER" not in sp.calls[0]["env"]       # popado -> channel=chrome
+
+
+# ==========================================================================
+# KAJABI — motor.kajabi + Chromium ISOLADO + perfil dedicado + KAJABI_URL. cwd
+# default (/aula), onde o motor.kajabi já vive.
+# ==========================================================================
+def test_kajabi_monta_motor_kajabi_chromium_e_url():
+    sp = FakeSpawn()
+    ex = _exec(_kajabi(), spawn=sp)                         # sem override => cwd=/aula
+    ex.disparar(KAJABI)
+    call = sp.calls[0]
+    assert call["cmd"] == [PY, "-m", "motor.kajabi", KAJABI]
+    assert "--audio" not in call["cmd"]
+    env = call["env"]
+    assert env["MOTOR_BROWSER"] == "chromium"
+    assert env["KAJABI_URL"] == KAJABI
+    assert env["CHROME_USER_DATA_DIR"] == ".chrome-profile-kajabi"
+    assert env["WHISPER_BACKEND"] == "groq"
+    assert "HEADLESS" not in env
+    assert call["cwd"] == DIR                               # default: motor.kajabi vive em /aula
+
+
+# ==========================================================================
+# ANTI-BAN em PARALELO: Stoa, Kajabi e Hotmart são CONTAS distintas -> disparam no
+# MESMO ciclo sem ContaOcupada (perfis Chrome distintos, Chromium isolado). A MESMA
+# conta serializa (já coberto genericamente; aqui a prova cross-plataforma).
+# ==========================================================================
+def test_stoa_kajabi_hotmart_disparam_em_paralelo():
+    sp = FakeSpawn()
+    ex = _exec(_stoa(), _kajabi(), _hot(C1, "hotmart"), spawn=sp,
+               motor_dir_por_plataforma={"stoa": STOA_DIR})
+    ex.disparar(STOA)
+    ex.disparar(KAJABI)
+    ex.disparar(C1)                                        # 3 contas distintas -> paralelo
+    assert len(sp.calls) == 3
+    assert ex.conta_ocupada("stoa") and ex.conta_ocupada("kajabi")
+    assert ex.conta_ocupada("hotmart")
+
+
+def test_mesma_conta_stoa_serializa():
+    sp = FakeSpawn()
+    # duas 'capturas' na MESMA conta stoa (patológico, mas prova o guard 1-por-conta).
+    ex = _exec(_stoa("stoa"),
+               captura.CursoLocal(url=STOA + "?x", conta="stoa", plataforma="stoa"),
+               spawn=sp, motor_dir_por_plataforma={"stoa": STOA_DIR})
+    ex.disparar(STOA)
+    with pytest.raises(captura.ContaOcupada):
+        ex.disparar(STOA + "?x")
+    assert len(sp.calls) == 1
 
 
 # ==========================================================================

@@ -389,10 +389,58 @@ class CursoLocal:
     total_esperado: int = 0
 
 
-# plataforma -> módulo do motor a invocar. Fora deste mapa => fail-closed (o motor só
-# sabe estas; capturar numa plataforma desconhecida às cegas violaria o anti-ban/o gate
-# de plataforma-nova). Hotmart usa o CLI base; Memberkit tem o adaptador próprio.
-_MODULO_POR_PLATAFORMA = {"hotmart": "motor.cli", "memberkit": "motor.memberkit"}
+@dataclass(frozen=True)
+class PlataformaSpec:
+    """Como o LocalExecutor invoca o MOTOR de UMA plataforma. Um registro por plataforma
+    suportada — fora do mapa `_PLATAFORMAS` => fail-closed (o gate de plataforma-nova já
+    deveria ter barrado; isto é a última linha de defesa).
+
+    Campos que CRAVAM os invioláveis anti-ban por plataforma:
+      - `modulo`: o módulo do motor (`python -m <modulo> <url>`).
+      - `audio`: anexa `--audio` — SÓ Hotmart (motor.cli), que resgata aula sem legenda
+        pelo Whisper. Os adaptadores áudio-nativos (memberkit/stoa/kajabi) NÃO conhecem
+        a flag (passá-la seria argumento desconhecido).
+      - `headless`: True => HEADLESS=1 (Memberkit, áudio-nativo, roda cego); False =>
+        HEADED (Hotmart/Stoa/Kajabi — a sonda de sessão e/ou a captura de áudio do
+        player de vídeo falham headless).
+      - `chromium`: True => MOTOR_BROWSER=chromium (o Chromium EMBUTIDO, binário SEPARADO
+        que NÃO colide com o Google Chrome do sistema no ProcessSingleton do macOS); False
+        => channel=chrome (Hotmart/Memberkit, retrocompat do spike). É o que deixa Stoa/
+        Kajabi rodarem em PARALELO ao Hotmart sem brigar pela única instância de Chrome do
+        SO. (O executor NÃO dirige navegador — só escolhe a env; quem lança é o motor.)
+      - `url_env`: nome do env que recebe a `meta.url` (STOA_URL/KAJABI_URL). Redundante
+        com o argv (o CLI resolve argv-first), mas espelha o launcher manual e cobre
+        qualquer caminho do motor que leia o env em vez do argv. '' => não seta.
+      - `env`: env FIXO extra da plataforma (perfil Chrome DEDICADO por conta via
+        CHROME_USER_DATA_DIR; LESSON_TIMEOUT_S). Aplicado DEPOIS do extra_env global (a
+        config da plataforma vence) e ANTES dos invioláveis (Groq/HEADLESS/MOTOR_BROWSER
+        vencem tudo)."""
+    modulo: str
+    audio: bool = False
+    headless: bool = False
+    chromium: bool = False
+    url_env: str = ""
+    env: tuple = ()
+
+
+# plataforma -> como invocar o motor. Fora deste mapa => fail-closed (o motor só sabe
+# estas; capturar numa plataforma desconhecida às cegas violaria o anti-ban/o gate de
+# plataforma-nova).
+#   - hotmart:  CLI base, --audio, HEADED, channel=chrome.
+#   - memberkit: adaptador próprio, áudio-nativo, HEADLESS, channel=chrome.
+#   - stoa/kajabi: adaptadores próprios, áudio-nativo, HEADED, Chromium ISOLADO (perfil
+#     dedicado por conta) — nunca channel=chrome (colidiria com o Hotmart no singleton).
+_PLATAFORMAS = {
+    "hotmart": PlataformaSpec("motor.cli", audio=True),
+    "memberkit": PlataformaSpec("motor.memberkit", headless=True),
+    "stoa": PlataformaSpec(
+        "motor.stoa", chromium=True, url_env="STOA_URL",
+        env=(("CHROME_USER_DATA_DIR", ".chrome-profile-stoa"),
+             ("LESSON_TIMEOUT_S", "1800"))),
+    "kajabi": PlataformaSpec(
+        "motor.kajabi", chromium=True, url_env="KAJABI_URL",
+        env=(("CHROME_USER_DATA_DIR", ".chrome-profile-kajabi"),)),
+}
 
 
 def _spawn_popen(cmd, *, env, cwd):  # pragma: no cover — processo REAL do motor
@@ -471,10 +519,14 @@ class LocalExecutor:
     encerrados a cada consulta (reap por `poll()` + varredura de lock obsoleto)."""
 
     def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
-                 extra_env=None, lock_dir=None, pid_vivo=None):
+                 extra_env=None, lock_dir=None, pid_vivo=None,
+                 motor_dir_por_plataforma=None):
         self._meta = {c.url: c for c in cursos}
         self._motor_python = motor_python
         self._motor_dir = motor_dir
+        # Override de diretório do motor POR PLATAFORMA (ex.: Stoa vive no worktree
+        # adaptador-stoa, não em /aula). Default = self._motor_dir para as demais.
+        self._motor_dir_por_plataforma = dict(motor_dir_por_plataforma or {})
         self._spawn = spawn or _spawn_popen
         self._groq_key = groq_key
         self._extra_env = dict(extra_env or {})
@@ -565,6 +617,16 @@ class LocalExecutor:
         meta = self._meta.get(curso_url)
         return meta.conta if meta is not None else ""
 
+    def _motor_dir_de(self, plataforma) -> str:
+        """cwd (e raiz do `python -m`) do motor DESTA plataforma. Default = self._motor_dir
+        (o /aula, onde vivem Hotmart/Memberkit/Kajabi). Uma plataforma cujo código-CORRIGIDO
+        vive noutra árvore (ex.: Stoa no worktree `adaptador-stoa`) é apontada aqui — sem
+        mover o código nem arriscar um merge que contamine o caminho intocado do Hotmart. O
+        cwd é ONDE caem os artefatos duráveis da captura (.chrome-profile-*, .stoa-session.
+        json, tracker.db): apontar pro worktree é o que REUSA a sessão viva e o tracker
+        idempotente na retomada — o handoff do launcher manual sem re-login."""
+        return self._motor_dir_por_plataforma.get(plataforma, self._motor_dir)
+
     def conta_ocupada(self, conta) -> bool:
         self._reap()
         return self._ler_lock(conta) is not None
@@ -586,7 +648,7 @@ class LocalExecutor:
                 f"conta {meta.conta!r} já captura {lock.get('course_url')} (PID "
                 f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
                 f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
-        cmd, env = self._montar(meta)                      # fail-closed ANTES de qualquer spawn
+        cmd, env, cwd = self._montar(meta)                 # fail-closed ANTES de qualquer spawn
         # TOCTOU (fix do achado MÉDIO): grava o lock de INTENÇÃO (pid=None) ANTES do spawn.
         # Se o loop crashar na janela sub-ms entre o spawn e a escrita do PID, a captura
         # órfã (start_new_session) segue viva SEM que seu PID tenha sido registrado — mas o
@@ -595,7 +657,7 @@ class LocalExecutor:
         # do spawn (o bug) deixaria essa janela sem lock -> re-disparo -> ban + captura dupla.
         self._escrever_lock(meta.conta, curso_url, None)
         try:
-            proc = self._spawn(cmd, env=env, cwd=self._motor_dir)
+            proc = self._spawn(cmd, env=env, cwd=cwd)
         except Exception:
             # o spawn FALHOU: a intenção não virou captura. Remove o lock de intenção para
             # não travar a conta para sempre por um disparo que nunca aconteceu (o processo
@@ -610,37 +672,51 @@ class LocalExecutor:
         return f"local_iniciada:{curso_url}"
 
     def _montar(self, meta):
-        modulo = _MODULO_POR_PLATAFORMA.get(meta.plataforma)
-        if modulo is None:
+        spec = _PLATAFORMAS.get(meta.plataforma)
+        if spec is None:
             # fail-closed: o motor só sabe as plataformas mapeadas. Uma nova nunca é
             # capturada às cegas (o gate de plataforma-nova já deveria tê-la barrado
             # antes; isto é a última linha de defesa).
             raise RuntimeError(
                 f"plataforma {meta.plataforma!r} sem módulo de motor conhecido — "
                 f"fail-closed, não capturo {meta.url}")
-        cmd = [self._motor_python, "-m", modulo, meta.url]
-        # REFINO 1 — --audio SÓ no caminho HOTMART (motor.cli). Sem ele, uma aula
-        # Hotmart SEM legenda termina em 'sem_legenda' (terminal benigno) e NUNCA
-        # chega ao Notion — a completude-por-Notion desse curso jamais fecha. O passe
-        # de áudio (Whisper/Groq) transcreve essas aulas e as leva ao Notion. Memberkit
-        # é ÁUDIO-NATIVO (motor.memberkit próprio) e NÃO aceita --audio: passar a flag
-        # ao módulo errado seria argumento desconhecido. Amarrado ao módulo (motor.cli),
-        # não à string 'hotmart', para casar exatamente o caminho que tem a flag.
-        if modulo == "motor.cli":
+        motor_dir = self._motor_dir_de(meta.plataforma)
+        cmd = [self._motor_python, "-m", spec.modulo, meta.url]
+        # --audio SÓ Hotmart (motor.cli): resgata aula sem legenda pelo Whisper. Sem ele
+        # essa aula vira terminal 'sem_legenda' e nunca chega ao Notion. Os adaptadores
+        # áudio-nativos (memberkit/stoa/kajabi) NÃO conhecem a flag.
+        if spec.audio:
             cmd.append("--audio")
         env = dict(os.environ)
-        # extra_env PRIMEIRO (base overridável); os INVIOLÁVEIS entram DEPOIS para VENCER
-        # o extra_env — senão um extra_env poderia clobberar WHISPER_BACKEND/HEADLESS (o
-        # exato inviolável anti-ban / Groq que este executor existe para cravar).
+        # ORDEM (importa p/ o anti-ban): extra_env global PRIMEIRO (base overridável); a
+        # config da PLATAFORMA depois (o perfil DEDICADO/URL vence um extra_env global); os
+        # INVIOLÁVEIS por último (Groq/HEADLESS/MOTOR_BROWSER vencem tudo — o exato anti-ban
+        # que este executor existe para cravar).
         env.update(self._extra_env)
+        for k, v in spec.env:                              # perfil dedicado, LESSON_TIMEOUT_S
+            env[k] = v
+        if spec.url_env:                                   # STOA_URL / KAJABI_URL = meta.url
+            env[spec.url_env] = meta.url
+        # PYTHONPATH = a árvore do motor DESTA plataforma, p/ o `python -m <modulo>`
+        # resolver o pacote certo (ex.: Stoa vive no worktree, não em /aula). Sobrepõe
+        # o PYTHONPATH herdado do daemon (que aponta pra árvore da Athena, sem `motor`).
+        env["PYTHONPATH"] = motor_dir
         env["WHISPER_BACKEND"] = "groq"                    # INVIOLÁVEL Groq (vence extra_env)
         if self._groq_key:
             env["GROQ_API_KEY"] = self._groq_key
-        if meta.plataforma == "hotmart":
-            env.pop("HEADLESS", None)                      # HEADED (sonda falha headless)
+        # ISOLAMENTO DE NAVEGADOR (anti-ban): Stoa/Kajabi no Chromium EMBUTIDO (não colide
+        # com o Chrome do sistema do Hotmart no singleton do macOS); Hotmart/Memberkit
+        # seguem channel=chrome. Popar quando não-chromium GARANTE channel=chrome mesmo que
+        # um MOTOR_BROWSER tenha vazado do ambiente — o Hotmart NUNCA sai do channel=chrome.
+        if spec.chromium:
+            env["MOTOR_BROWSER"] = "chromium"
         else:
-            env["HEADLESS"] = "1"                          # demais plataformas headless
-        return cmd, env
+            env.pop("MOTOR_BROWSER", None)
+        if spec.headless:
+            env["HEADLESS"] = "1"                          # Memberkit (áudio-nativo, roda cego)
+        else:
+            env.pop("HEADLESS", None)                      # HEADED (sonda/áudio falham headless)
+        return cmd, env, motor_dir
 
 
 def _total_esperado(projeto, acesso, curso_url, total_esperado_fn):

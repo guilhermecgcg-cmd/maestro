@@ -295,6 +295,36 @@ def carregar_cursos(path) -> list:
     return out
 
 
+def _motor_dirs_por_plataforma() -> dict:
+    """Overrides de diretório do motor POR PLATAFORMA, lidos de env ATHENA_MOTOR_DIR_<PLAT>
+    (ex.: ATHENA_MOTOR_DIR_STOA aponta pro worktree `adaptador-stoa`, onde vivem o código
+    CORRIGIDO da Stoa E a sessão/tracker VIVOS). Sem override => o LocalExecutor usa o
+    ATHENA_MOTOR_DIR global. Genérico: qualquer plataforma pode ter árvore própria sem
+    tocar no código."""
+    prefixo = "ATHENA_MOTOR_DIR_"
+    return {k[len(prefixo):].lower(): v for k, v in os.environ.items()
+            if k.startswith(prefixo) and v}
+
+
+def _ler_groq_key(motor_dir) -> str:  # pragma: no cover — I/O real (lê o chave-groq.txt)
+    """GROQ_API_KEY p/ INJETAR no subprocesso do motor. Necessária para as plataformas
+    cujo cwd NÃO é o /aula (ex.: Stoa no worktree): lá o `motor.config` não acha o
+    `chave-groq.txt` e o Whisper/Groq (único backend viável p/ captura sem legenda)
+    ficaria sem chave. Lê de env GROQ_API_KEY ou do chave-groq.txt do `motor_dir` (o
+    /aula). '' se não achar — o Hotmart (cwd=/aula) ainda pega via motor.config; as
+    outras escalam honesto sem chave em vez de fingir transcrição."""
+    import re
+    v = os.getenv("GROQ_API_KEY")
+    if v:
+        return v
+    try:
+        with open(os.path.join(motor_dir, "chave-groq.txt")) as f:
+            m = re.search(r"gsk_[A-Za-z0-9]{20,}", f.read())
+            return m.group(0) if m else ""
+    except OSError:
+        return ""
+
+
 def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o loop)
     from maestro.config import carregar
     from maestro.telegram_api import TelegramClient
@@ -312,18 +342,32 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     # lock_dir DURÁVEL e ESTÁVEL entre restarts (o guard anti-ban depende disso — ver
     # LocalExecutor). Env sobrepõe; o default do executor já é um caminho estável do SO.
     lock_dir = os.getenv("ATHENA_LOCK_DIR") or None
-    executor = captura.LocalExecutor(cursos, motor_python=motor_python, motor_dir=motor_dir,
-                                     lock_dir=lock_dir)
+    # GROQ p/ injetar (Stoa roda com cwd=worktree, sem chave-groq.txt lá) e overrides de
+    # diretório do motor por plataforma (Stoa => worktree adaptador-stoa).
+    groq_key = _ler_groq_key(motor_dir) or None
+    executor = captura.LocalExecutor(
+        cursos, motor_python=motor_python, motor_dir=motor_dir, lock_dir=lock_dir,
+        groq_key=groq_key, motor_dir_por_plataforma=_motor_dirs_por_plataforma())
     total_por_curso = {c.url: c.total_esperado for c in cursos}
+    # A contagem-verdade do Notion (numerador) só precisa de motor.config+notion_client
+    # (o NOTION_TOKEN do /aula/.env) — é independente de plataforma; usa o motor_dir
+    # global mesmo para Stoa/Kajabi (o prefixo de 'Origem' basta).
     progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso)
 
     plataformas = frozenset(
-        p for p in os.getenv("PLATAFORMAS_SUPORTADAS", "hotmart.com,memberkit.com.br")
+        p for p in os.getenv(
+            "PLATAFORMAS_SUPORTADAS",
+            "hotmart.com,memberkit.com.br,stoa.com.br,mykajabi.com")
         .replace(" ", "").split(",") if p)
     plataformas_suportadas = plataformas or None
 
+    # Teto de re-disparos por curso (disjuntor anti-martelo). Env-overridável: Stoa/Kajabi
+    # (multi-curso, sem denominador de completude confiável) podem precisar de mais fôlego
+    # de retomada que o default do Hotmart.
+    max_tentativas = int(os.getenv("ATHENA_MAX_TENTATIVAS", "3"))
+
     asyncio.run(rodar(cursos, executor, progresso_fn, voz,
-                      intervalo_s=cfg.intervalo_s,
+                      intervalo_s=cfg.intervalo_s, max_tentativas=max_tentativas,
                       plataformas_suportadas=plataformas_suportadas))
 
 

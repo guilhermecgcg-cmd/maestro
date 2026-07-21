@@ -616,6 +616,12 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     pulso_path = os.getenv("ATHENA_PULSO_PATH", os.path.join(base, "pulso.json"))
     lock_dir_efetivo = lock_dir or os.path.join(base, "locks")
     batimento_intervalo = float(os.getenv("ATHENA_BATIMENTO_S", "1800"))
+    # DIAGNÓSTICO por LLM da causa-raiz DESCONHECIDA: OFF por padrão (fail-closed ->
+    # escalar_humano). Ligar com ATHENA_CAUSA_LLM=1 faz uma morte de causa desconhecida
+    # chamar `claude -p` (subprocesso REAL, custo/tempo) para classificar. Deixado como
+    # opt-in explícito para não gastar por surpresa (a maioria das mortes já é
+    # determinística pelo exit_code).
+    llm = causa_mod.seam_claude_p if os.getenv("ATHENA_CAUSA_LLM") == "1" else None
 
     asyncio.run(rodar(
         cursos, executor, progresso_fn, voz, intervalo_s=cfg.intervalo_s,
@@ -623,8 +629,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         controle=controle_mod, controle_path=controle_path, disjuntor=disjuntor_mod,
         vigia=vigia_mod, causa=causa_mod, alertas=alertas, batimento=batimento_mod,
         batimento_intervalo=batimento_intervalo, pulso_path=pulso_path,
-        lock_dir=lock_dir_efetivo, autopsia_dir=autopsia_dir,
-        llm=causa_mod.seam_claude_p))
+        lock_dir=lock_dir_efetivo, autopsia_dir=autopsia_dir, llm=llm))
 
 
 if __name__ == "__main__":  # pragma: no cover

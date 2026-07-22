@@ -3,6 +3,12 @@
 **Data:** 2026-07-20 · **Status:** spec integral (não por etapa)
 **Objetivo:** a Athena SUBSTITUI o humano no processo de captura de conhecimento — recebe o link, entende o curso, dispara os sistemas certos, corrige desvios, prioriza, e só chama o humano no Telegram quando precisa de DECISÃO dele. Não é watchdog; é o cérebro que assume o lugar do humano.
 
+> **ANEXO F4 (22/07, normativo):** a Athena também supervisiona, corrige e
+> presta contas de SISTEMAS GERADOS pela fábrica — registro, espinha como
+> contrato, `causa_sistema`, reescrita-com-review (única porta = Construtor),
+> travas D2/D5, gatilhos, seção "sistemas" no SITREP e R3 explícito:
+> `docs/2026-07-22-athena-sistemas-anexo-f4.md`.
+
 ## 0. Diagnóstico honesto (por que esta spec existe)
 A Athena F0 (o que EXISTE) é um watchdog com 4 ações: `{restart, redeploy, reenqueue, nada}`. Detecta+avisa+reinicia (reiniciou o painel-web sozinha), mas: **não vê progresso real** (lê flags, não o Notion), **não orquestra as passadas** (deixa curso parcial), **não conserta código** (escala o bug pro humano), **não previne o falso-pronto**, **não prioriza**. O humano ainda é o orquestrador. Esta spec define TUDO que falta pra ela assumir.
 

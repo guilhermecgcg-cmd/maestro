@@ -455,3 +455,114 @@ def test_autopsia_exit4_grava_erros_reais_do_tracker(tmp_path, monkeypatch):
     assert rec.get("causa") == "escalar_humano", rec
     # DENTES: o erro REAL do tracker está gravado na autópsia (não "desconhecida" cega)
     assert "TimeoutError REAL: chunk 3" in (rec.get("detalhe") or ""), rec
+
+
+# ==========================================================================
+# FIX 2 (bench do exit-5) — N mortes exit-5 IDÊNTICAS no MESMO curso (mesma URL;
+# ex.: URL malformada …/products/X/agent que torna a sonda inconclusiva SEMPRE)
+# NÃO podem virar `relancar` infinito (flap eterno). O curso é BENCHED
+# (irredutível) + ALERTA com a URL. INVARIANTE ANTI-BAN: exit-5 = sonda
+# INCONCLUSIVA, NÃO sessão morta — sem reseed, sem relogin; e o bench é
+# por-CURSO: os demais cursos (mesmo da MESMA conta) seguem.
+# ==========================================================================
+_STDERR_EXIT5 = ("SONDA DE SESSÃO INCONCLUSIVA (transitório de rede/timeout): "
+                 "probe /v1/navigation timeout")
+C2 = "https://hotmart.com/pt-br/x/products/222"
+
+
+def test_exit5_tres_mortes_identicas_bencham_o_curso_com_alerta_de_url(tmp_path):
+    # RED-first: hoje 3 exit-5 idênticos -> relancar/backoff -> re-dispara para
+    # sempre (flap). Com o fix: 3ª morte bencha o curso + alerta com a URL; a
+    # conta NÃO para (outro curso da MESMA conta segue disparando); e NUNCA
+    # escala reseed (sonda inconclusiva não é sessão morta).
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a", C2: "a"})            # MESMA conta
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18), _curso(C2, "a", "hotmart", 9)]
+    common = _reais(tmp_path, alr)
+    prog = _prog({C1: (0, 18), C2: (0, 9)})
+    t = 1000.0
+    for _ in range(3):                                      # 3 mortes exit-5 idênticas
+        athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+        ex.matar(C1, exit_code=5, stderr=_STDERR_EXIT5)
+        t += 1
+    assert ex.disparos.count(C1) == 3                       # relançou nas 2 primeiras
+    # 4º ciclo: autopsia a 3ª morte -> BENCH (não relança mais)
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+    assert estado[C1].get("benched_exit5") is True          # DENTES: curso benched
+    assert estado[C1].get("irredutivel") is True            # disjuntor não re-tenta
+    assert any("exit-5" in m and C1 in m for _, m in alr.mortes)  # ALERTA com a URL
+    assert alr.sessoes == []                                # INVARIANTE: sem reseed
+    # a CONTA não parou: o outro curso da mesma conta segue capturando
+    assert C2 in ex.disparos
+    # e o relancar infinito MORREU: muito depois (backoff expiraria), NÃO re-dispara
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado,
+                             agora=t + 7 * 86400.0, **common)
+    assert ex.disparos.count(C1) == 3                       # DENTES: benched de vez
+
+
+def test_exit5_menos_que_o_limiar_segue_relancando(tmp_path):
+    # 2 mortes exit-5 (< N=3): comportamento transitório preservado — relança sob
+    # o backoff, sem bench, sem alerta de sessão.
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    prog = _prog({C1: (0, 18)})
+    t = 1000.0
+    for _ in range(2):
+        athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+        ex.matar(C1, exit_code=5, stderr=_STDERR_EXIT5)
+        t += 1
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+    assert not estado[C1].get("benched_exit5")              # 2 < 3: sem bench
+    assert not estado[C1].get("irredutivel")
+    assert ex.disparos.count(C1) >= 2                       # seguiu relançando
+
+
+def test_exit5_avanco_no_notion_reseta_a_contagem_do_bench(tmp_path):
+    # Um curso que MORRE exit-5 mas cujo Notion AVANÇA não é URL malformada — o
+    # avanço reseta a contagem: a 3ª morte pós-avanço NÃO bencha.
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    t = 1000.0
+    for _ in range(2):                                      # 2 mortes exit-5
+        athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                                 agora=t, **common)
+        ex.matar(C1, exit_code=5, stderr=_STDERR_EXIT5)
+        t += 1
+    # o Notion AVANÇOU (0 -> 5): a passada re-arma o recozimento E zera a contagem
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (5, 18)}), voz, voo, estado,
+                             agora=t, **common)
+    ex.matar(C1, exit_code=5, stderr=_STDERR_EXIT5)         # 3ª morte, pós-avanço
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (5, 18)}), voz, voo, estado,
+                             agora=t + 1, **common)
+    assert not estado[C1].get("benched_exit5")              # DENTES: avanço resetou
+    assert not estado[C1].get("irredutivel")
+
+
+def test_exit5_nao_mascara_sessao_realmente_morta(tmp_path):
+    # INVARIANTE anti-ban: um exit-5 cujo stderr DECLARA a sessão morta segue a
+    # escalada NORMAL de reseed (irredutível + sessao_expirada) — o bench jamais
+    # engole uma sessão realmente morta.
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1000.0, **common)
+    ex.matar(C1, exit_code=5, stderr="SESSÃO MORTA: refaça o login headed")
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1100.0, **common)
+    assert estado[C1].get("irredutivel") is True            # escalou como sessão
+    assert alr.sessoes == ["hotmart"]                       # reseed alertado (correto)
+    assert not estado[C1].get("benched_exit5")              # NÃO foi o bench

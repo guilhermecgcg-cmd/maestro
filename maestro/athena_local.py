@@ -72,6 +72,22 @@ FASE_CONCLUIDO = captura.FASE_CONCLUIDO
 # NUNCA um latch permanente. Anti-ban intacto: reseed continua irredutível.
 _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 
+# BENCH do exit-5 (anti-flap): exit 5 = sonda de sessão INCONCLUSIVA / erro de infra
+# (contrato do motor — NÃO é sessão morta). Uma URL MALFORMADA no YAML (ex.:
+# …/products/X/agent) torna a sonda inconclusiva PARA SEMPRE: cada disparo morre
+# exit-5, a causa diz `relancar`, e o curso flapa infinito. Após N mortes exit-5
+# SEGUIDAS no MESMO curso (mesma URL — o `st` é chaveado por URL), o curso é
+# BENCHED (irredutível: o disjuntor para de re-tentar SÓ este curso) + ALERTA com
+# a URL. INVIOLÁVEL ANTI-BAN: o bench NÃO é reseed nem relogin (sonda inconclusiva
+# ≠ sessão morta confirmada — esta segue a escalada normal de reseed, que tem
+# precedência sobre o bench); e é POR-CURSO: os demais cursos, inclusive da MESMA
+# conta, seguem. N=3 espelha o _FLAP_MIN (1 exit-5 é transitório comum de rede;
+# 3 seguidos — espaçados pelo recozimento do backoff — não é blip, é a URL).
+# A contagem zera em: saída limpa, avanço real no Notion (que também DESBENCHA:
+# se outra via produziu progresso, never-stop reavalia), ou morte de outra causa.
+_EXIT_SONDA_INCONCLUSIVA = 5           # contrato do motor (ver causa.py)
+_BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
+
 # COOLDOWN de curso QUIESCIDO por SAÍDA LIMPA: quando o motor sai LIMPO (exit 0) sem
 # produzir nada novo (Notion não avançou), o curso está concluído/sem-pendência para o
 # denominador que temos. Em vez de re-spawnar a cada ciclo (o que floodava o vigia com
@@ -221,6 +237,7 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     # a passada decide cooldown/conclusão pela completude/avanço no Notion.
     if getattr(obito, "exit_code", None) == 0 and acao == "aguardar_backoff":
         st["_saida_limpa_ciclo"] = agora
+        st.pop("exit5_seguidas", None)   # um run limpo prova a sonda sã: zera o bench
         return
 
     # MORTE REAL (não é saída limpa): um cooldown de 'concluído' herdado de um run limpo
@@ -243,6 +260,7 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     if acao in _CAUSAS_IRREDUTIVEIS:      # só escalar_reseed: sessão morta = superfície de ban
         st["irredutivel"] = True
         st["esgotado_avisado"] = True                # o alerta typado abaixo já cobre
+        st.pop("benched_exit5", None)                # o latch agora é de RESEED, não de bench
         alertas.sessao_expirada(plat)
         st["fase"] = FASE_NOVO
         # E1: sessão morta → curso TRAVADO até reseed humano (irredutível, anti-ban).
@@ -252,6 +270,37 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
                    curso=curso, plataforma=plat, fonte=fonte_causa,
                    origem="athena-local/causa")
         return
+
+    # BENCH do exit-5 (anti-flap; DEPOIS do ramo irredutível de propósito — uma
+    # sessão DECLARADA morta escala reseed normal mesmo com exit 5, o bench nunca
+    # a mascara). Conta mortes exit-5 SEGUIDAS deste curso; no limiar, bencha SÓ o
+    # curso (irredutível) + alerta com a URL — sem reseed, sem relogin, e a conta
+    # segue nos demais cursos. Morte de OUTRA causa zera a contagem (o bench é
+    # para o exit-5 IDÊNTICO em série da URL malformada, não para azar misto).
+    if getattr(obito, "exit_code", None) == _EXIT_SONDA_INCONCLUSIVA:
+        n5 = int(st.get("exit5_seguidas", 0) or 0) + 1
+        st["exit5_seguidas"] = n5
+        if n5 >= _BENCH_EXIT5_MIN:
+            st["irredutivel"] = True                  # o disjuntor para SÓ este curso
+            st["benched_exit5"] = True
+            st["esgotado_avisado"] = True             # o alerta typado abaixo já cobre
+            st["fase"] = FASE_NOVO
+            alertas.captura_morreu(
+                plat, f"BENCH exit-5: {n5} sondas de sessão INCONCLUSIVAS seguidas "
+                f"em {curso} — curso benched (cheque a URL no YAML: provável "
+                f"malformada). NÃO é sessão morta: sem reseed/relogin; os demais "
+                f"cursos da conta seguem. Avanço real no Notion desbencha.")
+            # E15: bench por exit-5 em série — irredutível POR-CURSO, anti-flap.
+            _registrar(espinha, f"BENCH exit-5: travei {curso} após {n5} sondas "
+                       f"inconclusivas seguidas",
+                       "exit-5 idêntico em série (URL provável malformada) — NÃO é "
+                       "sessão morta: sem reseed; avanço no Notion desbencha",
+                       tipo="escalada", reversivel=True, escalada=True,
+                       trava="bench-exit5", curso=curso, plataforma=plat,
+                       fonte=fonte_causa, origem="athena-local/causa")
+            return
+    else:
+        st.pop("exit5_seguidas", None)                # outra causa: a série quebrou
 
     # transitório / TOKEN / desconhecida: back off (recozimento) e re-tenta sob o gate.
     # `escalar_token` cai AQUI (não mais irredutível): alertamos o dono para trocar a
@@ -445,6 +494,10 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                 except Exception:
                     pass
                 st.pop("cooldown_ate", None)               # AVANÇO real: sai do cooldown (há trabalho)
+                st.pop("exit5_seguidas", None)             # a captura PRODUZIU: sonda sã, zera o bench
+                if st.pop("benched_exit5", None):          # DESBENCH (never-stop): avanço real
+                    st.pop("irredutivel", None)            # ... reabre SÓ o bench de exit-5
+                    st.pop("esgotado_avisado", None)       # (reseed nunca seta benched_exit5)
             st["ultimo_no_notion"] = int(no_notion)
         if no_notion is not None and int(total) > 0 and int(no_notion) >= int(total):
             st["fase"] = FASE_CONCLUIDO

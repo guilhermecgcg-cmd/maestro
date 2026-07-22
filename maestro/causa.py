@@ -94,8 +94,16 @@ _RE_SESSAO = re.compile(
 #        construção (anti-bot? rede? detector nosso ruim?). A mensagem apenas
 #        LISTA a sessão como palpite — NÃO a declara morta. Tratar como reseed
 #        aqui era o falso "Sessão expirou" que benchava o curso de vez.
+#   5 -> SessionProbeInconclusiveError / PWError (infra): a sonda de sessão deu
+#        timeout/erro transitório SEM sinal forte de logout, ou a infraestrutura
+#        (DNS/conexão/URL) falhou ANTES de tocar a sessão. O motor sai FORA de
+#        {2,3} DE PROPÓSITO: NÃO é veredito de sessão morta (anti-ban: jamais
+#        reseed/relogin por exit 5) — transitório: relança sob o backoff. O
+#        bench anti-flap de exit-5 EM SÉRIE (URL malformada torna a sonda
+#        inconclusiva para sempre) vive no loop (athena_local), não aqui.
 _EXIT_SESSAO_MORTA = frozenset({2, 3})
 _EXIT_CIRCUIT_BREAKER = 4
+_EXIT_SONDA_INCONCLUSIVA = 5
 
 # Credencial de API ruim (401/403/api key inválida). É o que escala TROCA DE TOKEN.
 #
@@ -245,6 +253,16 @@ def _deterministico(obito, tracker_dir=None):
         return "escalar_humano", (
             "circuit-breaker por excesso de falhas (exit 4): causa sistêmica "
             "desconhecida — humano inspeciona o tracker; NÃO é sessão morta")
+
+    # 4) EXIT 5 = sonda de sessão INCONCLUSIVA / erro de infra (contrato do motor):
+    #    transitório — relança sob o backoff. NUNCA reseed (anti-ban: a sessão NÃO
+    #    foi provada morta; as âncoras assertivas de sessão/token acima têm
+    #    precedência caso o stderr declare outra coisa). Determinístico aqui poupa
+    #    o LLM quando o tee de stderr está desligado (stderr vazio).
+    if code == _EXIT_SONDA_INCONCLUSIVA:
+        return "relancar", (
+            "sonda de sessão inconclusiva / erro de infra (exit 5): transitório — "
+            "NÃO é sessão morta (sem reseed)")
 
     # 5) SIGKILL / OOM / timeout -> relançar (transitório de recurso/SO; motor é idempotente).
     if code in _EXIT_SIGKILL:

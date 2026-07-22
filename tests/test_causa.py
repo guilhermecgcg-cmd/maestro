@@ -327,3 +327,40 @@ def test_exit4_erros_do_tracker_nao_mudam_a_acao_nem_viram_reseed(tmp_path):
                stderr=_ABORT_CIRCUIT_BREAKER)
     d = causa.classificar(o, tracker_dir=str(tmp_path))
     assert d.acao == "escalar_humano", d           # NÃO virou reseed pelo texto do tracker
+
+
+# --------------------------------------------------------------------------
+# FIX 2 (exit-5) — sonda de sessão INCONCLUSIVA / erro de infra (contrato do
+# motor: SystemExit(5) em SessionProbeInconclusiveError e PWError). NÃO é sessão
+# morta (anti-ban: jamais reseed/relogin por exit 5) — transitório: relança sob
+# backoff. O bench anti-flap de exit-5 em série vive no loop (athena_local).
+# --------------------------------------------------------------------------
+def test_exit5_sonda_inconclusiva_relanca_deterministico_sem_llm():
+    # RED-first: hoje exit-5 sem stderr (tee desligado) cai em DESCONHECIDA ->
+    # escalar_humano/LLM. Com o fix, o contrato de exit-code decide: relancar.
+    chamadas = []
+    def llm(p):
+        chamadas.append(p)
+        return "relancar"
+    d = causa.classificar(_obito(exit_code=5, stderr=""), llm=llm)
+    assert d.acao == "relancar", d
+    assert d.fonte == "deterministico", d          # decidido pelo exit-code
+    assert chamadas == []                          # sem gastar claude -p
+    assert "sonda" in d.motivo or "infra" in d.motivo, d
+
+
+def test_exit5_com_stderr_real_do_motor_relanca():
+    # A mensagem REAL do motor no exit 5 (contém "timeout", sem âncora de morte).
+    d = causa.classificar(_obito(
+        exit_code=5,
+        stderr="SONDA DE SESSÃO INCONCLUSIVA (transitório de rede/timeout): "
+               "probe /v1/navigation timeout"))
+    assert d.acao == "relancar", d
+    assert d.acao != "escalar_reseed", d
+
+
+def test_exit5_com_stderr_de_sessao_morta_ainda_escala_reseed():
+    # INVARIANTE anti-ban (precedência): se o stderr DECLARA a sessão morta, a
+    # causa-raiz é a sessão — mesmo com exit 5. O exit-code NÃO mascara o veredito.
+    d = causa.classificar(_obito(exit_code=5, stderr="SESSÃO MORTA: refaça o login"))
+    assert d.acao == "escalar_reseed", d

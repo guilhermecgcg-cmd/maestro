@@ -566,3 +566,63 @@ def test_exit5_nao_mascara_sessao_realmente_morta(tmp_path):
     assert estado[C1].get("irredutivel") is True            # escalou como sessão
     assert alr.sessoes == ["hotmart"]                       # reseed alertado (correto)
     assert not estado[C1].get("benched_exit5")              # NÃO foi o bench
+
+
+def test_exit5_serie_de_causa_token_nao_bencha_e_mantem_alerta_de_token(tmp_path):
+    # REVIEW A1: o bench conta a série pela CAUSA CLASSIFICADA, não pelo exit-code cru.
+    # 3 exit-5 cujo stderr denuncia CREDENCIAL (escalar_token) NÃO são a série
+    # 'idêntica' da URL malformada: não bencham (bench seria um latch sem via de
+    # desbench — curso nunca roda, Notion nunca avança), e o alerta de token de
+    # CADA morte segue chegando ao dono (o bench não pode engolir o 3º).
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    prog = _prog({C1: (0, 18)})
+    stderr_token = ("SONDA DE SESSÃO INCONCLUSIVA: HTTP 403 Forbidden na sonda "
+                    "(invalid api key)")
+    t = 1000.0
+    mortes = 0
+    for _ in range(12):                                     # saltos grandes: backoff expira
+        athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+        if ex.curso_ativo(C1) and mortes < 3:
+            ex.matar(C1, exit_code=5, stderr=stderr_token)
+            mortes += 1
+        t += 7 * 86400.0
+        if mortes >= 3 and not ex.curso_ativo(C1):
+            athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+            break
+    assert mortes == 3
+    assert not estado[C1].get("benched_exit5")              # DENTES A1: causa≠relancar não bencha
+    assert not estado[C1].get("irredutivel")
+    assert sum(1 for _, m in alr.mortes if "troque o token" in m) == 3  # nenhum engolido
+    assert alr.sessoes == []                                # e jamais reseed
+
+
+def test_obito_fantasma_sem_exit_code_nao_zera_a_serie_do_bench(tmp_path):
+    # REVIEW A2 (interação nova): um óbito detectado só por PID morto (exit_code=None —
+    # ex.: lock órfão de encarnação/conta antiga apontando o MESMO course_url) NÃO pode
+    # quebrar a série de exit-5 confirmados — senão o fantasma re-zera o contador a cada
+    # ciclo e o bench nunca dispara (o flap infinito que o fix veio matar continua).
+    # Morte com exit_code REAL de outra causa continua quebrando a série (idênticas).
+    from maestro.vigia import Obito
+
+    class SpyDisj:
+        def registrar_falha(self, st, agora):
+            return None
+
+    st = {"exit5_seguidas": 2}
+    fantasma = Obito(conta="a", curso=C1, exit_code=None, stderr_tail="",
+                     flaps_na_janela=1, ts="")
+    athena_local._aplicar_decisao(
+        C1, st, fantasma, None, disjuntor=SpyDisj(), alertas=SpyAlertas(),
+        agora=1000.0, meta_por_curso=None, flap_min=99)
+    assert st.get("exit5_seguidas") == 2                    # DENTES A2: fantasma NÃO zera
+    real = Obito(conta="a", curso=C1, exit_code=-9, stderr_tail="Killed: 9",
+                 flaps_na_janela=1, ts="")
+    athena_local._aplicar_decisao(
+        C1, st, real, None, disjuntor=SpyDisj(), alertas=SpyAlertas(),
+        agora=1001.0, meta_por_curso=None, flap_min=99)
+    assert "exit5_seguidas" not in st                       # morte confirmada ≠ exit-5: zera

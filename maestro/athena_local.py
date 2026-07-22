@@ -277,7 +277,17 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     # curso (irredutível) + alerta com a URL — sem reseed, sem relogin, e a conta
     # segue nos demais cursos. Morte de OUTRA causa zera a contagem (o bench é
     # para o exit-5 IDÊNTICO em série da URL malformada, não para azar misto).
-    if getattr(obito, "exit_code", None) == _EXIT_SONDA_INCONCLUSIVA:
+    # A série exige a MESMA CAUSA CLASSIFICADA, não só o exit-code cru (review A1):
+    # um exit-5 classificado `escalar_token` NÃO conta nem bencha — benchar por token
+    # seria um latch SEM via de desbench (o curso nunca roda, o Notion nunca avança)
+    # e engoliria o alerta "troque o token" da morte que bencha. `acao is None`
+    # (classificador estourou) ainda conta: numa URL malformada real a série não
+    # pode depender do classificador de pé. E morte SEM exit_code (óbito por PID
+    # morto — ex.: lock órfão de encarnação/conta antiga com o mesmo course_url)
+    # NÃO quebra a série (review A2): um fantasma sem veredito re-zeraria o
+    # contador a cada ciclo e reabriria o flap infinito que este fix mata.
+    exit5 = getattr(obito, "exit_code", None) == _EXIT_SONDA_INCONCLUSIVA
+    if exit5 and (acao == "relancar" or acao is None):
         n5 = int(st.get("exit5_seguidas", 0) or 0) + 1
         st["exit5_seguidas"] = n5
         if n5 >= _BENCH_EXIT5_MIN:
@@ -299,8 +309,9 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
                        trava="bench-exit5", curso=curso, plataforma=plat,
                        fonte=fonte_causa, origem="athena-local/causa")
             return
-    else:
-        st.pop("exit5_seguidas", None)                # outra causa: a série quebrou
+    elif getattr(obito, "exit_code", None) is not None:
+        st.pop("exit5_seguidas", None)                # morte CONFIRMADA de outra causa:
+                                                      # a série 'idêntica' quebrou
 
     # transitório / TOKEN / desconhecida: back off (recozimento) e re-tenta sob o gate.
     # `escalar_token` cai AQUI (não mais irredutível): alertamos o dono para trocar a

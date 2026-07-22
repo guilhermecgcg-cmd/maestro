@@ -43,6 +43,7 @@ PENDENTE / o que ficou por LIGAR (honesto):
     recebê-lo (o vigia lê `stderr_tail`/`stderr_path`), mas o tee ainda não está ligado.
 """
 import asyncio
+import json
 import os
 import time
 
@@ -142,6 +143,35 @@ class _AlertasNulo:
         return None
 
 
+class _EspinhaNula:
+    """DEFAULT F4-a (espinha): SEM log de decisões — o comportamento pré-integração.
+    Assinatura == `decisoes.registrar_decisao` (aceita QUALQUER kwarg do contrato,
+    inclusive `sistema=`). Os testes-invariante do loop rodam sem a espinha; o
+    `main()` injeta o módulo `decisoes` real. Nunca levanta (é no-op)."""
+    def registrar_decisao(self, o_que, por_que, **kw):
+        return None
+
+
+def _registrar(espinha, o_que, por_que, **kw):
+    """Chama a espinha À PROVA DE FALHAS: um erro no LOG jamais derruba o loop
+    (mesmo contrato do pulso/batimento/alertas). A espinha REAL
+    (`decisoes.registrar_decisao`) já é fail-safe por construção; este wrapper
+    protege TAMBÉM contra uma espinha INJETADA defeituosa — o null-object garante
+    o default, o wrapper garante que observabilidade nunca é quem mata o loop."""
+    try:
+        espinha.registrar_decisao(o_que, por_que, **kw)
+    except Exception:
+        pass
+
+
+# Proxy de custo do diagnóstico `claude -p` (E14): o seam `causa.seam_claude_p`
+# NÃO devolve usage, então o custo é PRESUMIDO por um valor fixo e SEMPRE
+# rotulado `medido=False` — a regra inviolável nº2 da espinha (nunca somar
+# presumido com medido). Uma classificação de causa-raiz é 1 chamada headless
+# curta; o proxy é conservador e serve só ao teto/observabilidade, jamais à fatura.
+_CUSTO_PROXY_CLAUDE_P_USD = float(os.getenv("ATHENA_CUSTO_PROXY_CLAUDE_P_USD", "0.02"))
+
+
 def _safe_ativo(executor, curso_url) -> bool:
     try:
         return bool(executor.curso_ativo(curso_url))
@@ -162,7 +192,7 @@ def _plataforma_de(curso_url, meta_por_curso) -> str:
 # AUTÓPSIA + CAUSA-RAIZ (P3) fiadas na MORTE de um curso -> decisão do disjuntor (P4)
 # ---------------------------------------------------------------------------
 def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
-                     meta_por_curso, flap_min):
+                     meta_por_curso, flap_min, espinha=None):
     """Traduz a `Decisao` da causa-raiz em ação de never-stop sobre o `st` do curso.
 
       transitório (relancar/aguardar_backoff/None) -> `registrar_falha` avança o backoff
@@ -178,6 +208,9 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     acao = getattr(decisao, "acao", None)
     plat = _plataforma_de(curso, meta_por_curso)
     st["ultima_causa"] = acao
+    espinha = espinha or _EspinhaNula()
+    fonte_causa = getattr(decisao, "fonte", None) or "deterministico"
+    motivo_causa = getattr(decisao, "motivo", "") or ""
 
     # SAÍDA LIMPA (exit 0 SEM assinatura alarmante): o motor rodou e saiu sem erro — NÃO é
     # morte. Exigimos DOIS sinais concordantes: exit_code == 0 E a causa classificada como
@@ -200,12 +233,24 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     if flaps >= flap_min:
         alertas.captura_morreu(
             plat, f"FLAP: {flaps} mortes na janela (curso {curso}, causa={acao})")
+        # E5: flapping detectado — escalada (a captura morre em loop, seja a causa
+        # qual for). Latch de flap não existe (a janela já dedup por autópsia).
+        _registrar(espinha, f"FLAP: {flaps} mortes na janela em {curso}",
+                   f"captura morrendo em loop (causa={acao})", tipo="escalada",
+                   reversivel=True, escalada=True, curso=curso, plataforma=plat,
+                   fonte=fonte_causa, origem="athena-local/causa")
 
     if acao in _CAUSAS_IRREDUTIVEIS:      # só escalar_reseed: sessão morta = superfície de ban
         st["irredutivel"] = True
         st["esgotado_avisado"] = True                # o alerta typado abaixo já cobre
         alertas.sessao_expirada(plat)
         st["fase"] = FASE_NOVO
+        # E1: sessão morta → curso TRAVADO até reseed humano (irredutível, anti-ban).
+        _registrar(espinha, f"travei {curso} até reseed humano",
+                   motivo_causa or "sessão morta (superfície de ban)",
+                   reversivel=False, escalada=True, trava="anti-ban",
+                   curso=curso, plataforma=plat, fonte=fonte_causa,
+                   origem="athena-local/causa")
         return
 
     # transitório / TOKEN / desconhecida: back off (recozimento) e re-tenta sob o gate.
@@ -220,14 +265,33 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     if acao == "escalar_token":
         alertas.captura_morreu(
             plat, f"credencial de API inválida — troque o token (curso {curso})")
+        # E2: credencial de API ruim → backoff + alerta (reversível, NÃO latcha —
+        # a chave é API downstream, não a plataforma: recoze e re-tenta).
+        _registrar(espinha, f"backoff+alerta de token em {curso}",
+                   motivo_causa or "credencial de API inválida", reversivel=True,
+                   escalada=True, trava=None, curso=curso, plataforma=plat,
+                   fonte=fonte_causa, origem="athena-local/causa")
     elif acao == "escalar_humano":
         alertas.captura_morreu(
             plat, f"causa desconhecida (fail-closed): {getattr(decisao, 'motivo', '')}")
+        # E3: causa desconhecida fail-closed → chama o dono.
+        _registrar(espinha, f"escalei {curso} (causa desconhecida)",
+                   motivo_causa or "fail-closed: causa desconhecida",
+                   reversivel=True, escalada=True, trava="desconhecida",
+                   curso=curso, plataforma=plat, fonte="fail-closed",
+                   origem="athena-local/causa")
+    else:
+        # E4: morte transitória (relancar/aguardar_backoff/None) → recozer e
+        # re-tentar sob o gate do disjuntor (decisão reversível, não escalada).
+        _registrar(espinha, f"recozer e re-tentar {curso}",
+                   motivo_causa or f"morte transitória (causa={acao})",
+                   reversivel=True, curso=curso, plataforma=plat,
+                   fonte=fonte_causa, origem="athena-local/causa")
     st["fase"] = FASE_NOVO
 
 
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
-                     autopsia_dir, agora, meta_por_curso, flap_min, llm):
+                     autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None):
     """Passe de AUTÓPSIA do ciclo: drena os óbitos do executor, roda o vigia (que também
     varre `lock_dir` por mortes de encarnações anteriores), classifica cada óbito pela
     causa-raiz e aplica a decisão ao `st` do curso. Best-effort: um erro aqui NÃO derruba
@@ -244,6 +308,7 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
                                 autopsia_dir=autopsia_dir, flap_min=flap_min)
     except Exception:
         obitos = []
+    espinha = espinha or _EspinhaNula()
     for obito in obitos:
         curso = getattr(obito, "curso", "") or ""
         if not curso:
@@ -253,12 +318,26 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
             decisao = causa.classificar(obito, llm=llm)
         except Exception:
             decisao = None
+        # E14: custo do diagnóstico `claude -p`. O seam só é consultado quando a
+        # causa NÃO bateu numa assinatura determinística (fonte != "deterministico");
+        # com `llm` ligado, isso significa que houve UMA chamada headless — custo
+        # PRESUMIDO por proxy fixo, SEMPRE medido=False (regra inviolável nº2:
+        # jamais somar presumido com medido).
+        if llm is not None and getattr(decisao, "fonte", None) in ("llm", "fail-closed"):
+            plat = _plataforma_de(curso, meta_por_curso)
+            _registrar(espinha, f"diagnóstico claude -p da morte de {curso}",
+                       "custo presumido (o seam claude -p não devolve usage)",
+                       tipo="custo", reversivel=True, modelo="claude -p",
+                       custo_usd=_CUSTO_PROXY_CLAUDE_P_USD, medido=False,
+                       curso=curso, plataforma=plat,
+                       fonte=getattr(decisao, "fonte", "llm"),
+                       origem="athena-local/causa")
         _aplicar_decisao(curso, st, obito, decisao, disjuntor=disjuntor,
                          alertas=alertas, agora=agora, meta_por_curso=meta_por_curso,
-                         flap_min=flap_min)
+                         flap_min=flap_min, espinha=espinha)
 
 
-def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st):
+def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st, *, espinha=None):
     """Gate da Capacidade B no doméstico: escala UMA vez (latch por-curso) que a
     plataforma é NOVA (sem adaptador) e PULA o curso. Não dispara criação de adaptador
     (decisão humana)."""
@@ -270,11 +349,17 @@ def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st):
               f"criar o adaptador precisa da SUA aprovação.")
     voz.escalar(Problema("plataforma_nova", curso_url, pedido, "aviso"), pedido)
     st["plataforma_nova_avisada"] = True
+    # E6: plataforma sem adaptador — pulei (latch por-curso; reversível quando o
+    # adaptador existir).
+    _registrar(espinha or _EspinhaNula(), f"pulei {curso_url}: plataforma nova",
+               f"sem adaptador para '{plat or 'desconhecida'}'", reversivel=True,
+               escalada=True, trava="plataforma-nova", curso=curso_url,
+               plataforma=plat or "desconhecida", origem="athena-local")
     return Acao("", False, True, pedido)
 
 
 def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disjuntor,
-                      agora, cooldown_s=_COOLDOWN_SAIDA_LIMPA_S):
+                      agora, cooldown_s=_COOLDOWN_SAIDA_LIMPA_S, espinha=None):
     """Fábrica da `passada_fn` LOCAL que o owner (`orquestrar_captura`) invoca por curso.
 
     A máquina de estados por-curso (persiste em `estado[curso]` entre ciclos):
@@ -290,8 +375,11 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
       8. senão -> DISPARA. `ContaOcupada` (anti-ban) => aguarda a vez (None). Falha/silêncio
          do disparo -> escala honesto.
     """
+    esp = espinha or _EspinhaNula()
+
     def passada(curso):
         st = estado.setdefault(curso, {})
+        plat = adaptador_pipeline.plataforma_de_url(curso) or curso
         if st.get("fase") == FASE_CONCLUIDO:
             return None
         try:
@@ -301,7 +389,18 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                       f"(anti-dup/completude): {str(e)[:140]} — NÃO disparo às cegas")
             voz.escalar(Problema("progresso_notion_inacessivel", curso, pedido, "aviso"),
                         pedido)
+            # E12: progresso Notion ilegível → não disparo às cegas (fail-closed).
+            # LATCH (regra de ruído "só transição"): registra na ENTRADA do estado
+            # ilegível; um Notion persistentemente fora não spamma um log por ciclo.
+            # O latch limpa numa leitura bem-sucedida (abaixo).
+            if not st.get("notion_ilegivel_avisado"):
+                _registrar(esp, f"não li o Notion de {curso} — não disparo",
+                           f"{str(e)[:140]}", tipo="escalada", reversivel=True,
+                           escalada=True, fonte="fail-closed", curso=curso,
+                           plataforma=plat, origem="athena-local/passada")
+                st["notion_ilegivel_avisado"] = True
             return Acao("", False, True, pedido)
+        st["notion_ilegivel_avisado"] = False              # leitura OK: re-arma o latch E12
         # AVANÇO -> re-arma o recozimento do disjuntor (o backoff reduz com sucesso).
         if no_notion is not None:
             prev = st.get("ultimo_no_notion")
@@ -318,6 +417,12 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                         f"({no_notion}/{total}) — não disparo (anti-dup por completude)",
                         True, False)
             voz.avisar_acao(acao)
+            # E7: curso COMPLETO no Notion — decidi não disparar (anti-dup por
+            # completude). Transição NOVO/CAPTURANDO→CONCLUIDO (uma vez).
+            _registrar(esp, f"{curso} COMPLETO ({no_notion}/{total}) — não disparo",
+                       "anti-dup por completude (fonte-verdade Notion)",
+                       reversivel=True, fonte="deterministico", curso=curso,
+                       plataforma=plat, origem="athena-local/passada")
             return acao
         if executor.curso_ativo(curso):
             return None                                    # capturando: quieto
@@ -334,6 +439,11 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                            and int(no_notion) > int(ref))
                 if not avancou:
                     st["cooldown_ate"] = agora + cooldown_s
+                    # E8: saída limpa sem avanço → curso quiescido entra em cooldown.
+                    _registrar(esp, f"{curso} quiescido — cooldown {int(cooldown_s)}s",
+                               "saída limpa (exit 0) sem avanço no Notion",
+                               reversivel=True, fonte="deterministico", curso=curso,
+                               plataforma=plat, origem="athena-local/passada")
                 st["fase"] = FASE_NOVO
             elif st.get("_morte_ciclo") != agora:
                 # FALLBACK de MORTE (default/no-autópsia): caiu sem saída-limpa e a autópsia
@@ -362,6 +472,12 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                 voz.escalar(Problema("captura_local_esgotada", curso, pedido, "critico"),
                             pedido)
                 st["esgotado_avisado"] = True
+                # E9: disjuntor fechado (teto/backoff/irredutível) — paro de disparar.
+                _registrar(esp, f"paro de disparar {curso} (disjuntor aberto)",
+                           "teto/backoff/irredutível — escalo, não martelo",
+                           tipo="escalada", reversivel=True, escalada=True,
+                           fonte="disjuntor", curso=curso, plataforma=plat,
+                           origem="athena-local/passada")
             return Acao("", False, True, pedido)
         st["esgotado_avisado"] = False                     # disjuntor reabriu: re-arma o latch
         try:
@@ -373,12 +489,22 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                       f"{str(e)[:160]}")
             voz.escalar(Problema("captura_local_disparo_falhou", curso, pedido, "critico"),
                         pedido)
+            # E11: disparo falhou — escalo, não assumo sucesso.
+            _registrar(esp, f"falhei ao disparar {curso}", f"{str(e)[:160]}",
+                       tipo="escalada", reversivel=True, escalada=True,
+                       fonte="fail-closed", curso=curso, plataforma=plat,
+                       origem="athena-local/passada")
             return Acao("", False, True, pedido)
         if not conf:
             pedido = (f"[{projeto_nome}] disparo LOCAL de {curso} SEM confirmação — "
                       f"não assumo sucesso")
             voz.escalar(Problema("captura_local_sem_confirmacao", curso, pedido, "critico"),
                         pedido)
+            # E11: disparo sem confirmação — não assumo sucesso (regra nº1).
+            _registrar(esp, f"disparo de {curso} sem confirmação", "não assumo sucesso",
+                       tipo="escalada", reversivel=True, escalada=True,
+                       fonte="fail-closed", curso=curso, plataforma=plat,
+                       origem="athena-local/passada")
             return Acao("", False, True, pedido)
         st["tentativas"] = st.get("tentativas", 0) + 1
         st["fase"] = FASE_CAPTURANDO
@@ -388,15 +514,250 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         acao = Acao(f"[{projeto_nome}] captura LOCAL de {curso} iniciada "
                     f"(tentativa {st['tentativas']}): {conf}", True, False)
         voz.avisar_acao(acao)
+        # E10: disparei a captura (tentativa N) — decisão reversível.
+        _registrar(esp, f"disparei captura de {curso} (tentativa {st['tentativas']})",
+                   f"{conf}", reversivel=True, fonte="deterministico", curso=curso,
+                   plataforma=plat, origem="athena-local/passada")
         return acao
     return passada
+
+
+# ===========================================================================
+# SUPERVISÃO DE SISTEMAS GERADOS (F4-d) — um sistema é um ALVO ao lado da captura.
+# Integração por ARQUIVO: lê heartbeat/resultado.json do <raiz>/estado, NUNCA
+# importa `sintetizador.*`. MESMO disjuntor/vigia/never-stop da captura.
+# ===========================================================================
+# Frescor do heartbeat: acima disso, com run "ativo", o run está TRAVADO (processo
+# vivo mas parado) — matar é seguro (sistema não tem sessão/anti-ban). Default 15min.
+_HEARTBEAT_LIMIAR_S = float(os.getenv("ATHENA_SISTEMA_HEARTBEAT_S", "900"))
+# Proxy conservador de custo quando o resultado.json não traz custo (nunca deve,
+# mas fail-safe): 0 medido, 0 presumido — o resultado.json é a fonte-verdade.
+
+
+def _ler_json_tolerante(path):
+    """Lê um JSON de sistema à prova de falhas (nunca levanta; ausente/meio-escrito
+    → None). O produtor (ledger/resultado) escreve atômico; isto só protege o
+    leitor de uma corrida rara ou arquivo ausente."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _resultado_mais_recente(raiz):
+    """O `estado/resultado-*.json` mais novo (por mtime) do sistema, ou None. É o
+    desfecho do último run; a Athena o lê por ciclo (§3.3)."""
+    import glob
+    d = os.path.join(str(raiz), "estado")
+    cands = glob.glob(os.path.join(d, "resultado-*.json"))
+    if not cands:
+        return None
+    cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return _ler_json_tolerante(cands[0])
+
+
+def _aplicar_decisao_sistema(slug, st, obito, decisao, *, disjuntor, alertas, agora,
+                             espinha):
+    """Traduz a `Decisao` de `causa_sistema` (conjunto FECHADO, SEM reseed) em ação
+    de never-stop sobre o `st` do sistema. Espelha `_aplicar_decisao` da captura,
+    mas: matar já foi feito por quem drenou o óbito; aqui só se decide backoff /
+    engenharia / escala. NUNCA há `escalar_reseed` (sistema não tem sessão)."""
+    acao = getattr(decisao, "acao", None)
+    fonte = getattr(decisao, "fonte", None) or "deterministico"
+    motivo = getattr(decisao, "motivo", "") or ""
+    st["ultima_causa"] = acao
+    if acao == "nada":
+        return
+    # transitório (relancar/aguardar_backoff) e engenharia: avança o backoff do
+    # disjuntor (recozimento) — o re-disparo virá sob o gate, nunca em martelo.
+    try:
+        disjuntor.registrar_falha(st, agora)
+    except Exception:
+        pass
+    if acao == "acionar_engenharia":
+        alertas.captura_morreu(slug, f"sistema {slug}: defeito → engenharia ({motivo})")
+        _registrar(espinha, f"aciono engenharia p/ {slug}", motivo, tipo="escalada",
+                   reversivel=True, escalada=True, trava="executor_ausente",
+                   sistema=slug, fonte=fonte, origem="athena-local/causa-sistema")
+    elif acao == "escalar_token":
+        alertas.captura_morreu(slug, f"sistema {slug}: credencial de API — troque o token")
+        _registrar(espinha, f"backoff+alerta de token em {slug}", motivo,
+                   reversivel=True, escalada=True, sistema=slug, fonte=fonte,
+                   origem="athena-local/causa-sistema")
+    elif acao in ("escalar_humano", "pausar_sistema"):
+        alertas.captura_morreu(slug, f"sistema {slug}: {acao} ({motivo})")
+        if acao == "pausar_sistema":
+            st["pausado_por_causa"] = True
+        _registrar(espinha, f"escalei {slug} ({acao})", motivo, tipo="escalada",
+                   reversivel=True, escalada=True, trava="desconhecida",
+                   sistema=slug, fonte="fail-closed",
+                   origem="athena-local/causa-sistema")
+    else:  # relancar / aguardar_backoff
+        # NEVER-STOP: uma morte TRANSITÓRIA (recurso/rede) re-tenta SOB O GATE do
+        # disjuntor (recozimento) — marca `retentar_devido` para o passo (4) re-
+        # disparar quando o backoff expirar. Engenharia/token/humano/pausa NÃO
+        # auto-re-tentam (precisam de correção/humano) — não marcam a flag.
+        st["retentar_devido"] = True
+        _registrar(espinha, f"recozer e re-tentar {slug}", motivo or f"transitório ({acao})",
+                   reversivel=True, sistema=slug, fonte=fonte,
+                   origem="athena-local/causa-sistema")
+
+
+def _registrar_desfecho_sistema(slug, resultado, *, disjuntor, st, espinha, agora):
+    """Um run TERMINADO (resultado.json novo) → prestação de contas por sistema:
+    2 linhas de CUSTO (medido e presumido SEPARADOS, `sistema=slug`) + 1 linha de
+    desfecho. Sucesso re-arma o disjuntor; parcial/congelado registram sem re-run
+    automático (§4.2)."""
+    estado = resultado.get("estado")
+    sucesso = bool(resultado.get("sucesso"))
+    medido = float(resultado.get("custo_medido_usd", 0.0) or 0.0)
+    presumido = float(resultado.get("custo_presumido_usd", 0.0) or 0.0)
+    # CUSTO: duas linhas, JAMAIS somadas (regra inviolável nº2).
+    _registrar(espinha, f"custo medido do run de {slug}", "usage real do run",
+               tipo="custo", reversivel=True, custo_usd=medido, medido=True,
+               sistema=slug, origem="athena-local/sistema")
+    _registrar(espinha, f"custo presumido do run de {slug}", "estimativa (proxy)",
+               tipo="custo", reversivel=True, custo_usd=presumido, medido=False,
+               sistema=slug, origem="athena-local/sistema")
+    if sucesso:
+        try:
+            disjuntor.registrar_sucesso(st)
+        except Exception:
+            pass
+        _registrar(espinha, f"run de {slug} APROVADO (provado)", "sucesso falha-fechada",
+                   reversivel=True, sistema=slug, fonte="deterministico",
+                   origem="athena-local/sistema")
+    else:
+        eh_congelado = estado == "congelado_parcial"
+        _registrar(espinha, f"run de {slug} → {estado}",
+                   "congelado_parcial/parcial (sem re-run automático)",
+                   tipo="escalada" if eh_congelado else "decisao",
+                   reversivel=True, escalada=eh_congelado,
+                   trava="irreversivel-externo" if eh_congelado else None,
+                   sistema=slug, fonte="deterministico", origem="athena-local/sistema")
+
+
+def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, alertas,
+                    espinha, agora, lock_dir, autopsia_dir, flap_min, llm=None,
+                    heartbeat_limiar_s=_HEARTBEAT_LIMIAR_S):
+    """A máquina de estados por-sistema (§4.2), um passo por ciclo. Devolve uma
+    `Acao` (reportável) ou None (quieto). NUNCA levanta (best-effort): um erro aqui
+    não pode derrubar o loop nem afetar a captura ao lado.
+
+    Ordem: (1) run ATIVO com heartbeat velho → TRAVADO: mata (seguro) + espinha;
+    (2) óbitos drenados → autópsia → causa_sistema → decisão; (3) resultado.json
+    novo → custo/desfecho na espinha; (4) gatilho de disparo (sob_demanda) sob o
+    gate do disjuntor; (5) quieto."""
+    slug = spec.slug
+    espinha = espinha or _EspinhaNula()
+
+    # (1) run ATIVO: heartbeat fresco → quieto; velho → TRAVADO, mata (SEGURO).
+    if executor.sistema_ativo(slug):
+        hb = _ler_json_tolerante(os.path.join(str(spec.raiz), "estado", "heartbeat.json"))
+        ts = (hb or {}).get("ts")
+        fresco = False
+        if isinstance(ts, (int, float)):
+            fresco = (agora - ts) < heartbeat_limiar_s
+        else:
+            # heartbeat ISO string: parse tolerante; ilegível → NÃO mata (conservador).
+            try:
+                from datetime import datetime as _dt
+                fresco = (agora - _dt.fromisoformat(ts).timestamp()) < heartbeat_limiar_s
+            except Exception:
+                fresco = True
+        if fresco:
+            return None
+        # TRAVADO: matar é SEGURO (sistema não tem sessão/anti-ban — ≠ captura).
+        try:
+            executor.matar(slug)
+        except Exception:
+            pass
+        _registrar(espinha, f"matei run travado de {slug} (heartbeat velho)",
+                   "processo vivo mas parado — kill seguro (sem sessão/anti-ban)",
+                   tipo="escalada", reversivel=True, escalada=True, sistema=slug,
+                   fonte="deterministico", origem="athena-local/sistema")
+        return Acao(f"[{slug}] run travado morto (heartbeat velho)", True, False)
+
+    # (2) ÓBITOS drenados → autópsia → causa_sistema → decisão (backoff/engenharia/escala).
+    try:
+        obitos_fonte = executor.drenar_obitos() or {}
+    except Exception:
+        obitos_fonte = {}
+    try:
+        obitos = vigia.autopsia(lock_dir, obitos_fonte, agora=agora,
+                                autopsia_dir=autopsia_dir, flap_min=flap_min)
+    except Exception:
+        obitos = []
+    for obito in obitos:
+        if getattr(obito, "saida_limpa", False):
+            continue                                   # exit 0 limpo: desfecho, não morte
+        try:
+            decisao = causa_sistema.classificar(obito, llm=llm)
+        except Exception:
+            decisao = None
+        if llm is not None and getattr(decisao, "fonte", None) in ("llm", "fail-closed"):
+            _registrar(espinha, f"diagnóstico claude -p da morte de {slug}",
+                       "custo presumido (o seam claude -p não devolve usage)",
+                       tipo="custo", reversivel=True, modelo="claude -p",
+                       custo_usd=_CUSTO_PROXY_CLAUDE_P_USD, medido=False,
+                       sistema=slug, fonte=getattr(decisao, "fonte", "llm"),
+                       origem="athena-local/causa-sistema")
+        _aplicar_decisao_sistema(slug, st, obito, decisao, disjuntor=disjuntor,
+                                 alertas=alertas, agora=agora, espinha=espinha)
+
+    # (3) resultado.json novo (run_fim visto) → custo/desfecho por sistema (uma vez).
+    resultado = _resultado_mais_recente(spec.raiz)
+    if resultado is not None:
+        rid = resultado.get("run_id")
+        if rid and rid != st.get("ultimo_resultado_run"):
+            st["ultimo_resultado_run"] = rid
+            _registrar_desfecho_sistema(slug, resultado, disjuntor=disjuntor, st=st,
+                                        espinha=espinha, agora=agora)
+
+    # (4) GATILHO de disparo (sob_demanda): só dispara sob PEDIDO explícito
+    # (`st['pedido_run']`) ou re-tentativa devida — NUNCA em loop de gasto. Sempre
+    # sob o gate do disjuntor (recozimento). Pausado (controle P5) nunca re-dispara.
+    if spec.estado == "pausado" or st.get("pausado_por_causa"):
+        return None
+    quer_disparar = bool(st.pop("pedido_run", False)) or st.get("retentar_devido")
+    if not quer_disparar:
+        return None
+    try:
+        pode = disjuntor.pode_tentar(st, agora)
+    except Exception:
+        pode = True
+    if not pode:
+        if not st.get("esgotado_avisado"):
+            st["esgotado_avisado"] = True
+            _registrar(espinha, f"paro de disparar {slug} (disjuntor aberto)",
+                       "teto/backoff — escalo, não martelo", tipo="escalada",
+                       reversivel=True, escalada=True, fonte="disjuntor",
+                       sistema=slug, origem="athena-local/sistema")
+        return None
+    st["esgotado_avisado"] = False
+    st["retentar_devido"] = False
+    try:
+        conf = executor.disparar(slug)
+    except Exception as e:
+        _registrar(espinha, f"falhei ao disparar sistema {slug}", f"{str(e)[:160]}",
+                   tipo="escalada", reversivel=True, escalada=True, fonte="fail-closed",
+                   sistema=slug, origem="athena-local/sistema")
+        return Acao("", False, True, f"[{slug}] disparo falhou: {str(e)[:160]}")
+    st["tentativas"] = st.get("tentativas", 0) + 1
+    _registrar(espinha, f"disparei run de {slug} (tentativa {st['tentativas']})",
+               f"{conf}", reversivel=True, sistema=slug, fonte="deterministico",
+               origem="athena-local/sistema")
+    return Acao(f"[{slug}] run disparado: {conf}", True, False)
 
 
 def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 plataformas_suportadas=None, max_tentativas=3, projeto_nome="athena-local",
                 controle=None, controle_path=None, disjuntor=None, vigia=None, causa=None,
                 alertas=None, lock_dir=None, autopsia_dir=None, meta_por_curso=None,
-                flap_min=None, llm=None):
+                flap_min=None, llm=None, espinha=None, sistemas=None,
+                sistema_executor=None, causa_sistema=None, estado_sistemas=None,
+                sistema_lock_dir=None, sistema_autopsia_dir=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -411,6 +772,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     vigia = vigia or _VigiaNulo()
     causa = causa or _CausaNula()
     alertas = alertas or _AlertasNulo()
+    espinha = espinha or _EspinhaNula()
     if flap_min is None:
         flap_min = _FLAP_MIN_PADRAO
     if meta_por_curso is None:
@@ -442,7 +804,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
         st = estado.setdefault(c.url, {})
         if (plataformas_suportadas is not None and
                 not adaptador_pipeline.plataforma_suportada(c.url, plataformas_suportadas)):
-            _escalar_plataforma_nova(projeto_nome, voz, c.url, st)
+            _escalar_plataforma_nova(projeto_nome, voz, c.url, st, espinha=espinha)
             continue
         cursos_ok.append(c.url)
 
@@ -450,11 +812,13 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     # (backoff vs irredutível) já esteja no `st` quando a passada consultar o disjuntor.
     _autopsiar_ciclo(executor, estado, vigia=vigia, causa=causa, disjuntor=disjuntor,
                      alertas=alertas, lock_dir=lock_dir, autopsia_dir=autopsia_dir,
-                     agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min, llm=llm)
+                     agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min,
+                     llm=llm, espinha=espinha)
 
     # (4) passada LOCAL + owner.
     passada = _passada_local_fn(executor, progresso_cached, voz, estado,
-                                projeto_nome=projeto_nome, disjuntor=disjuntor, agora=agora)
+                                projeto_nome=projeto_nome, disjuntor=disjuntor,
+                                agora=agora, espinha=espinha)
 
     def notion_fn(curso):
         try:
@@ -463,8 +827,32 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
             return (None, 0)
         return (no_notion, total)
 
-    return orquestrador.orquestrar_captura(cursos_ok, passada, notion_fn, voz, voo,
-                                           agora=agora)
+    resultado_captura = orquestrador.orquestrar_captura(cursos_ok, passada, notion_fn,
+                                                        voz, voo, agora=agora)
+
+    # (5) SISTEMAS GERADOS (F4-d): supervisão ao lado da captura. A captura acima NÃO
+    # muda em nada; sem sistemas registrados (default) este passo é um no-op — o
+    # padrão P1–P6 preservado (zero regressão na captura). Best-effort por sistema:
+    # um erro na supervisão de um sistema não derruba o ciclo nem afeta a captura.
+    if sistemas and sistema_executor is not None:
+        causa_sistema = causa_sistema or _CausaNula()
+        if estado_sistemas is None:
+            estado_sistemas = {}
+        for spec in sistemas:
+            st_s = estado_sistemas.setdefault(spec.slug, {})
+            try:
+                acao = passada_sistema(
+                    spec, st_s, sistema_executor, vigia=vigia,
+                    causa_sistema=causa_sistema, disjuntor=disjuntor, alertas=alertas,
+                    espinha=espinha, agora=agora,
+                    lock_dir=sistema_lock_dir, autopsia_dir=sistema_autopsia_dir,
+                    flap_min=flap_min, llm=llm)
+            except Exception:
+                acao = None                            # supervisão nunca derruba o ciclo
+            if acao is not None:
+                voz.avisar_acao(acao)                  # só posta se acao.executada
+
+    return resultado_captura
 
 
 def _escrever_pulso(path, *, ts, ciclo, ativos):
@@ -484,19 +872,23 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 controle_path=None, disjuntor=None, vigia=None, causa=None, alertas=None,
                 batimento=None, batimento_intervalo=1800.0, resumo_fn=None, pulso_path=None,
                 lock_dir=None, autopsia_dir=None, meta_por_curso=None, flap_min=None,
-                llm=None):
+                llm=None, espinha=None, sistemas=None, sistema_executor=None,
+                causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). A cada
     ciclo grava o PULSO e chama o BATIMENTO — ambos BEST-EFFORT (observabilidade nunca mata
-    o loop)."""
+    o loop). SISTEMAS gerados (F4-d) entram como alvos supervisionados no passo (5) do
+    ciclo — `estado_sistemas` persiste entre ciclos, igual ao `estado` dos cursos."""
     estado = {}
     voo = {}
+    estado_sistemas = {}
     controle = controle or _ControleNulo()
     disjuntor = disjuntor or _DisjuntorTeto(max_tentativas)
     vigia = vigia or _VigiaNulo()
     causa = causa or _CausaNula()
     alertas = alertas or _AlertasNulo()
     batimento = batimento or _BatimentoNulo()
+    espinha = espinha or _EspinhaNula()
     if meta_por_curso is None:
         meta_por_curso = {c.url: c for c in cursos}
     ultimo_erro = None
@@ -512,7 +904,10 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         controle=controle, controle_path=controle_path, disjuntor=disjuntor,
                         vigia=vigia, causa=causa, alertas=alertas, lock_dir=lock_dir,
                         autopsia_dir=autopsia_dir, meta_por_curso=meta_por_curso,
-                        flap_min=flap_min, llm=llm)
+                        flap_min=flap_min, llm=llm, espinha=espinha, sistemas=sistemas,
+                        sistema_executor=sistema_executor, causa_sistema=causa_sistema,
+                        estado_sistemas=estado_sistemas, sistema_lock_dir=sistema_lock_dir,
+                        sistema_autopsia_dir=sistema_autopsia_dir)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -524,6 +919,11 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                                          "critico"), pedido)
                 except Exception:
                     pass                                   # a voz falhar não pode matar o loop
+                # E13: ciclo doméstico estourou (latch por assinatura) — escala, o
+                # loop NÃO morre. A espinha é fail-safe: um erro AQUI também não mata.
+                _registrar(espinha, "o CICLO doméstico estourou",
+                           assinatura, tipo="escalada", reversivel=True,
+                           escalada=True, fonte="fail-closed", origem="athena-local/rodar")
                 ultimo_erro = assinatura
         # PULSO (P6 backstop lê isto) — best-effort, gravado MESMO num ciclo que estourou.
         if pulso_path:
@@ -638,6 +1038,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     from maestro import batimento as batimento_mod
     from maestro import causa as causa_mod
     from maestro import controle as controle_mod
+    from maestro import decisoes as decisoes_mod
     from maestro import disjuntor as disjuntor_mod
     from maestro import vigia as vigia_mod
     from maestro.config import carregar
@@ -685,13 +1086,39 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     # determinística pelo exit_code).
     llm = causa_mod.seam_claude_p if os.getenv("ATHENA_CAUSA_LLM") == "1" else None
 
+    # SISTEMAS GERADOS (F4-d): supervisão ao lado da captura. OPT-IN por
+    # ATHENA_SISTEMAS_PATH (o registro sistemas.yaml, F4-b). Ausente => só captura
+    # (default preservado, zero mudança no comportamento vivo). A fábrica é apontada
+    # por ATHENA_FABRICA_PYTHON/ATHENA_FABRICA_DIR (o repo do sintetizador).
+    sistemas = None
+    sistema_executor = None
+    causa_sistema_mod = None
+    sistema_lock_dir = None
+    sistema_autopsia_dir = None
+    sistemas_path = os.getenv("ATHENA_SISTEMAS_PATH")
+    if sistemas_path and os.path.exists(sistemas_path):
+        from maestro import causa_sistema as causa_sistema_mod
+        from maestro.adaptadores.sistema import SistemaExecutor, carregar_sistemas
+        sistemas = carregar_sistemas(sistemas_path)
+        fabrica_python = os.getenv("ATHENA_FABRICA_PYTHON", motor_python)
+        fabrica_dir = os.getenv(
+            "ATHENA_FABRICA_DIR", "/Users/guilhermerodrigues/teste/aula-sintetizador")
+        sistema_lock_dir = os.path.join(base, "locks-sistemas")
+        sistema_autopsia_dir = os.path.join(base, "autopsias-sistemas")
+        sistema_executor = SistemaExecutor(
+            sistemas, fabrica_python=fabrica_python, fabrica_dir=fabrica_dir,
+            lock_dir=sistema_lock_dir)
+
     asyncio.run(rodar(
         cursos, executor, progresso_fn, voz, intervalo_s=cfg.intervalo_s,
         max_tentativas=max_tentativas, plataformas_suportadas=plataformas_suportadas,
         controle=controle_mod, controle_path=controle_path, disjuntor=disjuntor_mod,
         vigia=vigia_mod, causa=causa_mod, alertas=alertas, batimento=batimento_mod,
         batimento_intervalo=batimento_intervalo, pulso_path=pulso_path,
-        lock_dir=lock_dir_efetivo, autopsia_dir=autopsia_dir, llm=llm))
+        lock_dir=lock_dir_efetivo, autopsia_dir=autopsia_dir, llm=llm,
+        espinha=decisoes_mod, sistemas=sistemas, sistema_executor=sistema_executor,
+        causa_sistema=causa_sistema_mod, sistema_lock_dir=sistema_lock_dir,
+        sistema_autopsia_dir=sistema_autopsia_dir))
 
 
 if __name__ == "__main__":  # pragma: no cover

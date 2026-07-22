@@ -89,6 +89,7 @@ def registrar_decisao(
     custo_usd: float = 0.0,
     medido: bool = True,
     origem=None,
+    sistema=None,
     agora: datetime | None = None,
     dir_base: Path | None = None,
 ) -> None:
@@ -96,6 +97,9 @@ def registrar_decisao(
 
     `agora` e `dir_base` são injetáveis para teste (nada de relógio/HOME reais).
     Custo: `medido=True` => veio de usage real; `medido=False` => estimativa.
+    `sistema` (aditivo F4): slug do sistema gerado a que a decisão/custo pertence
+    (None = decisão da captura/geral, agregada como 'athena-geral'). É o campo que
+    o `gasto_do_dia_por_sistema` (F4-f) agrupa para o enforcement D5 e o SITREP.
     """
     try:
         agora = agora if agora is not None else datetime.now().astimezone()
@@ -107,6 +111,7 @@ def registrar_decisao(
             "ts": agora.isoformat(),
             "tipo": tipo,
             "origem": _coagir_str(origem) if origem is not None else None,
+            "sistema": _coagir_str(sistema) if sistema is not None else None,
             "curso": _coagir_str(curso) if curso is not None else None,
             "plataforma": _coagir_str(plataforma) if plataforma is not None else None,
             "o_que": _coagir_str(o_que),

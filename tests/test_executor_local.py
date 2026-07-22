@@ -96,18 +96,29 @@ def _hot(url, conta="a"):
     return captura.CursoLocal(url=url, conta=conta, plataforma="hotmart")
 
 
+def _pend(**kw):
+    """pendencias_fn injetável: contagens FIXAS por passe (0 default). Deixa a escolha do
+    passe DETERMINÍSTICA no teste (sem depender de um tracker.db real). Ex.: _pend(audio=1)
+    => o único passe elegível é `audio` => o comando leva `--audio`."""
+    contagem = {"base": 0, "audio": 0, "embed": 0, "nao-video": 0}
+    contagem.update(kw)
+    return lambda url, motor_dir: dict(contagem)
+
+
 # ==========================================================================
 # Comando: chama o MOTOR DIRETO (não enfileira), com Groq e cwd do motor
 # ==========================================================================
 def test_dispara_o_motor_direto_com_url_backend_groq_e_cwd():
     sp = FakeSpawn()
-    ex = _exec(_hot(C1), spawn=sp)
+    # audio=1 fixa o passe escolhido em `audio` (determinístico) — o foco deste teste é
+    # módulo/Groq/cwd, não a escolha de passe (essa tem testes próprios abaixo).
+    ex = _exec(_hot(C1), spawn=sp, pendencias_fn=_pend(audio=1))
     conf = ex.disparar(C1)
     assert conf                                            # confirmação truthy
     assert len(sp.calls) == 1
     call = sp.calls[0]
-    # DENTES: comando é `<motor_python> -m motor.cli <url> --audio` (chama o motor,
-    # não INSERT; --audio resgata aulas Hotmart sem legenda — ver REFINO 1).
+    # DENTES: comando é `<motor_python> -m motor.cli <url> <flag-do-passe>` (chama o motor,
+    # não INSERT). Com sem_legenda pendente o passe é `audio` => `--audio`.
     assert call["cmd"] == [PY, "-m", "motor.cli", C1, "--audio"]
     assert call["env"]["WHISPER_BACKEND"] == "groq"        # INVIOLÁVEL Groq
     assert call["cwd"] == DIR                              # cwd p/ motor.config achar .env
@@ -121,15 +132,16 @@ def test_memberkit_usa_o_modulo_proprio():
 
 
 # ==========================================================================
-# REFINO 1 — --audio SÓ no caminho HOTMART (motor.cli). Sem ele, uma aula
-# Hotmart SEM legenda vira terminal 'sem_legenda' e NUNCA chega ao Notion (a
-# completude-por-Notion nunca fecha). O passe de áudio (Groq) é o que resgata
-# essas aulas. Memberkit é ÁUDIO-NATIVO (motor.memberkit) e NÃO leva --audio.
+# REFINO 1 — --audio SÓ no caminho HOTMART (motor.cli), e SÓ quando o passe
+# `audio` é o escolhido (há sem_legenda pendente). Sem ele, uma aula Hotmart
+# SEM legenda vira terminal 'sem_legenda' e NUNCA chega ao Notion. Memberkit é
+# ÁUDIO-NATIVO (motor.memberkit) e NUNCA leva --audio (só tem o passe `base`).
 # ==========================================================================
-def test_hotmart_leva_flag_audio():
+def test_hotmart_leva_flag_audio_quando_o_passe_audio_e_escolhido():
     sp = FakeSpawn()
-    _exec(_hot(C1), spawn=sp).disparar(C1)
-    # DENTES: sem o --audio, aula Hotmart sem legenda não chega ao Notion.
+    _exec(_hot(C1), spawn=sp, pendencias_fn=_pend(audio=1)).disparar(C1)
+    # DENTES: com sem_legenda pendente, o passe `audio` roda `--audio` — sem ele a
+    # aula Hotmart sem legenda não chega ao Notion.
     assert sp.calls[0]["cmd"] == [PY, "-m", "motor.cli", C1, "--audio"]
 
 
@@ -287,7 +299,7 @@ def test_restart_nao_redispara_o_mesmo_curso_com_processo_antigo_vivo(tmp_path):
     # Encarnação 1: dispara C1 na conta-A (processo desacoplado, "horas").
     sp1 = FakeSpawn(mundo)
     ex1 = _exec(_hot(C1, "conta-A"), spawn=sp1, lock_dir=lock, pid_vivo=mundo.vivo)
-    assert ex1.disparar(C1) == f"local_iniciada:{C1}"
+    assert ex1.disparar(C1).startswith(f"local_iniciada:{C1}")
     assert len(sp1.calls) == 1                             # 1 processo real
 
     # >>> RESTART <<< o loop crasha/reinicia: NOVO executor, _procs={} do zero. Mas o
@@ -330,7 +342,7 @@ def test_restart_libera_a_conta_quando_o_processo_antigo_morreu(tmp_path):
 
     sp2 = FakeSpawn(mundo)
     ex2 = _exec(_hot(C1, "conta-A"), spawn=sp2, lock_dir=lock, pid_vivo=mundo.vivo)
-    assert ex2.disparar(C1) == f"local_iniciada:{C1}"      # PID morto -> conta livre -> retoma
+    assert ex2.disparar(C1).startswith(f"local_iniciada:{C1}")      # PID morto -> conta livre -> retoma
     assert len(sp2.calls) == 1
 
 
@@ -420,7 +432,7 @@ def test_spawn_falho_remove_o_lock_de_intencao(tmp_path):
     # e um novo disparo (spawn bom) tem de conseguir rodar de fato.
     sp_ok = FakeSpawn()
     ex2 = _exec(_hot(C1, "conta-A"), spawn=sp_ok, lock_dir=lock, pid_vivo=sp_ok.mundo.vivo)
-    assert ex2.disparar(C1) == f"local_iniciada:{C1}"
+    assert ex2.disparar(C1).startswith(f"local_iniciada:{C1}")
     assert len(sp_ok.calls) == 1
 
 
@@ -644,3 +656,139 @@ def test_disparar_limpa_singleton_orfao_do_perfil_da_conta(tmp_path):
         motor_log_dir=str(tmp_path / "logs"))
     ex.disparar(C1)
     assert not lock.exists()                              # DENTES: lock órfão foi removido
+
+
+# ==========================================================================
+# RODÍZIO DE PASSES (correção de fiação — prioridade 1). O passe é escolhido
+# POR DEMANDA (o que tem pendência no tracker), 1 passe por disparo, com anel
+# anti-fome. O anti-ban NUNCA cede: 1 motor por conta por vez (o argv muda; a
+# QUANTIDADE de spawns, não). Cobre os 3 dentes exigidos:
+#   (i)  conta com sem_video roda --embed;
+#   (ii) conta com pendente roda base;
+#   (iii) NUNCA 2 passes na mesma conta no mesmo ciclo.
+# ==========================================================================
+def test_passe_embed_quando_conta_tem_sem_video():
+    """(i) DENTE: sem_video pendente => passe `embed` => `--embed`. Sem isto as 279
+    aulas sem_video jamais eram re-selecionadas (o daemon só chamava --audio)."""
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp, pendencias_fn=_pend(embed=3)).disparar(C1)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.cli", C1, "--embed"]
+    assert conf.endswith(":passe=embed")
+
+
+def test_passe_base_quando_conta_tem_pendente():
+    """(ii) DENTE: pendente => passe `base` (SEM flag). Sem isto as 95 aulas
+    pendente jamais eram re-selecionadas (o daemon fixava --audio)."""
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp, pendencias_fn=_pend(base=5)).disparar(C1)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.cli", C1]     # base = SEM flag
+    assert conf.endswith(":passe=base")
+
+
+def test_anti_ban_nunca_dois_passes_na_mesma_conta_no_mesmo_ciclo():
+    """(iii) DENTE ANTI-BAN: mesmo com pendência em VÁRIOS passes (base E embed),
+    o 2º disparo na MESMA conta enquanto o 1º motor vive é RECUSADO (ContaOcupada)
+    — só 1 motor por conta. Se o rodízio pudesse spawnar um 2º passe em paralelo na
+    conta, este teste falharia (2 sp.calls)."""
+    sp = FakeSpawn()
+    ex = _exec(_hot(C1, "a"), _hot(C2, "a"), spawn=sp,
+               pendencias_fn=_pend(base=5, embed=5))
+    ex.disparar(C1)                                       # passe 1 dispara na conta "a"
+    with pytest.raises(captura.ContaOcupada):
+        ex.disparar(C2)                                   # C2 é a MESMA conta "a"
+    assert len(sp.calls) == 1                             # DENTE: 1 único motor na conta
+
+
+def test_rodizio_alterna_entre_passes_elegiveis_entre_ciclos():
+    """ANTI-FOME: com base E embed elegíveis, disparos sucessivos (conta liberando
+    entre eles) ALTERNAM os passes em vez de fixar sempre o 1º — senão um backlog
+    grande num passe mataria de fome os outros."""
+    sp = FakeSpawn()
+    ex = _exec(_hot(C1), spawn=sp, pendencias_fn=_pend(base=5, embed=5))
+    escolhidos = []
+    for _ in range(3):
+        conf = ex.disparar(C1)
+        escolhidos.append(conf.rsplit("=", 1)[1])
+        sp.calls[-1]["proc"].encerrar(0)                  # encerra p/ liberar a conta
+        ex._reap()
+    assert escolhidos[0] != escolhidos[1]                 # alternou (anti-fome)
+    assert set(escolhidos) <= {"base", "embed"}
+
+
+def test_pendencias_ilegivel_cai_em_rodizio_cego_e_ainda_dispara():
+    """FAIL-OPEN p/ RODÍZIO (nunca p/ paralelismo): se a leitura do tracker falha
+    (None), o executor ainda DISPARA um passe cego — não trava a captura por não
+    conseguir contar. 1 spawn (o anti-ban segue intacto)."""
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp, pendencias_fn=lambda u, d: None).disparar(C1)
+    assert len(sp.calls) == 1
+    assert conf.startswith(f"local_iniciada:{C1}:passe=")
+
+
+def test_nao_video_desligado_por_default_nao_dispara_a_flag(monkeypatch):
+    """nao-video fica DESLIGADO por default (braço doc->Notion é a remediação #2,
+    ainda inexistente): mesmo com sem_embed pendente, NÃO dispara --nao-video — cai
+    na sonda `base`. Evita saída-limpa-sem-avanço + cooldown de 6h travando o curso."""
+    monkeypatch.delenv("ATHENA_NAO_VIDEO_ATIVO", raising=False)
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp,
+                 pendencias_fn=_pend(**{"nao-video": 4})).disparar(C1)
+    assert "--nao-video" not in sp.calls[0]["cmd"]
+    assert conf.endswith(":passe=base")
+
+
+def test_nao_video_ligado_por_env_dispara_a_flag(monkeypatch):
+    """Quando a remediação #2 entregar o braço, `ATHENA_NAO_VIDEO_ATIVO=1` liga o
+    passe SEM tocar código: aí sem_embed pendente roda `--nao-video`."""
+    monkeypatch.setenv("ATHENA_NAO_VIDEO_ATIVO", "1")
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp,
+                 pendencias_fn=_pend(**{"nao-video": 4})).disparar(C1)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.cli", C1, "--nao-video"]
+    assert conf.endswith(":passe=nao-video")
+
+
+def test_memberkit_passe_unico_ignora_pendencias_e_nunca_leva_flag():
+    """Plataforma áudio-nativa (passes=("base",)): a escolha de passe é no-op —
+    NUNCA consulta pendências nem anexa flag (passá-la seria argumento desconhecido
+    do módulo). pendencias_fn que EXPLODE prova que nem é chamado."""
+    def _boom(url, motor_dir):
+        raise AssertionError("passe único não pode consultar pendências")
+    sp = FakeSpawn()
+    _exec(captura.CursoLocal(url=MK, conta="mk", plataforma="memberkit"),
+          spawn=sp, pendencias_fn=_boom).disparar(MK)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.memberkit", MK]
+
+
+def test_pendencias_tracker_conta_por_course_id_da_url(tmp_path):
+    """O leitor default resolve o course_id pelo /products/<id> da URL (a coluna
+    courses.url é stale) e BUCKETIZA os status nos passes, isolando outros cursos e
+    excluindo terminais (no_notion). É o path de PRODUÇÃO — testado contra o schema
+    real (SELECT status,COUNT(*) ... GROUP BY status)."""
+    import sqlite3
+    db = tmp_path / "tracker.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE lessons(hash TEXT PRIMARY KEY, course_id TEXT, status TEXT)")
+    linhas = [
+        ("h1", "5431484", "sem_video"), ("h2", "5431484", "sem_video"),
+        ("h3", "5431484", "transcrevendo_embed"),          # também é `embed`
+        ("h4", "5431484", "pendente"),                     # `base`
+        ("h5", "5431484", "falhou"),                       # `base`
+        ("h6", "5431484", "sem_embed"),                    # `nao-video`
+        ("h7", "5431484", "no_notion"),                    # terminal: fora de tudo
+        ("h8", "9999", "sem_video"),                       # OUTRO curso: ignorado
+    ]
+    con.executemany("INSERT INTO lessons VALUES(?,?,?)", linhas)
+    con.commit()
+    con.close()
+    pend = captura._pendencias_tracker(
+        "https://hotmart.com/pt-br/club/x/products/5431484", str(tmp_path))
+    assert pend == {"base": 2, "audio": 0, "embed": 3, "nao-video": 1}
+
+
+def test_pendencias_tracker_none_fail_open(tmp_path):
+    """None (=> rodízio cego) quando: db ausente, ou a URL não tem /products/<id>."""
+    assert captura._pendencias_tracker("http://x/products/1", str(tmp_path)) is None
+    # cria db vazio mas passa URL sem product-id => course_id não resolve => None
+    (tmp_path / "tracker.db").write_bytes(b"")
+    assert captura._pendencias_tracker("http://x/sem-produto", str(tmp_path)) is None

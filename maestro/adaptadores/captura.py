@@ -27,7 +27,9 @@ nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar
 import hashlib
 import json
 import os
+import re
 import shlex
+import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass
@@ -397,9 +399,13 @@ class PlataformaSpec:
 
     Campos que CRAVAM os invioláveis anti-ban por plataforma:
       - `modulo`: o módulo do motor (`python -m <modulo> <url>`).
-      - `audio`: anexa `--audio` — SÓ Hotmart (motor.cli), que resgata aula sem legenda
-        pelo Whisper. Os adaptadores áudio-nativos (memberkit/stoa/kajabi) NÃO conhecem
-        a flag (passá-la seria argumento desconhecido).
+      - `passes`: a tupla de PASSES de trabalho que o motor desta plataforma sabe rodar,
+        em ORDEM DE ANEL. Cada disparo escolhe UM passe (ver `LocalExecutor._escolher_passe`)
+        e `_montar` anexa a flag correspondente (`_PASSE_FLAG`): base=sem flag,
+        audio=`--audio`, embed=`--embed`, nao-video=`--nao-video`. SÓ Hotmart (motor.cli)
+        tem os 4; os adaptadores áudio-nativos (memberkit/stoa/kajabi) ficam em `("base",)`
+        — NÃO conhecem flag nenhuma (passá-la seria argumento desconhecido), então para eles
+        a escolha de passe é um no-op (sempre "base", NADA muda no comando).
       - `headless`: True => HEADLESS=1 (Memberkit, áudio-nativo, roda cego); False =>
         HEADED (Hotmart/Stoa/Kajabi — a sonda de sessão e/ou a captura de áudio do
         player de vídeo falham headless).
@@ -416,7 +422,7 @@ class PlataformaSpec:
         config da plataforma vence) e ANTES dos invioláveis (Groq/HEADLESS/MOTOR_BROWSER
         vencem tudo)."""
     modulo: str
-    audio: bool = False
+    passes: tuple = ("base",)
     headless: bool = False
     chromium: bool = False
     url_env: str = ""
@@ -426,8 +432,10 @@ class PlataformaSpec:
 # plataforma -> como invocar o motor. Fora deste mapa => fail-closed (o motor só sabe
 # estas; capturar numa plataforma desconhecida às cegas violaria o anti-ban/o gate de
 # plataforma-nova).
-#   - hotmart:  CLI base, --audio, HEADED, channel=chrome.
-#   - memberkit: adaptador próprio, áudio-nativo, HEADLESS, channel=chrome.
+#   - hotmart:  CLI base, RODÍZIO dos 4 passes (base/embed/audio/nao-video), HEADED,
+#     channel=chrome. O passe é escolhido POR DEMANDA a cada disparo (o que tiver
+#     pendência no tracker), 1 passe por disparo — nunca 2 na mesma conta (anti-ban).
+#   - memberkit: adaptador próprio, áudio-nativo, HEADLESS, channel=chrome — só `base`.
 #   - stoa/kajabi: adaptadores próprios, áudio-nativo, HEADED, Chromium ISOLADO (perfil
 #     dedicado por conta) — nunca channel=chrome (colidiria com o Hotmart no singleton).
 _PLATAFORMAS = {
@@ -437,7 +445,7 @@ _PLATAFORMAS = {
     # colide: é conta ÚNICA (hotmart-principal) e os 3 Memberkit (que partilhavam este mesmo
     # default) agora têm perfis DEDICADOS — Hotmart fica sozinho no `.chrome-profile`.
     "hotmart": PlataformaSpec(
-        "motor.cli", audio=True,
+        "motor.cli", passes=("base", "embed", "audio", "nao-video"),
         env=(("CHROME_USER_DATA_DIR", ".chrome-profile"),)),
     # Memberkit: 3 tenants (contas distintas) — SEM perfil no spec => cada conta ganha o seu
     # (`.chrome-profile-<conta>`) em `_montar`. É o fix do flap: os 3 + Hotmart caíam todos
@@ -459,6 +467,85 @@ _PLATAFORMAS = {
 # config dele; é fiação interna do supervisor). O seam de spawn injetado (testes) ignora
 # a chave, então o contrato `(cmd, *, env, cwd)` fica intacto.
 _ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
+
+
+# PASSE -> flag do motor.cli. `base` = passe de legenda/vídeo nativo (SEM flag). Os demais
+# ligam os seletores próprios do tracker (audio_pending/embed_pending/nao_video_pending).
+_PASSE_FLAG = {"base": None, "audio": "--audio", "embed": "--embed", "nao-video": "--nao-video"}
+
+# ESPELHO de motor/tracker.py::PENDING_EXCLUDED — a FONTE-VERDADE vive lá; o executor NÃO
+# pode importar o pacote `motor` (árvore/pkg separados, roda via `python -m` noutro cwd).
+# Se `PENDING_EXCLUDED` mudar em tracker.py, ESTA lista tem que mudar junto (contrato).
+# `base` conta as aulas que o passe de legenda/vídeo nativo pega = tudo que NÃO está aqui.
+_PENDING_EXCLUDED = (
+    "no_notion", "sem_legenda", "sem_video", "transcrevendo", "audio_erro",
+    "sem_audio", "transcrevendo_embed", "sem_embed", "capturando_nao_video",
+    "sem_conteudo",
+)
+# Espelho de AUDIO_PENDING / EMBED_PENDING / NAO_VIDEO_PENDING (tracker.py). Idem contrato.
+_STATUSES_POR_PASSE = {
+    "audio": ("sem_legenda", "transcrevendo"),
+    "embed": ("sem_video", "transcrevendo_embed"),
+    "nao-video": ("sem_embed", "capturando_nao_video"),
+}
+
+
+def _course_id_de_url(curso_url):
+    """product-id Hotmart do trecho `/products/<id>` da URL. O tracker chaveia por
+    course_id (NÃO por url: a coluna `courses.url` é não-confiável — dezenas de course_id
+    compartilham uma url stale), e o product-id casa 1:1 com o course_id nas contas
+    Hotmart. None se a URL não tiver esse trecho."""
+    if not curso_url:
+        return None
+    achados = re.findall(r"/products/([^/?#]+)", curso_url)
+    return achados[-1] if achados else None
+
+
+def _pendencias_tracker(curso_url, motor_dir):
+    """Lê `{motor_dir}/tracker.db` em SQLite READ-ONLY e devolve {passe: qtd_pendente}
+    para o curso (base/audio/embed/nao-video). NÃO muta e NÃO trava o motor vivo (uri
+    `mode=ro` + `busy_timeout`; o WAL do motor permite leitura concorrente). Resolve o
+    course_id pelo product-id da URL (ver `_course_id_de_url`). Devolve **None** em
+    QUALQUER erro (db ausente, course_id não resolve, SQL) — o chamador então cai no
+    round-robin CEGO (fail-open p/ RODÍZIO, jamais p/ paralelismo)."""
+    course_id = _course_id_de_url(curso_url)
+    if not course_id:
+        return None
+    db_path = os.path.join(motor_dir, "tracker.db")
+    if not os.path.exists(db_path):
+        return None
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        linhas = con.execute(
+            "SELECT status, COUNT(*) FROM lessons WHERE course_id=? GROUP BY status",
+            (course_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        if con is not None:
+            con.close()
+    por_status = {s: n for (s, n) in linhas}
+    pend = {p: 0 for p in _PASSE_FLAG}
+    for status, n in por_status.items():
+        if status not in _PENDING_EXCLUDED:
+            pend["base"] += n
+    for passe, statuses in _STATUSES_POR_PASSE.items():
+        pend[passe] = sum(por_status.get(s, 0) for s in statuses)
+    return pend
+
+
+def _passe_ativavel(passe):
+    """Um passe pode ser DISPARADO? `nao-video` fica DESLIGADO por default: seu braço de
+    processamento (doc->Notion) é a remediação #2 e AINDA não existe — dispará-lo hoje só
+    gera saída-limpa-sem-avanço (e cooldown de 6h que trava o curso). Fica WIRED (flag,
+    _montar, CLI) e liga com `ATHENA_NAO_VIDEO_ATIVO` quando #2 entregar o braço, SEM
+    tocar código. Os demais passes são sempre ativáveis."""
+    if passe == "nao-video":
+        return bool(os.getenv("ATHENA_NAO_VIDEO_ATIVO"))
+    return True
 
 
 def _spawn_popen(cmd, *, env, cwd):  # pragma: no cover — processo REAL do motor
@@ -598,10 +685,18 @@ class LocalExecutor:
 
     def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
                  extra_env=None, lock_dir=None, pid_vivo=None,
-                 motor_dir_por_plataforma=None, motor_log_dir=None):
+                 motor_dir_por_plataforma=None, motor_log_dir=None, pendencias_fn=None):
         self._meta = {c.url: c for c in cursos}
         self._motor_python = motor_python
         self._motor_dir = motor_dir
+        # SEAM da escolha de passe: lê pendências do tracker por curso p/ decidir QUAL
+        # passe rodar. Default = `_pendencias_tracker` (SQLite read-only). Injetável nos
+        # testes. None em qualquer erro => round-robin cego (fail-open p/ rodízio).
+        self._pendencias_fn = pendencias_fn or _pendencias_tracker
+        # Cursor do ANEL de passes POR CONTA (anti-fome: alterna entre os passes elegíveis
+        # em vez de fixar sempre o 1º). In-memory: perda no restart é benigna (recomeça do
+        # início do anel). NÃO afeta o anti-ban (o guard é o lock durável em disco).
+        self._passe_cursor = {}
         # Override de diretório do motor POR PLATAFORMA (ex.: Stoa vive no worktree
         # adaptador-stoa, não em /aula). Default = self._motor_dir para as demais.
         self._motor_dir_por_plataforma = dict(motor_dir_por_plataforma or {})
@@ -767,7 +862,13 @@ class LocalExecutor:
                 f"conta {meta.conta!r} já captura {lock.get('course_url')} (PID "
                 f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
                 f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
-        cmd, env, cwd = self._montar(meta)                 # fail-closed ANTES de qualquer spawn
+        # ESCOLHA DO PASSE (por demanda, com rodízio anti-fome). Feita AQUI, DEPOIS do guard
+        # anti-ban e ANTES do único spawn: muda só o ARGV do processo — jamais a QUANTIDADE
+        # (1 spawn). Não pode disparar 2 passes na mesma conta: o passe N+1 só é escolhido
+        # quando `disparar` é chamado de novo, e o lock durável já barrou isso enquanto o
+        # motor do passe N não morreu e foi colhido (`_reap`).
+        passe = self._escolher_passe(meta)
+        cmd, env, cwd = self._montar(meta, passe)          # fail-closed ANTES de qualquer spawn
         # STDERR FIADO: diz ao spawn default ONDE tee'ar stdout+stderr do motor (por conta).
         # O `_spawn_popen` POPA esta chave antes do exec — o motor não a herda. Spawns
         # injetados (testes) a ignoram (contrato `(cmd, *, env, cwd)` intacto).
@@ -800,9 +901,44 @@ class LocalExecutor:
         # captura — é o que um executor nascido pós-restart lerá (via `_pid_vivo`) para
         # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
-        return f"local_iniciada:{curso_url}"
+        return f"local_iniciada:{curso_url}:passe={passe}"
 
-    def _montar(self, meta):
+    def _escolher_passe(self, meta):
+        """Escolhe UM passe para ESTE disparo, POR DEMANDA (o que tem pendência no tracker)
+        com RODÍZIO anti-fome (cursor por conta). Plataforma de passe único (áudio-nativos)
+        => sempre "base" (no-op). Erro de leitura => round-robin CEGO nos passes ativáveis
+        (fail-open p/ RODÍZIO, nunca paralelismo). Nenhum passe elegível => "base" (sonda de
+        re-enumeração barata e sempre válida; se nada há a fazer, sai limpo e o cooldown do
+        owner quiesce o curso). NUNCA muda a QUANTIDADE de spawns — só o argv do único."""
+        spec = _PLATAFORMAS.get(meta.plataforma)
+        passes = spec.passes if spec is not None else ("base",)
+        if len(passes) == 1:
+            return passes[0]                               # áudio-nativos: NADA muda
+        ativaveis = [p for p in passes if _passe_ativavel(p)]
+        try:
+            pend = self._pendencias_fn(meta.url, self._motor_dir_de(meta.plataforma))
+        except Exception:
+            pend = None
+        if pend is None:
+            candidatos = ativaveis                         # cego: rodízio nos ativáveis
+        else:
+            candidatos = [p for p in ativaveis if pend.get(p, 0) > 0]
+        if not candidatos:
+            return "base"                                  # nada elegível: sonda base
+        return self._proximo_no_anel(meta.conta, passes, candidatos)
+
+    def _proximo_no_anel(self, conta, passes, candidatos):
+        """Próximo passe elegível no ANEL `passes` a partir do cursor da conta; avança o
+        cursor. Garante alternância (anti-fome) entre os candidatos ao longo dos disparos."""
+        cur = self._passe_cursor.get(conta, 0) % len(passes)
+        for i in range(len(passes)):
+            idx = (cur + i) % len(passes)
+            if passes[idx] in candidatos:
+                self._passe_cursor[conta] = (idx + 1) % len(passes)
+                return passes[idx]
+        return candidatos[0]                               # inalcançável (candidatos ⊆ passes)
+
+    def _montar(self, meta, passe="base"):
         spec = _PLATAFORMAS.get(meta.plataforma)
         if spec is None:
             # fail-closed: o motor só sabe as plataformas mapeadas. Uma nova nunca é
@@ -813,11 +949,13 @@ class LocalExecutor:
                 f"fail-closed, não capturo {meta.url}")
         motor_dir = self._motor_dir_de(meta.plataforma)
         cmd = [self._motor_python, "-m", spec.modulo, meta.url]
-        # --audio SÓ Hotmart (motor.cli): resgata aula sem legenda pelo Whisper. Sem ele
-        # essa aula vira terminal 'sem_legenda' e nunca chega ao Notion. Os adaptadores
-        # áudio-nativos (memberkit/stoa/kajabi) NÃO conhecem a flag.
-        if spec.audio:
-            cmd.append("--audio")
+        # FLAG DO PASSE escolhido (`_escolher_passe`): base=sem flag; audio=--audio;
+        # embed=--embed; nao-video=--nao-video. SÓ Hotmart (motor.cli) tem passes != base;
+        # os adaptadores áudio-nativos ficam em ("base",) => flag None => comando inalterado
+        # (passar-lhes uma flag seria argumento desconhecido do módulo errado).
+        flag = _PASSE_FLAG.get(passe)
+        if flag:
+            cmd.append(flag)
         env = dict(os.environ)
         # ORDEM (importa p/ o anti-ban): extra_env global PRIMEIRO (base overridável); a
         # config da PLATAFORMA depois (o perfil DEDICADO/URL vence um extra_env global); os

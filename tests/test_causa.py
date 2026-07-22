@@ -246,3 +246,84 @@ def test_relogar_nao_esta_no_conjunto_fechado():
         "escalar_reseed", "escalar_token", "relancar",
         "aguardar_backoff", "escalar_humano",
     }
+
+
+# --------------------------------------------------------------------------
+# FIX 1 (observabilidade) — o ramo exit-4 ENRIQUECE o motivo com os erros REAIS
+# do tracker (SQLite READ-ONLY), em vez do hard-code "causa sistêmica desconhecida".
+# --------------------------------------------------------------------------
+import os
+import sqlite3
+
+
+def _tracker_com_erros(dirpath, linhas):
+    """Cria um tracker.db com o MESMO schema do motor (aula/motor/tracker.py) e
+    as linhas dadas: (course_id, status, error, updated_at)."""
+    db = os.path.join(str(dirpath), "tracker.db")
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE lessons(
+        course_id TEXT, order_idx INTEGER, url TEXT, status TEXT,
+        notion_page_id TEXT, error TEXT, updated_at REAL)""")
+    for i, (cid, status, error, ts) in enumerate(linhas):
+        con.execute("INSERT INTO lessons VALUES (?,?,?,?,?,?,?)",
+                    (cid, i, f"http://aula/{i}", status, None, error, ts))
+    con.commit()
+    con.close()
+    return db
+
+
+def test_exit4_enriquece_motivo_com_erros_reais_do_tracker(tmp_path):
+    # RED-first: hoje o exit-4 hard-coda "causa sistêmica desconhecida" SEM ler a
+    # coluna `error` do tracker — a autópsia morre cega. Com o fix, o motivo carrega
+    # os TOP-3 erros mais recentes DO CURSO (e só dele).
+    _tracker_com_erros(tmp_path, [
+        ("6278192", "audio_erro", "TimeoutError: chunk 3 do audio estourou 120s", 100.0),
+        ("6278192", "audio_erro", "HTTP 429 rate limit", 200.0),
+        ("6278192", "erro", "player nao encontrado na aula 7", 300.0),
+        ("6278192", "erro", "erro ANTIGO fora do top-3", 50.0),
+        ("999", "erro", "erro de OUTRO curso", 400.0),
+    ])
+    o = _obito(exit_code=4, curso="https://hotmart.com/pt/x/products/6278192/agent",
+               stderr=_ABORT_CIRCUIT_BREAKER)
+    d = causa.classificar(o, tracker_dir=str(tmp_path))
+    assert d.acao == "escalar_humano", d           # a AÇÃO não muda (fail-closed honesto)
+    assert d.fonte == "deterministico", d
+    # DENTES: o motivo agora carrega os erros REAIS (top-3 por recência), do curso certo
+    assert "player nao encontrado na aula 7" in d.motivo, d
+    assert "HTTP 429 rate limit" in d.motivo, d
+    assert "TimeoutError: chunk 3" in d.motivo, d
+    assert "fora do top-3" not in d.motivo, d      # limite 3, por recência
+    assert "OUTRO curso" not in d.motivo, d        # só o curso do óbito
+
+
+def test_exit4_sem_tracker_cai_no_motivo_generico(tmp_path):
+    # Fail-safe: sem tracker.db legível, o motivo generico de hoje se mantém (não
+    # levanta, não inventa) — e NADA é criado em disco (leitura mode=ro).
+    o = _obito(exit_code=4, curso="https://hotmart.com/pt/x/products/111/",
+               stderr=_ABORT_CIRCUIT_BREAKER)
+    d = causa.classificar(o, tracker_dir=str(tmp_path))
+    assert d.acao == "escalar_humano", d
+    assert "desconhecida" in d.motivo, d
+    assert not os.path.exists(os.path.join(str(tmp_path), "tracker.db"))
+
+
+def test_exit4_curso_sem_product_id_cai_no_motivo_generico(tmp_path):
+    # URL sem /products/<id> (ex.: Stoa/Memberkit): não há como resolver o course_id
+    # do tracker Hotmart — cai no genérico, sem levantar.
+    _tracker_com_erros(tmp_path, [("111", "erro", "irrelevante", 1.0)])
+    d = causa.classificar(_obito(exit_code=4, curso="https://minha.memberkit.com.br/9",
+                                 stderr=_ABORT_CIRCUIT_BREAKER),
+                          tracker_dir=str(tmp_path))
+    assert d.acao == "escalar_humano", d
+    assert "desconhecida" in d.motivo, d
+
+
+def test_exit4_erros_do_tracker_nao_mudam_a_acao_nem_viram_reseed(tmp_path):
+    # INVARIANTE: um erro do tracker que CITA sessão/login NÃO pode reclassificar o
+    # exit-4 (o texto vai pro MOTIVO, observabilidade; a ação segue escalar_humano).
+    _tracker_com_erros(tmp_path, [
+        ("6278192", "erro", "redirecionado pro login ao abrir a aula", 100.0)])
+    o = _obito(exit_code=4, curso="https://x.com/products/6278192/",
+               stderr=_ABORT_CIRCUIT_BREAKER)
+    d = causa.classificar(o, tracker_dir=str(tmp_path))
+    assert d.acao == "escalar_humano", d           # NÃO virou reseed pelo texto do tracker

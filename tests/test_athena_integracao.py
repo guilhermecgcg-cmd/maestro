@@ -374,3 +374,84 @@ def test_morte_real_limpa_cooldown_herdado_de_saida_limpa(tmp_path):
     assert estado[C1].get("irredutivel") is True           # DENTES: escalou como morte
     assert not estado[C1].get("cooldown_ate")              # cooldown herdado foi limpo
     assert alr.sessoes == ["hotmart"]
+
+
+# ==========================================================================
+# FIX 1 (observabilidade da autópsia) — a autópsia em disco tem de gravar o
+# PORQUÊ: a Decisao da causa-raiz (acao/motivo/fonte) + plataforma. Sem isso,
+# toda morte lida depois (sitrep/humano) via .get() vê None -> "causa
+# desconhecida" mesmo quando a causa foi classificada na hora.
+# ==========================================================================
+import glob as _glob
+import json as _json
+import os as _os
+import sqlite3 as _sqlite3
+
+
+def _autopsias(tmp_path):
+    recs = []
+    for p in sorted(_glob.glob(str(tmp_path / "aut" / "*.json"))):
+        with open(p) as f:
+            recs.append(_json.load(f))
+    return recs
+
+
+def test_autopsia_grava_causa_motivo_fonte_e_plataforma(tmp_path):
+    # RED-first: hoje o JSON da autópsia só tem o material bruto (exit_code/stderr);
+    # a Decisao classificada NUNCA chega ao disco -> leitura vê None/"desconhecida".
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1000.0, **common)
+    ex.matar(C1, exit_code=-9, stderr="Killed: 9")          # SIGKILL -> causa 'relancar'
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1100.0, **common)
+    recs = _autopsias(tmp_path)
+    assert recs, "a morte tem de gravar autópsia"
+    rec = recs[-1]
+    # DENTES: a Decisao classificada está NO DISCO (leitura .get() nunca mais vê None)
+    assert rec.get("causa") == "relancar", rec
+    assert rec.get("acao") == "relancar", rec
+    assert rec.get("fonte") == "deterministico", rec
+    assert rec.get("plataforma") == "hotmart", rec
+    assert rec.get("motivo") and rec.get("detalhe"), rec    # o PORQUÊ legível
+    assert rec.get("stderr_tail") == "Killed: 9", rec       # material bruto NÃO regrediu
+    assert rec.get("exit_code") == -9, rec
+
+
+def test_autopsia_exit4_grava_erros_reais_do_tracker(tmp_path, monkeypatch):
+    # RED-first (fim-a-fim do FIX 1): a PRÓXIMA morte exit-4 grava "causa: <erro real>"
+    # — o motivo enriquecido com a coluna `error` do tracker (SQLite mode=ro) chega ao
+    # JSON da autópsia via o default de produção (ATHENA_MOTOR_DIR).
+    motor_dir = tmp_path / "motor"
+    motor_dir.mkdir()
+    con = _sqlite3.connect(str(motor_dir / "tracker.db"))
+    con.execute("""CREATE TABLE lessons(
+        course_id TEXT, order_idx INTEGER, url TEXT, status TEXT,
+        notion_page_id TEXT, error TEXT, updated_at REAL)""")
+    con.execute("INSERT INTO lessons VALUES ('111',1,'u','audio_erro',NULL,"
+                "'TimeoutError REAL: chunk 3 estourou 120s',100.0)")
+    con.commit()
+    con.close()
+    monkeypatch.setenv("ATHENA_MOTOR_DIR", str(motor_dir))
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})                      # C1 tem /products/111
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1000.0, **common)
+    ex.matar(C1, exit_code=4, stderr="RUN INTERROMPIDO POR EXCESSO DE FALHAS")
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1100.0, **common)
+    recs = _autopsias(tmp_path)
+    assert recs
+    rec = recs[-1]
+    assert rec.get("causa") == "escalar_humano", rec
+    # DENTES: o erro REAL do tracker está gravado na autópsia (não "desconhecida" cega)
+    assert "TimeoutError REAL: chunk 3" in (rec.get("detalhe") or ""), rec

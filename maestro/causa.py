@@ -29,7 +29,9 @@ reproduziria a morte). A palavra "sessão" isolada NÃO é sinal: o motor a loga
 normal ("sessão viva/persistida") e o abort por excesso de falhas a cita como HIPÓTESE —
 casá-la solta era o falso "Sessão expirou" que benchava o curso de vez (bug corrigido).
 """
+import os
 import re
+import sqlite3
 from dataclasses import dataclass
 
 
@@ -135,7 +137,67 @@ _RE_TRANSITORIO = re.compile(
 _EXIT_SIGKILL = {-9, 137}
 
 
-def _deterministico(obito):
+# --------------------------------------------------------------------------
+# Enriquecimento do exit-4 com os erros REAIS do tracker (observabilidade).
+#
+# O exit 4 é, POR CONSTRUÇÃO, "excesso de falhas de causa desconhecida" — mas o
+# tracker do motor GRAVA o erro de cada aula que falhou (coluna `error` de
+# `lessons`). Ler os top-N mais recentes do curso e colá-los no MOTIVO transforma
+# a autópsia cega ("causa sistêmica desconhecida") em "causa: <erro real>" — sem
+# mudar a AÇÃO (segue escalar_humano, fail-closed honesto: reclassificar pela
+# prosa do tracker reabriria a porta dos falsos reseed/token).
+# --------------------------------------------------------------------------
+# Onde mora o tracker.db: o motor_dir do daemon (mesmo default do
+# athena_local.main). Injetável nos testes via `classificar(tracker_dir=...)`.
+_MOTOR_DIR_PADRAO = "/Users/guilhermerodrigues/teste/aula"
+_ERROS_TRACKER_LIMITE = 3            # top-3 erros recentes no motivo
+_ERRO_TRUNCA = 160                   # truncagem por erro (o motivo vai p/ alerta/JSON)
+
+
+def _course_id_de_url(curso_url):
+    """product-id Hotmart do trecho `/products/<id>` da URL — replicado (de
+    propósito) de `adaptadores.captura._course_id_de_url`, para a causa não
+    acoplar à cadeia de imports do executor (mesmo padrão do `vigia._pid_vivo`).
+    None quando a URL não tem o trecho (Stoa/Memberkit: sem enriquecimento)."""
+    if not curso_url:
+        return None
+    achados = re.findall(r"/products/([^/?#]+)", str(curso_url))
+    return achados[-1] if achados else None
+
+
+def _erros_recentes_tracker(curso_url, tracker_dir=None,
+                            limite=_ERROS_TRACKER_LIMITE):
+    """Top-`limite` erros mais RECENTES do curso, lidos de `{tracker_dir}/tracker.db`
+    em SQLite READ-ONLY (uri `mode=ro` + busy_timeout — padrão de
+    `captura._pendencias_tracker`: NÃO muta e NÃO trava o motor vivo; o WAL permite
+    leitura concorrente). `tracker_dir=None` resolve pelo env ATHENA_MOTOR_DIR (o
+    mesmo do daemon). Devolve [] em QUALQUER erro (db ausente, course_id não
+    resolve, SQL) — observabilidade JAMAIS derruba a classificação."""
+    course_id = _course_id_de_url(curso_url)
+    if not course_id:
+        return []
+    if tracker_dir is None:
+        tracker_dir = os.getenv("ATHENA_MOTOR_DIR", _MOTOR_DIR_PADRAO)
+    db_path = os.path.join(str(tracker_dir), "tracker.db")
+    if not os.path.exists(db_path):
+        return []
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        linhas = con.execute(
+            "SELECT error FROM lessons WHERE course_id=? AND error IS NOT NULL "
+            "AND error != '' ORDER BY updated_at DESC LIMIT ?",
+            (course_id, int(limite))).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        if con is not None:
+            con.close()
+    return [str(e)[:_ERRO_TRUNCA] for (e,) in linhas if e]
+
+
+def _deterministico(obito, tracker_dir=None):
     """Devolve (acao, motivo) se bater numa assinatura conhecida; None se DESCONHECIDA."""
     err = obito.stderr_tail or ""
     code = obito.exit_code
@@ -168,6 +230,18 @@ def _deterministico(obito):
     #        heurística de prosa para a palavra "sessão" do abort nunca reativar o
     #        falso reseed.
     if code == _EXIT_CIRCUIT_BREAKER:
+        #        OBSERVABILIDADE: o motivo carrega os erros REAIS do tracker (a
+        #        coluna `error` das aulas que falharam) — "causa: <erro real>" em
+        #        vez do cego "desconhecida". A AÇÃO não muda: reclassificar pela
+        #        prosa do tracker reabriria os falsos reseed/token (as regexes de
+        #        sessão/token operam sobre o STDERR do processo, não sobre o
+        #        histórico do tracker).
+        erros = _erros_recentes_tracker(getattr(obito, "curso", None), tracker_dir)
+        if erros:
+            return "escalar_humano", (
+                "circuit-breaker por excesso de falhas (exit 4); erros recentes "
+                "do tracker: " + " | ".join(erros) +
+                " — humano decide; NÃO é sessão morta")
         return "escalar_humano", (
             "circuit-breaker por excesso de falhas (exit 4): causa sistêmica "
             "desconhecida — humano inspeciona o tracker; NÃO é sessão morta")
@@ -246,11 +320,13 @@ def _parse_acao_llm(resp: str):
     return None                         # zero ou ambíguo -> fail-closed
 
 
-def classificar(obito, llm=None):
+def classificar(obito, llm=None, tracker_dir=None):
     """Classifica um `Obito` numa `Decisao`. `llm` é o seam do diagnosticador (callable
     prompt->texto); None => nenhum LLM disponível => fail-closed em escalar_humano quando
-    a causa é desconhecida. Produção passa `llm=seam_claude_p`."""
-    det = _deterministico(obito)
+    a causa é desconhecida. Produção passa `llm=seam_claude_p`. `tracker_dir` aponta o
+    diretório do tracker.db p/ enriquecer o motivo do exit-4 (None => env
+    ATHENA_MOTOR_DIR, o default do daemon)."""
+    det = _deterministico(obito, tracker_dir=tracker_dir)
     if det is not None:
         acao, motivo = det
         return Decisao(acao=acao, motivo=motivo, fonte="deterministico")

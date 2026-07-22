@@ -290,6 +290,36 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     st["fase"] = FASE_NOVO
 
 
+def _anotar_causa_na_autopsia(obito, decisao, plataforma):
+    """OBSERVABILIDADE da autópsia: anota a `Decisao` classificada (acao/motivo/fonte)
+    + plataforma NO JSON da autópsia já gravado pelo vigia (via `obito.autopsia_path`).
+    Grava as chaves nos DOIS vocabulários — `acao`/`motivo` (da Decisao) e
+    `causa`/`detalhe` (o que os leitores da autópsia buscam via .get()) — para a
+    próxima morte nunca mais ler "causa desconhecida" quando a causa FOI classificada.
+    Best-effort: um erro aqui JAMAIS derruba o ciclo (troca atômica tmp+replace,
+    mesmo padrão do vigia; preserva todas as chaves existentes, ex.: stderr_tail)."""
+    path = getattr(obito, "autopsia_path", "") or ""
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        acao = getattr(decisao, "acao", None)
+        motivo = getattr(decisao, "motivo", "") or ""
+        rec["acao"] = acao
+        rec["causa"] = acao
+        rec["motivo"] = motivo
+        rec["detalhe"] = motivo
+        rec["fonte"] = getattr(decisao, "fonte", "") or ""
+        rec["plataforma"] = plataforma
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
                      autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None):
     """Passe de AUTÓPSIA do ciclo: drena os óbitos do executor, roda o vigia (que também
@@ -318,6 +348,11 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
             decisao = causa.classificar(obito, llm=llm)
         except Exception:
             decisao = None
+        # FIX de observabilidade: a Decisao classificada vai PRO DISCO, no JSON da
+        # autópsia desta morte — senão toda leitura posterior vê "causa desconhecida".
+        if decisao is not None:
+            _anotar_causa_na_autopsia(
+                obito, decisao, _plataforma_de(curso, meta_por_curso))
         # E14: custo do diagnóstico `claude -p`. O seam só é consultado quando a
         # causa NÃO bateu numa assinatura determinística (fonte != "deterministico");
         # com `llm` ligado, isso significa que houve UMA chamada headless — custo

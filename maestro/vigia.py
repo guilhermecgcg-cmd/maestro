@@ -28,7 +28,7 @@ import glob
 import json
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime
 from typing import Optional
 
@@ -72,7 +72,13 @@ class Obito:
     encerrou), mas NÃO é um evento de flap: não conta na janela nem grava autópsia (o
     diretório de autópsias é de MORTES). Distinguir os dois é o que impede um curso já
     100% capturado — que a cada disparo injeta a sessão, roda e sai 0 — de ser contado
-    como 'morte' e disparar o falso alarme 'FLAP: N mortes na janela'."""
+    como 'morte' e disparar o falso alarme 'FLAP: N mortes na janela'.
+
+    `autopsia_path`: caminho do JSON de autópsia GRAVADO para esta morte ("" quando
+    nada foi gravado — saída limpa). É o gancho da OBSERVABILIDADE: quem classifica a
+    causa depois (athena_local._autopsiar_ciclo -> causa.classificar) usa este path
+    para ANOTAR a Decisao (acao/motivo/fonte/plataforma) no MESMO arquivo — sem ele, a
+    autópsia em disco fica cega ('causa desconhecida') mesmo com a causa classificada."""
     conta: str
     curso: str
     exit_code: Optional[int]
@@ -80,6 +86,7 @@ class Obito:
     flaps_na_janela: int
     ts: str = ""                 # ISO-8601 do momento da autópsia
     saida_limpa: bool = False    # exit_code == 0: encerrou LIMPO, NÃO é morte
+    autopsia_path: str = ""      # JSON gravado desta morte (p/ anotar a causa depois)
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +210,7 @@ def _slug(conta) -> str:
 def _gravar_autopsia(autopsia_dir, obito: Obito, ts_epoch: float, detectado_por: str):
     os.makedirs(autopsia_dir, exist_ok=True)
     rec = asdict(obito)
+    rec.pop("autopsia_path", None)        # o arquivo não aponta para si mesmo
     rec["ts_epoch"] = ts_epoch
     rec["detectado_por"] = detectado_por
     carimbo = datetime.fromtimestamp(ts_epoch).strftime("%Y%m%dT%H%M%S_%f")
@@ -276,8 +284,11 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
         flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) + 1
         obito = Obito(conta=conta, curso=curso, exit_code=fonte.exit_code,
                       stderr_tail=stderr_tail, flaps_na_janela=flaps, ts=ts_iso)
-        _gravar_autopsia(autopsia_dir, obito, ts_epoch=agora, detectado_por=detectado_por)
-        obitos.append(obito)
+        path = _gravar_autopsia(autopsia_dir, obito, ts_epoch=agora,
+                                detectado_por=detectado_por)
+        # O Obito devolvido CARREGA o path da autópsia gravada — é o gancho para o
+        # chamador anotar a causa classificada no MESMO arquivo (observabilidade).
+        obitos.append(replace(obito, autopsia_path=path))
     return obitos
 
 

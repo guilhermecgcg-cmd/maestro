@@ -792,3 +792,166 @@ def test_pendencias_tracker_none_fail_open(tmp_path):
     # cria db vazio mas passa URL sem product-id => course_id não resolve => None
     (tmp_path / "tracker.db").write_bytes(b"")
     assert captura._pendencias_tracker("http://x/sem-produto", str(tmp_path)) is None
+
+
+# ==========================================================================
+# RODÍZIO DE PASSES DA STOA (ativação das 3 ferramentas). Espelha o rodízio
+# do Hotmart: 1 passe por disparo, escolhido por demanda, anel anti-fome —
+# e o ANTI-BAN nunca cede (1 motor por conta; o rodízio muda só o argv).
+# Os passes novos (embed/nao-video) são GATED por ATHENA_STOA_PASSES_ATIVO:
+# desligado => comportamento vivo de hoje (só base áudio-nativo).
+# (Reusa o STOA e o helper `_stoa(conta=...)` do topo do módulo.)
+# ==========================================================================
+def _stoa2(url):
+    """2º curso na MESMA conta stoa (patológico, p/ o dente anti-ban)."""
+    return captura.CursoLocal(url=url, conta="stoa", plataforma="stoa")
+
+
+def test_stoa_sem_flag_roda_so_base_mesmo_com_sem_audio_pendente(monkeypatch):
+    """GATE: sem ATHENA_STOA_PASSES_ATIVO, a Stoa NÃO dispara --embed/--nao-video
+    mesmo com 178 sem_audio pendentes — cai na sonda `base` (o vivo de hoje).
+    A ativação é deliberada (flag + restart guardado), nunca acidental."""
+    monkeypatch.delenv("ATHENA_STOA_PASSES_ATIVO", raising=False)
+    sp = FakeSpawn()
+    conf = _exec(_stoa(), spawn=sp,
+                 pendencias_fn=_pend(embed=178, **{"nao-video": 4})).disparar(STOA)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.stoa", STOA]   # base = SEM flag
+    assert conf.endswith(":passe=base")
+
+
+def test_stoa_com_flag_dispara_embed_quando_ha_sem_audio(monkeypatch):
+    """DENTE: com a flag ligada e sem_audio pendente, o passe `embed` roda `--embed`
+    — é o que torna as 178 sem_audio re-selecionáveis (o motor separa embed-externo
+    de doc/texto)."""
+    monkeypatch.setenv("ATHENA_STOA_PASSES_ATIVO", "1")
+    sp = FakeSpawn()
+    conf = _exec(_stoa(), spawn=sp, pendencias_fn=_pend(embed=178)).disparar(STOA)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.stoa", STOA, "--embed"]
+    assert conf.endswith(":passe=embed")
+
+
+def test_stoa_com_flag_dispara_nao_video_quando_ha_sem_embed(monkeypatch):
+    """DENTE: com a flag ligada e sem_embed pendente (docs confirmados pelo --embed),
+    o passe `nao-video` roda `--nao-video` (doc→Notion)."""
+    monkeypatch.setenv("ATHENA_STOA_PASSES_ATIVO", "1")
+    sp = FakeSpawn()
+    conf = _exec(_stoa(), spawn=sp,
+                 pendencias_fn=_pend(**{"nao-video": 4})).disparar(STOA)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.stoa", STOA, "--nao-video"]
+    assert conf.endswith(":passe=nao-video")
+
+
+def test_stoa_rodizio_alterna_entre_passes_elegiveis(monkeypatch):
+    """ANTI-FOME: base E embed elegíveis => disparos sucessivos ALTERNAM (senão o
+    backlog de 178 sem_audio mataria de fome o base, ou vice-versa)."""
+    monkeypatch.setenv("ATHENA_STOA_PASSES_ATIVO", "1")
+    sp = FakeSpawn()
+    ex = _exec(_stoa(), spawn=sp, pendencias_fn=_pend(base=5, embed=178))
+    escolhidos = []
+    for _ in range(3):
+        conf = ex.disparar(STOA)
+        escolhidos.append(conf.rsplit("=", 1)[1])
+        sp.calls[-1]["proc"].encerrar(0)                  # encerra p/ liberar a conta
+        ex._reap()
+    assert escolhidos[0] != escolhidos[1]                 # alternou (anti-fome)
+    assert set(escolhidos) <= {"base", "embed"}
+
+
+def test_stoa_anti_ban_nunca_dois_motores_na_mesma_conta(monkeypatch):
+    """DENTE ANTI-BAN (INVIOLÁVEL): com pendência em vários passes, um 2º disparo na
+    conta stoa-principal enquanto o 1º motor vive é RECUSADO (ContaOcupada). O
+    rodízio jamais spawna um 2º passe em paralelo na Stoa."""
+    monkeypatch.setenv("ATHENA_STOA_PASSES_ATIVO", "1")
+    sp = FakeSpawn()
+    ex = _exec(_stoa2(STOA), _stoa2(STOA + "?b"), spawn=sp,
+               pendencias_fn=_pend(base=5, embed=178, **{"nao-video": 4}))
+    ex.disparar(STOA)
+    with pytest.raises(captura.ContaOcupada):
+        ex.disparar(STOA + "?b")                          # MESMA conta stoa-principal
+    assert len(sp.calls) == 1                             # 1 único motor na conta
+
+
+def test_stoa_idempotente_mesmo_curso_nao_respawna(monkeypatch):
+    """IDEMPOTÊNCIA: re-disparar o MESMO curso Stoa com o motor vivo devolve
+    ja_capturando sem abrir 2º processo (mesmo contrato do Hotmart)."""
+    monkeypatch.setenv("ATHENA_STOA_PASSES_ATIVO", "1")
+    sp = FakeSpawn()
+    ex = _exec(_stoa(), spawn=sp, pendencias_fn=_pend(embed=178))
+    ex.disparar(STOA)
+    assert ex.disparar(STOA) == f"ja_capturando:{STOA}"
+    assert len(sp.calls) == 1
+
+
+def test_pendencias_tracker_stoa_agrega_o_tenant_inteiro(tmp_path):
+    """O leitor default da Stoa agrega TODOS os course_ids do tracker (curso-único no
+    daemon; a URL não tem /products/) e bucketiza pelos pools PRÓPRIOS da Stoa:
+    sem_audio => embed (as 178), sem_embed => nao-video, pendente/transcrevendo =>
+    base. Terminais (no_notion/audio_erro/sem_conteudo) fora de tudo."""
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "tracker.db")
+    con.execute("CREATE TABLE lessons(hash TEXT PRIMARY KEY, course_id TEXT, status TEXT)")
+    linhas = [
+        ("h1", "stoa:educacao:9227", "sem_audio"),         # embed (candidata)
+        ("h2", "stoa:educacao:10389", "sem_audio"),        # embed (OUTRO curso: conta)
+        ("h3", "stoa:educacao:9227", "transcrevendo_embed"),  # embed (resume)
+        ("h4", "stoa:educacao:9224", "pendente"),          # base
+        ("h5", "stoa:educacao:9224", "transcrevendo"),     # base (resume)
+        ("h6", "stoa:educacao:10102", "sem_embed"),        # nao-video
+        ("h7", "stoa:educacao:9227", "no_notion"),         # terminal: fora
+        ("h8", "stoa:educacao:9227", "audio_erro"),        # terminal: fora
+        # DEFESA EM PROFUNDIDADE (achado do review): linhas de OUTRA plataforma no
+        # mesmo db (o fallback de motor_dir cairia no tracker do Hotmart) NÃO podem
+        # contaminar as contagens da Stoa — o filtro course_id LIKE 'stoa:%' exclui.
+        ("h9", "5431484", "sem_audio"),                    # Hotmart: fora
+        ("hA", "5431484", "sem_embed"),                    # Hotmart: fora
+    ]
+    con.executemany("INSERT INTO lessons VALUES(?,?,?)", linhas)
+    con.commit()
+    con.close()
+    pend = captura._pendencias_tracker_stoa(STOA, str(tmp_path))
+    assert pend == {"base": 2, "embed": 3, "nao-video": 1}
+
+
+def test_stoa_gate_desligado_nem_consulta_pendencias(monkeypatch):
+    """Com o gate desligado só existe 1 passe ativável (base): a escolha está
+    decidida e o executor NEM consulta pendências (caminho de execução idêntico
+    ao de antes da fiação multi-passe; achado do review). Um GRAVADOR de chamadas
+    prova que o leitor não é invocado (levantar não serviria de dente: o
+    `_escolher_passe` engole exceção do leitor como fail-open p/ rodízio cego)."""
+    monkeypatch.delenv("ATHENA_STOA_PASSES_ATIVO", raising=False)
+    chamadas = []
+    def _gravador(url, motor_dir):
+        chamadas.append(url)
+        return {"base": 0, "embed": 178, "nao-video": 0}
+    sp = FakeSpawn()
+    conf = _exec(_stoa(), spawn=sp, pendencias_fn=_gravador).disparar(STOA)
+    assert chamadas == []                                 # DENTE: leitor nem chamado
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.stoa", STOA]
+    assert conf.endswith(":passe=base")
+
+
+def test_pendencias_tracker_stoa_none_fail_open(tmp_path):
+    """None (=> rodízio cego) quando o db não existe — fail-open p/ RODÍZIO, nunca
+    p/ paralelismo (o anti-ban é o lock durável, não passa por aqui)."""
+    assert captura._pendencias_tracker_stoa(STOA, str(tmp_path)) is None
+
+
+def test_stoa_default_sem_injecao_usa_o_leitor_proprio(tmp_path, monkeypatch):
+    """FIAÇÃO DEFAULT: sem pendencias_fn injetado, a plataforma stoa resolve o leitor
+    PRÓPRIO (agregado) — não o do Hotmart (que devolveria None pela URL sem /products/
+    e cairia no rodízio cego). Com só sem_audio no tracker e a flag ligada, o disparo
+    real vai de `--embed` (determinístico, não cego)."""
+    monkeypatch.setenv("ATHENA_STOA_PASSES_ATIVO", "1")
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "tracker.db")
+    con.execute("CREATE TABLE lessons(hash TEXT PRIMARY KEY, course_id TEXT, status TEXT)")
+    con.execute("INSERT INTO lessons VALUES('h1','stoa:educacao:9227','sem_audio')")
+    con.commit()
+    con.close()
+    sp = FakeSpawn()
+    ex = _exec(_stoa(), spawn=sp,
+               motor_dir_por_plataforma={"stoa": str(tmp_path)})
+    conf = ex.disparar(STOA)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.stoa", STOA, "--embed"]
+    assert sp.calls[0]["cwd"] == str(tmp_path)            # cwd = worktree da Stoa
+    assert conf.endswith(":passe=embed")

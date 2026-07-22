@@ -402,10 +402,13 @@ class PlataformaSpec:
       - `passes`: a tupla de PASSES de trabalho que o motor desta plataforma sabe rodar,
         em ORDEM DE ANEL. Cada disparo escolhe UM passe (ver `LocalExecutor._escolher_passe`)
         e `_montar` anexa a flag correspondente (`_PASSE_FLAG`): base=sem flag,
-        audio=`--audio`, embed=`--embed`, nao-video=`--nao-video`. SÓ Hotmart (motor.cli)
-        tem os 4; os adaptadores áudio-nativos (memberkit/stoa/kajabi) ficam em `("base",)`
-        — NÃO conhecem flag nenhuma (passá-la seria argumento desconhecido), então para eles
-        a escolha de passe é um no-op (sempre "base", NADA muda no comando).
+        audio=`--audio`, embed=`--embed`, nao-video=`--nao-video`. Hotmart (motor.cli)
+        tem os 4; a STOA (motor.stoa, com as 3 ferramentas) tem `("base","embed",
+        "nao-video")` — o `base` dela JÁ é o áudio-nativo (modo default do CLI), então
+        não existe passe `audio` separado. Os demais adaptadores áudio-nativos
+        (memberkit/kajabi) ficam em `("base",)` — NÃO conhecem flag nenhuma (passá-la
+        seria argumento desconhecido), então para eles a escolha de passe é um no-op
+        (sempre "base", NADA muda no comando).
       - `headless`: True => HEADLESS=1 (Memberkit, áudio-nativo, roda cego); False =>
         HEADED (Hotmart/Stoa/Kajabi — a sonda de sessão e/ou a captura de áudio do
         player de vídeo falham headless).
@@ -436,7 +439,11 @@ class PlataformaSpec:
 #     channel=chrome. O passe é escolhido POR DEMANDA a cada disparo (o que tiver
 #     pendência no tracker), 1 passe por disparo — nunca 2 na mesma conta (anti-ban).
 #   - memberkit: adaptador próprio, áudio-nativo, HEADLESS, channel=chrome — só `base`.
-#   - stoa/kajabi: adaptadores próprios, áudio-nativo, HEADED, Chromium ISOLADO (perfil
+#   - stoa: adaptador próprio, HEADED, Chromium ISOLADO — RODÍZIO de 3 passes
+#     (base=áudio-nativo / embed=vídeo cross-plataforma / nao-video=doc→Notion), os 2
+#     novos GATED por ATHENA_STOA_PASSES_ATIVO (ver `_passe_ativavel`). Continua 1 motor
+#     por conta (o rodízio muda só o argv do único spawn — anti-ban intacto).
+#   - kajabi: adaptador próprio, áudio-nativo, HEADED, Chromium ISOLADO (perfil
 #     dedicado por conta) — nunca channel=chrome (colidiria com o Hotmart no singleton).
 _PLATAFORMAS = {
     # Hotmart FIXA seu perfil histórico `.chrome-profile` (o MESMO do launcher manual que
@@ -453,7 +460,8 @@ _PLATAFORMAS = {
     # os 3 injetam cookies e enumeram o próprio tenant), então perfil dedicado não perde login.
     "memberkit": PlataformaSpec("motor.memberkit", headless=True),
     "stoa": PlataformaSpec(
-        "motor.stoa", chromium=True, url_env="STOA_URL",
+        "motor.stoa", passes=("base", "embed", "nao-video"),
+        chromium=True, url_env="STOA_URL",
         env=(("CHROME_USER_DATA_DIR", ".chrome-profile-stoa"),
              ("LESSON_TIMEOUT_S", "1800"))),
     "kajabi": PlataformaSpec(
@@ -469,8 +477,10 @@ _PLATAFORMAS = {
 _ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
 
 
-# PASSE -> flag do motor.cli. `base` = passe de legenda/vídeo nativo (SEM flag). Os demais
-# ligam os seletores próprios do tracker (audio_pending/embed_pending/nao_video_pending).
+# PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 4) E pela Stoa
+# (motor.stoa: base/--embed/--nao-video). `base` = passe default SEM flag (legenda/vídeo
+# nativo no Hotmart; áudio-nativo na Stoa). Os demais ligam os seletores próprios do
+# tracker de cada motor (audio/embed/nao_video_pending; pools Stoa: _PENDING_POR_MODO).
 _PASSE_FLAG = {"base": None, "audio": "--audio", "embed": "--embed", "nao-video": "--nao-video"}
 
 # ESPELHO de motor/tracker.py::PENDING_EXCLUDED — a FONTE-VERDADE vive lá; o executor NÃO
@@ -486,6 +496,20 @@ _PENDING_EXCLUDED = (
 _STATUSES_POR_PASSE = {
     "audio": ("sem_legenda", "transcrevendo"),
     "embed": ("sem_video", "transcrevendo_embed"),
+    "nao-video": ("sem_embed", "capturando_nao_video"),
+}
+
+# ESPELHO de motor/stoa/pipeline.py::_PENDING_POR_MODO (a FONTE-VERDADE vive lá; mesmo
+# contrato de espelho do Hotmart acima). Na Stoa os pools DIFEREM do Hotmart:
+#   - `base` é o áudio-nativo (modo default do CLI): pendente + transcrevendo (resume);
+#   - `embed` re-visita as `sem_audio` (o braço de áudio não achou player Hotscool —
+#     pode ser embed externo OU doc/texto; o passe --embed é quem separa) — é o pool
+#     que torna as 178 sem_audio históricas re-selecionáveis;
+#   - `nao-video` pega as `sem_embed` (confirmadas doc/texto pelo --embed) + resume.
+# Se `_PENDING_POR_MODO` mudar no pipeline da Stoa, ESTE mapa muda junto (contrato).
+_STOA_STATUSES_POR_PASSE = {
+    "base": ("pendente", "transcrevendo"),
+    "embed": ("sem_audio", "transcrevendo_embed"),
     "nao-video": ("sem_embed", "capturando_nao_video"),
 }
 
@@ -537,12 +561,66 @@ def _pendencias_tracker(curso_url, motor_dir):
     return pend
 
 
-def _passe_ativavel(passe):
-    """Um passe pode ser DISPARADO? `nao-video` fica DESLIGADO por default: seu braço de
-    processamento (doc->Notion) é a remediação #2 e AINDA não existe — dispará-lo hoje só
-    gera saída-limpa-sem-avanço (e cooldown de 6h que trava o curso). Fica WIRED (flag,
-    _montar, CLI) e liga com `ATHENA_NAO_VIDEO_ATIVO` quando #2 entregar o braço, SEM
-    tocar código. Os demais passes são sempre ativáveis."""
+def _pendencias_tracker_stoa(curso_url, motor_dir):
+    """Leitor de pendências da STOA: lê `{motor_dir}/tracker.db` (o do worktree
+    adaptador-stoa, via ATHENA_MOTOR_DIR_STOA) em SQLite READ-ONLY e devolve
+    {passe: qtd_pendente} pelos pools de `_STOA_STATUSES_POR_PASSE`.
+
+    DIFERE do leitor Hotmart em DOIS pontos, ambos de propósito:
+      - SEM course_id específico (a Stoa é curso-único no daemon — 1 CursoLocal
+        "meus-cursos", conta stoa-principal — e a URL não tem `/products/<id>`; o
+        run do motor enumera o tenant INTEIRO, 18 course_ids, então agregar todos
+        é exatamente o trabalho que o próximo disparo verá), MAS filtrando
+        `course_id LIKE 'stoa:%'` — o prefixo é CONTRATO do motor
+        (motor/stoa/enumerate.py: `stoa:<subdominio>:<id>`, "impede colisão com
+        Hotmart/Memberkit"). Defesa em profundidade (achado do review): se
+        ATHENA_MOTOR_DIR_STOA sumir do env, `_motor_dir_de` cai CALADO no
+        motor_dir genérico (/aula, o do Hotmart), cujo tracker tem
+        sem_audio/sem_embed de outras plataformas — sem o filtro, o rodízio da
+        Stoa decidiria passes com pendências ALHEIAS, plausível e errado. Com o
+        filtro, esse fallback rende contagens 0 => sonda `base` (benigno);
+      - pools próprios (`sem_audio` no papel de candidata a embed, ver o espelho).
+    Devolve None em QUALQUER erro (db ausente/SQL) — rodízio CEGO (fail-open p/
+    RODÍZIO, jamais p/ paralelismo; o anti-ban não passa por aqui)."""
+    db_path = os.path.join(motor_dir, "tracker.db")
+    if not os.path.exists(db_path):
+        return None
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        linhas = con.execute(
+            "SELECT status, COUNT(*) FROM lessons "
+            "WHERE course_id LIKE 'stoa:%' GROUP BY status").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        if con is not None:
+            con.close()
+    por_status = {s: n for (s, n) in linhas}
+    return {passe: sum(por_status.get(s, 0) for s in statuses)
+            for passe, statuses in _STOA_STATUSES_POR_PASSE.items()}
+
+
+# Leitor de pendências DEFAULT por plataforma (só consultado quando nenhum
+# `pendencias_fn` foi injetado): a Stoa agrega o tracker do worktree pelos pools
+# próprios; as demais multi-passe (Hotmart) usam o leitor por course_id.
+_PENDENCIAS_PADRAO = {"stoa": _pendencias_tracker_stoa}
+
+
+def _passe_ativavel(passe, plataforma="hotmart"):
+    """Um passe pode ser DISPARADO? Gates de ativação POR FLAG (mesmo mecanismo p/ todos:
+    o código fica WIRED e a operação liga por env + restart guardado, sem tocar código):
+      - STOA: os passes NOVOS (`embed`/`nao-video` — vídeo cross-plataforma e doc→Notion,
+        as ferramentas 2 e 3) ligam JUNTOS com `ATHENA_STOA_PASSES_ATIVO`. Desligado =>
+        comportamento vivo de hoje (só o `base` áudio-nativo) — nada muda até a ativação
+        deliberada. O gate NÃO afeta o anti-ban (1 motor/conta é o lock durável).
+      - Hotmart: `nao-video` liga com `ATHENA_NAO_VIDEO_ATIVO` (o gate original do braço
+        doc->Notion da remediação #2). Os demais passes são sempre ativáveis."""
+    if plataforma == "stoa":
+        if passe in ("embed", "nao-video"):
+            return bool(os.getenv("ATHENA_STOA_PASSES_ATIVO"))
+        return True
     if passe == "nao-video":
         return bool(os.getenv("ATHENA_NAO_VIDEO_ATIVO"))
     return True
@@ -689,10 +767,12 @@ class LocalExecutor:
         self._meta = {c.url: c for c in cursos}
         self._motor_python = motor_python
         self._motor_dir = motor_dir
-        # SEAM da escolha de passe: lê pendências do tracker por curso p/ decidir QUAL
-        # passe rodar. Default = `_pendencias_tracker` (SQLite read-only). Injetável nos
-        # testes. None em qualquer erro => round-robin cego (fail-open p/ rodízio).
-        self._pendencias_fn = pendencias_fn or _pendencias_tracker
+        # SEAM da escolha de passe: lê pendências do tracker p/ decidir QUAL passe rodar.
+        # Injetável nos testes (o injetado vale p/ TODAS as plataformas). Sem injeção
+        # (None), o default é resolvido POR PLATAFORMA no `_escolher_passe` (Hotmart =
+        # `_pendencias_tracker` por course_id; Stoa = `_pendencias_tracker_stoa` agregado).
+        # None em qualquer erro => round-robin cego (fail-open p/ rodízio).
+        self._pendencias_fn = pendencias_fn
         # Cursor do ANEL de passes POR CONTA (anti-fome: alterna entre os passes elegíveis
         # em vez de fixar sempre o 1º). In-memory: perda no restart é benigna (recomeça do
         # início do anel). NÃO afeta o anti-ban (o guard é o lock durável em disco).
@@ -914,9 +994,17 @@ class LocalExecutor:
         passes = spec.passes if spec is not None else ("base",)
         if len(passes) == 1:
             return passes[0]                               # áudio-nativos: NADA muda
-        ativaveis = [p for p in passes if _passe_ativavel(p)]
+        ativaveis = [p for p in passes if _passe_ativavel(p, meta.plataforma)]
+        if len(ativaveis) == 1:
+            # Um único passe ativável (ex.: Stoa com o gate ATHENA_STOA_PASSES_ATIVO
+            # desligado => só "base"): a escolha está decidida — NÃO consulta pendências
+            # (poupa a query SQLite e mantém o caminho de execução IDÊNTICO ao de antes
+            # da fiação multi-passe enquanto o gate não liga; achado do review).
+            return ativaveis[0]
+        fn = self._pendencias_fn or _PENDENCIAS_PADRAO.get(
+            meta.plataforma, _pendencias_tracker)
         try:
-            pend = self._pendencias_fn(meta.url, self._motor_dir_de(meta.plataforma))
+            pend = fn(meta.url, self._motor_dir_de(meta.plataforma))
         except Exception:
             pend = None
         if pend is None:
@@ -950,8 +1038,10 @@ class LocalExecutor:
         motor_dir = self._motor_dir_de(meta.plataforma)
         cmd = [self._motor_python, "-m", spec.modulo, meta.url]
         # FLAG DO PASSE escolhido (`_escolher_passe`): base=sem flag; audio=--audio;
-        # embed=--embed; nao-video=--nao-video. SÓ Hotmart (motor.cli) tem passes != base;
-        # os adaptadores áudio-nativos ficam em ("base",) => flag None => comando inalterado
+        # embed=--embed; nao-video=--nao-video. Hotmart (motor.cli) tem os 4 passes; a
+        # Stoa (motor.stoa) tem base/embed/nao-video (o CLI dela conhece --embed e
+        # --nao-video, grupo mutuamente exclusivo, default áudio-nativo = base). Os
+        # áudio-nativos restantes ficam em ("base",) => flag None => comando inalterado
         # (passar-lhes uma flag seria argumento desconhecido do módulo errado).
         flag = _PASSE_FLAG.get(passe)
         if flag:

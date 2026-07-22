@@ -305,3 +305,77 @@ de estado dos sistemas (I-1: prova em arquivo, não relato).
 3. **Cadência default:** `sob_demanda` (proposto — cada run custa) ou agendada.
 4. **Flip de `calibrado_por_tipo`:** sempre dele, após K=5 (F5).
 5. **Migração R1 (24/7 na VPS):** só ele, quando um sistema real exigir (F8).
+
+---
+
+## §I. Implementação ENTREGUE (F4-e/F4-f) — status real
+
+> O design §E/§F acima passou de "a implementar" para IMPLEMENTADO. Esta seção é
+> o registro honesto do que foi construído, como foi provado, e o que ficou por
+> ligar. Provas rodadas AGORA (não relato): **maestro 529 verdes** (era 517 —
+> +12 aditivos, 0 regressão) e **fábrica 212 verdes** (era 205 — +7).
+
+### I.1 Fábrica (branch `f4-entrypoint`)
+
+- `sintetizador/construtor/pedido_store.py` (NOVO): persiste/carrega o
+  `PedidoConstrucao` em `construcao/pedidos/<slug(ref)>.json`. A **etapa NÃO é
+  persistida** — é re-derivada do `plano/system_plan.json` na reconstrução (fonte-
+  verdade; um pedido velho nunca prende uma edição de plano).
+- `pipeline.py` (aditivo): campo `PedidoConstrucao.feedback` (default `""`,
+  threaded ao subagente classe B); o E6, no SUCESSO, chama `salvar_pedido` —
+  persistir é pré-requisito da porta de reconstrução.
+- `sintetizador/reconstruir_etapa.py` (NOVO entrypoint): espelho do
+  `rodar_sistema`. `executar_reconstrucao` (seam testável) + `main` (produção).
+  Exit **0 pronto / 20 escalar / 40 crash**. Gates ANTES de construir: etapa do
+  plano (ausente→20), **decisão CRAVADA** (`DECISOES.md`, marcador
+  `nao-reconstruir: <etapa-id|tipo>`→20, sem construir), **pedido ausente**→20
+  ("não persistido", nunca build cego). `build-<id>.json` atômico, medido≠presumido.
+
+### I.2 Athena doméstica (branch `f4-core`)
+
+- `maestro/decisoes.py`: `gasto_do_dia_por_sistema` (F.1) — agrupa por
+  `reg["sistema"]` (None→`athena-geral`), medido/presumido SEPARADOS.
+- `maestro/adaptadores/sistema.py`: `disparar_build(slug, etapa, feedback_path)`,
+  `build_ativo(slug)`, `escrever_feedback`; lock ganha `tipo` (`run`|`build`) —
+  **mesmo lock do slug**, nunca build+run juntos. Builds são colhidos à parte
+  (o desfecho vem do `build-<id>.json`, jamais como óbito de `causa_sistema`).
+- `maestro/athena_local.py`:
+  - `_incidente_da_cauda(raiz, run_id)` lê a CAUDA do ledger (leitor tolerante
+    LOCAL, sem import cross-repo) e devolve a **trava REAL** — corrige o rótulo
+    fixo `irreversivel-externo` do `_registrar_desfecho_sistema` (§E.1.2). Dente
+    de regressão: com o literal antigo, `executor_ausente` viraria calibração e a
+    correção NUNCA dispararia (reprovei o commit antigo re-injetando o bug).
+  - Gatilhos: T1 (óbito 30/40 → etapa via heartbeat), T2/T3 (congelado →
+    trava da cauda). `_passo_engenharia` aplica **disjuntor de engenharia**
+    (1 ciclo/etapa/dia; 2ª falha do MESMO incidente → `escalar_humano`, nunca 3º
+    build) + **gate D5** antes do `disparar_build`. `_observar_build` fecha o laço
+    (pronto→custo da reescrita `origem="athena/reescrita"` + re-run; escalou→
+    brainstorm-gate). Incidente fechado quando o re-run aprova.
+  - `_gate_d5`: soma conservadora medido+presumido só para o teto; `alerta`
+    (default) registra+alerta e DISPARA (latch 1×/dia/sistema); `pausa` bloqueia
+    **mas preserva o incidente/pedido pendente** (never-stop — re-tenta quando o
+    teto reabrir).
+
+### I.3 Desvios/decisões de implementação (não no design original)
+
+- **Marcador `DECISOES.md`:** o design pedia "consulta DECISOES.md" sem formato;
+  cravei um marcador machine-readable `nao-reconstruir: <ids/tipos>`
+  (case-insensitive), testável, conservador (arquivo ausente/ilegível não barra
+  — a decisão cravada só existe se escrita).
+- **T1 sem etapa** (exit 30 PlanoInvalido antes de qualquer etapa): não há etapa
+  reconstruível → brainstorm-gate + escalada (re-síntese é F6), nunca um build cego.
+- **D5 pausa preserva pendências:** `eng_pendente` e um `pedido_run` explícito
+  sobrevivem ao bloqueio (correção achada no próprio gate POP — sem ela, um
+  incidente em modo pausa seria descartado silenciosamente).
+
+### I.4 O que FICOU por ligar (honesto)
+
+- **/sitrep seção "sistemas gerados" (§F.3/A7):** o AGREGADOR de dados existe
+  (`gasto_do_dia_por_sistema` + `resumo_do_dia` filtrado + arquivos de estado),
+  mas a RENDERIZAÇÃO no comando `/sitrep` (skill própria) ainda não foi fiada.
+- **Seams REAIS de produção da reconstrução:** `reconstruir_etapa.main` resolve
+  `subagente_tdd/revisor_pop/rodar_teste_real` de `sintetizador.construtor.seams`
+  (as costuras reais do build classe B do F3b) — o seam testável
+  `executar_reconstrucao` é provado com fakes; a fiação de produção segue o F3b.
+- **Ativação:** ORDEM IV — nenhum restart forçado; ativa no próximo restart
+  natural, após o merge que só o usuário crava (§D.1).

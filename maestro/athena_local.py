@@ -557,8 +557,266 @@ def _resultado_mais_recente(raiz):
     return _ler_json_tolerante(cands[0])
 
 
+def _build_mais_recente(raiz):
+    """O `estado/build-*.json` mais novo (por mtime), ou None. Desfecho de uma
+    RECONSTRUÇÃO (F4-e); a Athena o observa por arquivo — nunca por óbito."""
+    import glob
+    d = os.path.join(str(raiz), "estado")
+    cands = glob.glob(os.path.join(d, "build-*.json"))
+    if not cands:
+        return None
+    cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return _ler_json_tolerante(cands[0])
+
+
+# ---------------------------------------------------------------------------
+# F4-e/F4-f — gatilhos de correção + prestação de contas por sistema.
+# ---------------------------------------------------------------------------
+# Modo do gate D5 (§F.2): 'alerta' (default, ordem do usuário 22/07 — registra +
+# alerta e DISPARA) | 'pausa' (não dispara). O flip para 'pausa' é decisão do usuário.
+_BUDGET_MODO = os.getenv("ATHENA_BUDGET_MODO", "alerta")
+# Proxy de custo do brainstorm `claude -p` antes de escalar — SEMPRE medido=False
+# (regra inviolável nº2: jamais somar presumido com medido).
+_CUSTO_PROXY_BRAINSTORM_USD = float(os.getenv("ATHENA_CUSTO_PROXY_BRAINSTORM_USD", "0.05"))
+
+# Classes de trava do ledger que são DEFEITO DE ENGENHARIA → reconstruir (§E.1).
+_TRAVAS_ENGENHARIA = frozenset({
+    "executor_ausente", "desconhecida", "reprovacao_esgotada",
+    "erro_nao_classificado", "indeterminado_esgotado", "timeout_repetido"})
+# NÃO-defeito: calibração D2 pendente — alerta 1×, NENHUMA reescrita.
+_TRAVAS_NAO_DEFEITO = frozenset({"irreversivel-externo"})
+# Budget: não-engenharia (re-run só sob disjuntor+D5; reincidente → retro-síntese F6).
+_TRAVAS_BUDGET = frozenset({"budget", "custo_teto"})
+
+
+def _dia_local_ts(agora) -> str:
+    """Dia LOCAL do epoch `agora` (float) — chave do disjuntor de engenharia e do
+    latch do gate D5. Ilegível → hoje (fail-safe, nunca levanta)."""
+    from datetime import datetime as _dt
+    try:
+        return _dt.fromtimestamp(float(agora)).date().isoformat()
+    except Exception:
+        return _dt.now().date().isoformat()
+
+
+def _ler_ledger_tolerante(raiz, run_id):
+    """Lê `estado/runs/<run_id>.jsonl` do lado ATHENA, tolerante (linha inválida
+    pulada) e SEM importar `sintetizador.*` — integração por ARQUIVO (§E.1). Lista
+    de eventos (dicts) na ordem do arquivo; ausente/ilegível → []."""
+    if not run_id:
+        return []
+    path = os.path.join(str(raiz), "estado", "runs", f"{run_id}.jsonl")
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    reg = json.loads(linha)
+                except Exception:
+                    continue
+                if isinstance(reg, dict):
+                    out.append(reg)
+    except (FileNotFoundError, OSError):
+        return []
+    return out
+
+
+def _incidente_da_cauda(raiz, run_id):
+    """Classifica um run congelado pela CAUDA do ledger (§E.1.2): acha o ÚLTIMO
+    `g4_escalada`/`g2_congelada` e devolve `{trava, etapa, classe}` com
+    classe ∈ {'nao-defeito','budget','engenharia'}. Sem cauda relevante → None.
+
+    É o que corrige o BUG do rótulo fixo: um congelamento por `executor_ausente`
+    (engenharia) NÃO pode virar `irreversivel-externo` (calibração), senão a
+    correção nunca dispara. A trava REAL vem daqui, não de um literal."""
+    eventos = _ler_ledger_tolerante(raiz, run_id)
+    alvo = None
+    for reg in eventos:
+        if reg.get("evento") in ("g4_escalada", "g2_congelada"):
+            alvo = reg                                 # o ÚLTIMO vence (cauda)
+    if alvo is None:
+        return None
+    trava = alvo.get("trava")
+    etapa = alvo.get("etapa")
+    if trava in _TRAVAS_NAO_DEFEITO:
+        classe = "nao-defeito"
+    elif trava in _TRAVAS_BUDGET:
+        classe = "budget"
+    else:
+        # executor_ausente / desconhecida / reprovacao_esgotada / None → engenharia.
+        classe = "engenharia"
+    return {"trava": trava, "etapa": etapa, "classe": classe}
+
+
+def _gate_d5(slug, spec, st, espinha, agora, *, gasto_por_sistema_fn, budget_modo,
+             alertas):
+    """Gate D5 (§F.2), ANTES de TODO disparo (run E build). Compara a SOMA
+    conservadora (medido+presumido — SÓ para o teto, nunca para relato) com o teto
+    do sistema. Modo 'alerta' (default): registra (latch 1×/dia/sistema) + alerta e
+    DISPARA; 'pausa': NÃO dispara. Devolve True se pode disparar.
+
+    Sem `gasto_por_sistema_fn` (default null-object) o gate é no-op (comportamento
+    pré-integração preservado)."""
+    if gasto_por_sistema_fn is None:
+        return True
+    try:
+        g = gasto_por_sistema_fn().get(slug) or {}
+    except Exception:
+        return True                                    # observabilidade nunca bloqueia
+    conservador = (float(g.get("custo_medido_usd", 0.0) or 0.0)
+                   + float(g.get("custo_presumido_usd", 0.0) or 0.0))
+    teto = float(getattr(spec, "teto_dia_usd", 5.0) or 5.0)
+    if conservador < teto:
+        return True
+    dia = _dia_local_ts(agora)
+    if st.get("d5_avisado_dia") != dia:                # latch 1×/dia/sistema
+        st["d5_avisado_dia"] = dia
+        try:
+            alertas.captura_morreu(
+                slug, f"sistema {slug}: teto D5 US${teto:.2f}/dia atingido "
+                f"(conservador US${conservador:.4f}) — modo {budget_modo}")
+        except Exception:
+            pass
+        _registrar(espinha, f"teto D5 atingido em {slug} (modo {budget_modo})",
+                   f"soma conservadora medido+presumido US${conservador:.4f} "
+                   f">= teto US${teto:.2f}", tipo="escalada", reversivel=True,
+                   escalada=True, trava="budget", sistema=slug,
+                   fonte="deterministico", origem="athena-local/sistema")
+    return budget_modo != "pausa"
+
+
+def _brainstorm_gate_escalar(slug, etapa, st, *, alertas, espinha, llm, motivo):
+    """Antes de ESCALAR ao humano ([[trava-brainstorm-fable]]): com LLM, 1 linha de
+    brainstorm (custo medido=False, proxy) e depois escala 'só humano destrava';
+    sem LLM, escala direto (fail-closed). Nunca constrói (é o fim da linha da
+    engenharia)."""
+    if llm is not None:
+        _registrar(espinha, f"brainstorm da falha de {slug}:{etapa}",
+                   "custo presumido (o seam claude -p não devolve usage)",
+                   tipo="custo", reversivel=True, modelo="claude -p",
+                   custo_usd=_CUSTO_PROXY_BRAINSTORM_USD, medido=False,
+                   sistema=slug, fonte="llm", origem="athena-local/brainstorm")
+    try:
+        alertas.captura_morreu(slug, f"sistema {slug}: {motivo} — só humano destrava")
+    except Exception:
+        pass
+    _registrar(espinha, f"escalei {slug}:{etapa} — só humano destrava", motivo,
+               tipo="escalada", reversivel=True, escalada=True, trava="desconhecida",
+               sistema=slug, fonte="fail-closed", origem="athena-local/sistema")
+
+
+def _observar_build(slug, spec, st, *, espinha, alertas, agora, llm):
+    """Observa o desfecho de uma reconstrução (build-<id>.json novo, §E.4). pronto
+    → 2 linhas de custo (origem='athena/reescrita', medido/presumido SEPARADOS) +
+    `retentar_devido` (re-run sob gate) + marca `aguardando_rerun`. escalar/crash →
+    brainstorm-gate → escalar_humano. Idempotente por build_id."""
+    build = _build_mais_recente(spec.raiz)
+    if build is None:
+        return
+    bid = build.get("build_id")
+    if not bid or bid == st.get("ultimo_build"):
+        return
+    etapa = build.get("etapa")
+    eng = st.setdefault("eng", {})
+    reg_e = eng.get(etapa) or {}
+    if not reg_e.get("aguardando_build"):
+        return                                         # build não-esperado: ignora
+    st["ultimo_build"] = bid
+    reg_e["aguardando_build"] = False
+    medido = float(build.get("custo_medido_usd", 0.0) or 0.0)
+    presumido = float(build.get("custo_presumido_usd", 0.0) or 0.0)
+    # CUSTO do build: 2 linhas SEPARADAS, no orçamento do SLUG (engenharia gasta o
+    # teto do sistema). origem='athena/reescrita' as diferencia no SITREP.
+    _registrar(espinha, f"custo medido da reescrita de {slug}:{etapa}",
+               "usage real do build", tipo="custo", reversivel=True,
+               custo_usd=medido, medido=True, sistema=slug, origem="athena/reescrita")
+    _registrar(espinha, f"custo presumido da reescrita de {slug}:{etapa}",
+               "estimativa (proxy)", tipo="custo", reversivel=True,
+               custo_usd=presumido, medido=False, sistema=slug, origem="athena/reescrita")
+    if bool(build.get("pronto")) is True:
+        reg_e["aguardando_rerun"] = True
+        st["retentar_devido"] = True                   # re-run SOB o gate (§E.4)
+        _registrar(espinha, f"reescrita de {slug}:{etapa} PRONTA (hash novo)",
+                   "executor reconstruído e provado (smoke+gate F2) — re-run sob gate",
+                   reversivel=True, sistema=slug, fonte="deterministico",
+                   origem="athena/reescrita")
+    else:
+        _brainstorm_gate_escalar(
+            slug, etapa, st, alertas=alertas, espinha=espinha, llm=llm,
+            motivo=f"reescrita não instalou (build escalou/crashou): {build.get('motivo','')[:120]}")
+        reg_e["aguardando_rerun"] = False
+    eng[etapa] = reg_e
+
+
+def _passo_engenharia(slug, spec, st, executor, *, alertas, espinha, agora,
+                      gasto_por_sistema_fn, budget_modo, llm):
+    """Consome `st['eng_pendente']` (um gatilho de engenharia aceito): DISJUNTOR DE
+    ENGENHARIA (máx. 1 ciclo/etapa/dia), GATE D5, então `disparar_build` (§E.4).
+    Devolve Acao|None. Nunca há build+run simultâneos (mesmo lock do slug)."""
+    pend = st.get("eng_pendente")
+    if not pend:
+        return None
+    etapa = pend.get("etapa")
+    incidente = pend.get("incidente")
+    classe = pend.get("classe") or "executor_ausente"
+    if not etapa:
+        # Sem etapa reconstruível (ex.: exit 30 PlanoInvalido) → re-síntese é F6.
+        st.pop("eng_pendente", None)
+        _brainstorm_gate_escalar(slug, "?", st, alertas=alertas, espinha=espinha,
+                                 llm=llm, motivo="defeito sem etapa reconstruível (re-síntese é F6)")
+        return Acao(f"[{slug}] engenharia sem etapa — escalado", True, False)
+    if not hasattr(executor, "disparar_build"):
+        return None                                    # executor sem porta de build (mantém pendente)
+    dia = _dia_local_ts(agora)
+    eng = st.setdefault("eng", {})
+    reg_e = eng.get(etapa) or {}
+    # DISJUNTOR DE ENGENHARIA: já construiu esta etapa HOJE → 2º gatilho não constrói.
+    if reg_e.get("dia") == dia and reg_e.get("builds", 0) >= 1:
+        st.pop("eng_pendente", None)
+        _registrar(espinha, f"2º gatilho de engenharia em {etapa} hoje — não construo",
+                   f"disjuntor de engenharia (1 ciclo/etapa/dia local); incidente {incidente}",
+                   tipo="escalada", reversivel=True, escalada=True, trava=classe,
+                   sistema=slug, fonte="disjuntor", origem="athena-local/sistema")
+        _brainstorm_gate_escalar(slug, etapa, st, alertas=alertas, espinha=espinha,
+                                 llm=llm, motivo="2º gatilho de engenharia no mesmo dia")
+        return Acao(f"[{slug}] disjuntor de engenharia: 2º gatilho em {etapa} hoje", True, False)
+    # GATE D5 (antes do build — build consome o mesmo orçamento do sistema). Em
+    # modo PAUSA o incidente NÃO é descartado: fica pendente e re-tenta quando o
+    # teto reabrir (never-stop) — por isso NÃO se dá pop aqui.
+    if not _gate_d5(slug, spec, st, espinha, agora,
+                    gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
+                    alertas=alertas):
+        return None                                    # modo pausa: mantém eng_pendente
+    st.pop("eng_pendente", None)                        # daqui em diante o gatilho é consumido
+    feedback_path = None
+    try:
+        feedback_path = executor.escrever_feedback(slug, {
+            "trava": classe, "run_id": incidente, "etapa": etapa, "classe": classe,
+            "stderr_tail": pend.get("stderr_tail", ""), "laudo": pend.get("laudo", "")})
+    except Exception:
+        feedback_path = None
+    try:
+        conf = executor.disparar_build(slug, etapa, feedback_path)
+    except Exception as e:
+        _registrar(espinha, f"falhei ao disparar reescrita de {slug}:{etapa}",
+                   f"{str(e)[:160]}", tipo="escalada", reversivel=True, escalada=True,
+                   fonte="fail-closed", sistema=slug, origem="athena-local/sistema")
+        return Acao("", False, True, f"[{slug}] disparo de build falhou: {str(e)[:160]}")
+    eng[etapa] = {"dia": dia, "incidente": incidente,
+                  "builds": reg_e.get("builds", 0) + 1, "aguardando_build": True,
+                  "aguardando_rerun": False, "classe": classe}
+    _registrar(espinha, f"aciono engenharia p/ {slug}:{etapa}",
+               f"defeito classe={classe} no incidente {incidente} — reconstruo (E1→E6)",
+               tipo="escalada", reversivel=True, escalada=True, trava=classe,
+               sistema=slug, fonte="deterministico", origem="athena-local/reescrita")
+    return Acao(f"[{slug}] reescrita de {etapa} disparada: {conf}", True, False)
+
+
 def _aplicar_decisao_sistema(slug, st, obito, decisao, *, disjuntor, alertas, agora,
-                             espinha):
+                             espinha, raiz=None):
     """Traduz a `Decisao` de `causa_sistema` (conjunto FECHADO, SEM reseed) em ação
     de never-stop sobre o `st` do sistema. Espelha `_aplicar_decisao` da captura,
     mas: matar já foi feito por quem drenou o óbito; aqui só se decide backoff /
@@ -577,7 +835,21 @@ def _aplicar_decisao_sistema(slug, st, obito, decisao, *, disjuntor, alertas, ag
         pass
     if acao == "acionar_engenharia":
         alertas.captura_morreu(slug, f"sistema {slug}: defeito → engenharia ({motivo})")
-        _registrar(espinha, f"aciono engenharia p/ {slug}", motivo, tipo="escalada",
+        # T1 (óbito exit 30/40/traceback): tenta identificar a etapa em curso pelo
+        # heartbeat (run_id + etapa). Com etapa → FLAG de engenharia (o
+        # `_passo_engenharia` reconstrói sob disjuntor+D5). Sem etapa (ex.: exit 30
+        # PlanoInvalido antes de qualquer etapa) → só alerta/escalada (re-síntese é F6).
+        etapa, run_id = None, None
+        if raiz is not None:
+            hb = _ler_json_tolerante(os.path.join(str(raiz), "estado", "heartbeat.json"))
+            if isinstance(hb, dict):
+                etapa, run_id = hb.get("etapa"), hb.get("run_id")
+        if etapa:
+            st["eng_pendente"] = {"etapa": etapa, "incidente": run_id or "obito",
+                                  "classe": "executor_ausente",
+                                  "stderr_tail": (getattr(obito, "stderr_tail", "") or "")[:400]}
+        _registrar(espinha, f"aciono engenharia p/ {slug}"
+                   + (f":{etapa}" if etapa else ""), motivo, tipo="escalada",
                    reversivel=True, escalada=True, trava="executor_ausente",
                    sistema=slug, fonte=fonte, origem="athena-local/causa-sistema")
     elif acao == "escalar_token":
@@ -604,12 +876,15 @@ def _aplicar_decisao_sistema(slug, st, obito, decisao, *, disjuntor, alertas, ag
                    origem="athena-local/causa-sistema")
 
 
-def _registrar_desfecho_sistema(slug, resultado, *, disjuntor, st, espinha, agora):
+def _registrar_desfecho_sistema(slug, resultado, *, raiz, disjuntor, st, espinha,
+                                alertas, agora, llm=None):
     """Um run TERMINADO (resultado.json novo) → prestação de contas por sistema:
     2 linhas de CUSTO (medido e presumido SEPARADOS, `sistema=slug`) + 1 linha de
-    desfecho. Sucesso re-arma o disjuntor; parcial/congelado registram sem re-run
-    automático (§4.2)."""
+    desfecho. Sucesso re-arma o disjuntor E FECHA um incidente de reescrita aberto;
+    um congelamento é classificado pela TRAVA REAL da cauda do ledger (§E.1) —
+    engenharia dispara a correção; calibração D2/budget não."""
     estado = resultado.get("estado")
+    run_id = resultado.get("run_id")
     sucesso = bool(resultado.get("sucesso"))
     medido = float(resultado.get("custo_medido_usd", 0.0) or 0.0)
     presumido = float(resultado.get("custo_presumido_usd", 0.0) or 0.0)
@@ -628,29 +903,73 @@ def _registrar_desfecho_sistema(slug, resultado, *, disjuntor, st, espinha, agor
         _registrar(espinha, f"run de {slug} APROVADO (provado)", "sucesso falha-fechada",
                    reversivel=True, sistema=slug, fonte="deterministico",
                    origem="athena-local/sistema")
-    else:
-        eh_congelado = estado == "congelado_parcial"
-        _registrar(espinha, f"run de {slug} → {estado}",
-                   "congelado_parcial/parcial (sem re-run automático)",
-                   tipo="escalada" if eh_congelado else "decisao",
-                   reversivel=True, escalada=eh_congelado,
-                   trava="irreversivel-externo" if eh_congelado else None,
-                   sistema=slug, fonte="deterministico", origem="athena-local/sistema")
+        # FECHA um incidente de reescrita aberto: re-run aprovado após reconstrução
+        # (§E.4). reversivel=True — manifesto/hash anteriores permitem reinstalar.
+        for etapa, reg_e in list((st.get("eng") or {}).items()):
+            if reg_e.get("aguardando_rerun"):
+                reg_e["aguardando_rerun"] = False
+                _registrar(espinha,
+                           f"reescrita de {etapa} fechou incidente {reg_e.get('incidente')}",
+                           "re-run aprovado após reconstrução (hash novo instalado)",
+                           reversivel=True, sistema=slug, fonte="deterministico",
+                           origem="athena/reescrita")
+        return
+    # Não-sucesso: a TRAVA REAL vem da cauda do ledger (corrige o rótulo fixo).
+    eh_congelado = estado == "congelado_parcial"
+    inc = _incidente_da_cauda(raiz, run_id) if eh_congelado else None
+    trava_real = inc.get("trava") if inc else None
+    classe = inc.get("classe") if inc else None
+    etapa = inc.get("etapa") if inc else None
+    _registrar(espinha, f"run de {slug} → {estado}",
+               f"congelado_parcial/parcial (trava={trava_real})",
+               tipo="escalada" if eh_congelado else "decisao",
+               reversivel=True, escalada=eh_congelado,
+               trava=trava_real if eh_congelado else None,
+               sistema=slug, fonte="deterministico", origem="athena-local/sistema")
+    if not (eh_congelado and classe == "engenharia" and etapa):
+        return                                         # D2/budget/parcial: sem reescrita
+    reg_e = (st.get("eng") or {}).get(etapa) or {}
+    # 2ª FALHA do MESMO incidente (re-run após build congelou de novo, mesma etapa)
+    # → escalar_humano direto, NUNCA 3º build (§E.2).
+    if reg_e.get("aguardando_rerun") and reg_e.get("incidente") != run_id:
+        reg_e["aguardando_rerun"] = False
+        st.setdefault("eng", {})[etapa] = reg_e
+        _brainstorm_gate_escalar(slug, etapa, st, alertas=alertas, espinha=espinha,
+                                 llm=llm, motivo="2ª falha do mesmo incidente após reescrita")
+        return
+    # Gatilho de engenharia aceito → FLAG (o `_passo_engenharia` aplica disjuntor+D5).
+    st["eng_pendente"] = {"etapa": etapa, "incidente": run_id,
+                          "classe": trava_real or "executor_ausente"}
 
 
 def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, alertas,
                     espinha, agora, lock_dir, autopsia_dir, flap_min, llm=None,
-                    heartbeat_limiar_s=_HEARTBEAT_LIMIAR_S):
-    """A máquina de estados por-sistema (§4.2), um passo por ciclo. Devolve uma
-    `Acao` (reportável) ou None (quieto). NUNCA levanta (best-effort): um erro aqui
-    não pode derrubar o loop nem afetar a captura ao lado.
+                    heartbeat_limiar_s=_HEARTBEAT_LIMIAR_S,
+                    gasto_por_sistema_fn=None, budget_modo=None):
+    """A máquina de estados por-sistema (§4.2 + F4-e/F4-f), um passo por ciclo.
+    Devolve uma `Acao` (reportável) ou None (quieto). NUNCA levanta (best-effort):
+    um erro aqui não pode derrubar o loop nem afetar a captura ao lado.
 
-    Ordem: (1) run ATIVO com heartbeat velho → TRAVADO: mata (seguro) + espinha;
-    (2) óbitos drenados → autópsia → causa_sistema → decisão; (3) resultado.json
-    novo → custo/desfecho na espinha; (4) gatilho de disparo (sob_demanda) sob o
-    gate do disjuntor; (5) quieto."""
+    Ordem: (0) BUILD em andamento → quieto (nunca mata/dispara — mesmo lock do
+    slug); (1) run ATIVO com heartbeat velho → TRAVADO: mata (seguro) + espinha;
+    (2) óbitos → autópsia → causa_sistema → decisão (pode flagar engenharia T1);
+    (2.5) observa build-<id>.json (reescrita concluída → custo + re-run/escala);
+    (3) resultado.json novo → custo/desfecho + trava REAL da cauda (flag T2/T3);
+    (3.5) ENGENHARIA: disjuntor de engenharia + gate D5 + disparar_build;
+    (4) gatilho de disparo (run) sob gate do disjuntor + gate D5; (5) quieto."""
     slug = spec.slug
     espinha = espinha or _EspinhaNula()
+    if budget_modo is None:
+        budget_modo = _BUDGET_MODO
+
+    # (0) BUILD (reconstrução F4-e) em andamento p/ este slug → quieto. Nunca é
+    # morto (≠ run travado) nem concorre com um run (mesmo lock do slug).
+    if hasattr(executor, "build_ativo"):
+        try:
+            if executor.build_ativo(slug):
+                return None
+        except Exception:
+            pass
 
     # (1) run ATIVO: heartbeat fresco → quieto; velho → TRAVADO, mata (SEGURO).
     if executor.sistema_ativo(slug):
@@ -704,7 +1023,13 @@ def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, aler
                        sistema=slug, fonte=getattr(decisao, "fonte", "llm"),
                        origem="athena-local/causa-sistema")
         _aplicar_decisao_sistema(slug, st, obito, decisao, disjuntor=disjuntor,
-                                 alertas=alertas, agora=agora, espinha=espinha)
+                                 alertas=alertas, agora=agora, espinha=espinha,
+                                 raiz=spec.raiz)
+
+    # (2.5) BUILD concluído (reescrita F4-e): observa build-<id>.json → custo do
+    # build + re-run (pronto) ou brainstorm-gate/escala (escalou/crashou).
+    _observar_build(slug, spec, st, espinha=espinha, alertas=alertas, agora=agora,
+                    llm=llm)
 
     # (3) resultado.json novo (run_fim visto) → custo/desfecho por sistema (uma vez).
     resultado = _resultado_mais_recente(spec.raiz)
@@ -712,15 +1037,27 @@ def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, aler
         rid = resultado.get("run_id")
         if rid and rid != st.get("ultimo_resultado_run"):
             st["ultimo_resultado_run"] = rid
-            _registrar_desfecho_sistema(slug, resultado, disjuntor=disjuntor, st=st,
-                                        espinha=espinha, agora=agora)
+            _registrar_desfecho_sistema(slug, resultado, raiz=spec.raiz,
+                                        disjuntor=disjuntor, st=st, espinha=espinha,
+                                        alertas=alertas, agora=agora, llm=llm)
+
+    # (3.5) ENGENHARIA (F4-e): um gatilho aceito (T1/T2/T3) reconstrói a etapa sob
+    # o disjuntor de engenharia (1 ciclo/etapa/dia) + gate D5 — a ÚNICA porta de
+    # mudança de código. Pausado (P5) nunca reconstrói.
+    if not (spec.estado == "pausado" or st.get("pausado_por_causa")):
+        acao_eng = _passo_engenharia(
+            slug, spec, st, executor, alertas=alertas, espinha=espinha, agora=agora,
+            gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo, llm=llm)
+        if acao_eng is not None:
+            return acao_eng
 
     # (4) GATILHO de disparo (sob_demanda): só dispara sob PEDIDO explícito
     # (`st['pedido_run']`) ou re-tentativa devida — NUNCA em loop de gasto. Sempre
     # sob o gate do disjuntor (recozimento). Pausado (controle P5) nunca re-dispara.
     if spec.estado == "pausado" or st.get("pausado_por_causa"):
         return None
-    quer_disparar = bool(st.pop("pedido_run", False)) or st.get("retentar_devido")
+    pediu = bool(st.pop("pedido_run", False))
+    quer_disparar = pediu or st.get("retentar_devido")
     if not quer_disparar:
         return None
     try:
@@ -734,6 +1071,16 @@ def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, aler
                        "teto/backoff — escalo, não martelo", tipo="escalada",
                        reversivel=True, escalada=True, fonte="disjuntor",
                        sistema=slug, origem="athena-local/sistema")
+        return None
+    # GATE D5 (§F.2) ANTES do disparo do run: modo 'pausa' → não dispara; 'alerta'
+    # (default) → registra+alerta e dispara. Consome o retentar_devido só quando
+    # de fato dispara; em PAUSA, um pedido explícito é PRESERVADO (never-stop —
+    # re-tenta quando o teto reabrir), nunca silenciosamente descartado.
+    if not _gate_d5(slug, spec, st, espinha, agora,
+                    gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
+                    alertas=alertas):
+        if pediu:
+            st["pedido_run"] = True
         return None
     st["esgotado_avisado"] = False
     st["retentar_devido"] = False
@@ -757,7 +1104,8 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 alertas=None, lock_dir=None, autopsia_dir=None, meta_por_curso=None,
                 flap_min=None, llm=None, espinha=None, sistemas=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
-                sistema_lock_dir=None, sistema_autopsia_dir=None):
+                sistema_lock_dir=None, sistema_autopsia_dir=None,
+                gasto_por_sistema_fn=None, budget_modo=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -846,7 +1194,8 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                     causa_sistema=causa_sistema, disjuntor=disjuntor, alertas=alertas,
                     espinha=espinha, agora=agora,
                     lock_dir=sistema_lock_dir, autopsia_dir=sistema_autopsia_dir,
-                    flap_min=flap_min, llm=llm)
+                    flap_min=flap_min, llm=llm,
+                    gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo)
             except Exception:
                 acao = None                            # supervisão nunca derruba o ciclo
             if acao is not None:
@@ -873,7 +1222,8 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 batimento=None, batimento_intervalo=1800.0, resumo_fn=None, pulso_path=None,
                 lock_dir=None, autopsia_dir=None, meta_por_curso=None, flap_min=None,
                 llm=None, espinha=None, sistemas=None, sistema_executor=None,
-                causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None):
+                causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None,
+                gasto_por_sistema_fn=None, budget_modo=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). A cada
     ciclo grava o PULSO e chama o BATIMENTO — ambos BEST-EFFORT (observabilidade nunca mata
@@ -907,7 +1257,8 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         flap_min=flap_min, llm=llm, espinha=espinha, sistemas=sistemas,
                         sistema_executor=sistema_executor, causa_sistema=causa_sistema,
                         estado_sistemas=estado_sistemas, sistema_lock_dir=sistema_lock_dir,
-                        sistema_autopsia_dir=sistema_autopsia_dir)
+                        sistema_autopsia_dir=sistema_autopsia_dir,
+                        gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -1095,6 +1446,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     causa_sistema_mod = None
     sistema_lock_dir = None
     sistema_autopsia_dir = None
+    gasto_por_sistema_fn = None
+    budget_modo = _BUDGET_MODO
     sistemas_path = os.getenv("ATHENA_SISTEMAS_PATH")
     if sistemas_path and os.path.exists(sistemas_path):
         from maestro import causa_sistema as causa_sistema_mod
@@ -1108,6 +1461,10 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         sistema_executor = SistemaExecutor(
             sistemas, fabrica_python=fabrica_python, fabrica_dir=fabrica_dir,
             lock_dir=sistema_lock_dir)
+        # GATE D5 (F4-f): a leitura de custo/dia por sistema vem da espinha real.
+        # Closure zero-arg (o gate a chama sem args); dir_base=None → o padrão da
+        # espinha (~/.athena-local/decisoes). budget_modo do env (default 'alerta').
+        gasto_por_sistema_fn = decisoes_mod.gasto_do_dia_por_sistema
 
     asyncio.run(rodar(
         cursos, executor, progresso_fn, voz, intervalo_s=cfg.intervalo_s,
@@ -1118,7 +1475,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         lock_dir=lock_dir_efetivo, autopsia_dir=autopsia_dir, llm=llm,
         espinha=decisoes_mod, sistemas=sistemas, sistema_executor=sistema_executor,
         causa_sistema=causa_sistema_mod, sistema_lock_dir=sistema_lock_dir,
-        sistema_autopsia_dir=sistema_autopsia_dir))
+        sistema_autopsia_dir=sistema_autopsia_dir,
+        gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo))
 
 
 if __name__ == "__main__":  # pragma: no cover

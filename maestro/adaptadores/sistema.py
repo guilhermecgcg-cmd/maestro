@@ -104,7 +104,8 @@ class SistemaExecutor:
         self._spawn = spawn or _spawn_popen
         self._lock_dir = lock_dir or _LOCK_DIR_PADRAO
         self._pid_vivo = pid_vivo or _pid_vivo
-        self._procs = {}                       # slug -> handle
+        self._procs = {}                       # slug -> handle (RUN)
+        self._build_procs = {}                 # slug -> handle (RECONSTRUÇÃO, F4-e)
         self._obitos = {}                      # slug -> fonte de óbito
         os.makedirs(self._lock_dir, exist_ok=True)
 
@@ -139,11 +140,11 @@ class SistemaExecutor:
             return None
         return data
 
-    def _escrever_lock(self, slug, pid, raiz):
+    def _escrever_lock(self, slug, pid, raiz, *, tipo="run"):
         tmp = self._lock_path(slug) + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"conta": str(slug), "course_url": str(raiz), "pid": pid,
-                       "run_iniciado_ts": time.time()}, f)
+                       "tipo": tipo, "run_iniciado_ts": time.time()}, f)
         os.replace(tmp, self._lock_path(slug))
 
     def _remover_lock(self, path):
@@ -161,9 +162,18 @@ class SistemaExecutor:
             json.dump(dict(spec.calibrados or {}), f, ensure_ascii=False)
         return ep, cp
 
+    def build_stderr_path(self, slug) -> str:
+        return os.path.join(self._lock_dir, str(slug) + ".build.stderr")
+
+    def feedback_path(self, slug) -> str:
+        return os.path.join(self._lock_dir, str(slug) + ".feedback.json")
+
     def _reap(self):
         """Colhe runs que ESTA encarnação spawnou e encerraram; grava o óbito
-        (exit_code REAL + path do stderr) e remove o lock do slug."""
+        (exit_code REAL + path do stderr) e remove o lock do slug. BUILDS
+        (reconstruções, F4-e) são colhidos à parte: o desfecho de um build vem do
+        `build-<id>.json` (não é um óbito a diagnosticar por `causa_sistema`), então
+        NÃO entram em `_obitos` — só liberam o lock do slug ao terminar."""
         for slug in [s for s, p in self._procs.items() if p.poll() is not None]:
             proc = self._procs.pop(slug)
             meta = self._meta.get(slug)
@@ -180,6 +190,18 @@ class SistemaExecutor:
             except (FileNotFoundError, ValueError, OSError):
                 continue
             if data.get("conta") == str(slug):
+                self._remover_lock(path)
+        # BUILDS terminados: libera o lock (o build-<id>.json é a fonte-verdade do
+        # desfecho; a Athena o observa por arquivo — jamais como óbito de run).
+        for slug in [s for s, p in self._build_procs.items() if p.poll() is not None]:
+            self._build_procs.pop(slug)
+            path = self._lock_path(slug)
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except (FileNotFoundError, ValueError, OSError):
+                continue
+            if data.get("conta") == str(slug) and data.get("tipo") == "build":
                 self._remover_lock(path)
 
     def drenar_obitos(self) -> dict:
@@ -228,6 +250,59 @@ class SistemaExecutor:
         self._procs[slug] = proc
         self._escrever_lock(slug, getattr(proc, "pid", None), meta.raiz)
         return f"run_iniciado:{slug}:pid={getattr(proc, 'pid', None)}"
+
+    def build_ativo(self, slug) -> bool:
+        """Uma RECONSTRUÇÃO (F4-e) está em andamento p/ este slug? Lê o lock e
+        confere `tipo=="build"`. Enquanto um build roda, a passada NÃO mata (≠ run
+        travado) e NÃO dispara run (mesmo lock do slug: nunca build+run juntos)."""
+        self._reap()
+        lock = self._ler_lock(slug)
+        return bool(lock is not None and lock.get("tipo") == "build")
+
+    def escrever_feedback(self, slug, dados: dict) -> str:
+        """Grava o feedback do incidente (laudo reprovado + stderr_tail + trava +
+        run_id) que a reconstrução anexa ao pedido. Atômico; devolve o caminho."""
+        alvo = self.feedback_path(slug)
+        tmp = alvo + f".{os.getpid()}.tmp"
+        os.makedirs(os.path.dirname(alvo), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dict(dados or {}), f, ensure_ascii=False)
+        os.replace(tmp, alvo)
+        return alvo
+
+    def disparar_build(self, slug, etapa, feedback_path=None):
+        """Dispara a RECONSTRUÇÃO de UMA etapa (a ÚNICA porta de mudança de código,
+        F4-e). MESMO lock do slug que `disparar` → NUNCA build e run simultâneos no
+        mesmo sistema. Subprocesso: `ATHENA_FABRICA_PYTHON -m
+        sintetizador.reconstruir_etapa <raiz> --etapa <id> [--feedback f.json]`,
+        stderr tee'd para `<slug>.build.stderr`. O desfecho vem do `build-<id>.json`
+        (a Athena o observa), não do óbito. Idempotente por slug."""
+        self._reap()
+        meta = self._meta.get(slug)
+        if meta is None:
+            raise RuntimeError(f"sistema {slug!r} sem metadados (raiz) — não reconstruo")
+        lock = self._ler_lock(slug)
+        if lock is not None:
+            return f"ocupado:{slug}"           # run OU build já em andamento (1 por slug)
+
+        cmd = [self._fabrica_python, "-m", "sintetizador.reconstruir_etapa",
+               str(meta.raiz), "--etapa", str(etapa)]
+        if feedback_path:
+            cmd += ["--feedback", str(feedback_path)]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = self._fabrica_dir
+        stderr_path = self.build_stderr_path(slug)
+        # Lock de INTENÇÃO (pid=None, tipo=build) ANTES do spawn — fecha o TOCTOU.
+        self._escrever_lock(slug, None, meta.raiz, tipo="build")
+        try:
+            proc = self._spawn(cmd, env=env, cwd=self._fabrica_dir,
+                               stderr_path=stderr_path)
+        except Exception:
+            self._remover_lock(self._lock_path(slug))
+            raise
+        self._build_procs[slug] = proc
+        self._escrever_lock(slug, getattr(proc, "pid", None), meta.raiz, tipo="build")
+        return f"build_iniciado:{slug}:etapa={etapa}:pid={getattr(proc, 'pid', None)}"
 
     def matar(self, slug, *, espera_s=2.0) -> bool:
         """Mata o run TRAVADO deste slug (heartbeat congelado). SEGURO: sistema NÃO

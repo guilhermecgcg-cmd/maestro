@@ -272,3 +272,66 @@ def gasto_do_dia(data: date | None = None, dir_base: Path | None = None) -> dict
         "tokens_in": t["tokens_in"],
         "tokens_out": t["tokens_out"],
     }
+
+
+def _zerado_por_sistema() -> dict:
+    return {
+        "custo_medido_usd": 0.0,
+        "custo_presumido_usd": 0.0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "n_decisoes": 0,
+        "n_escaladas": 0,
+    }
+
+
+def gasto_do_dia_por_sistema(
+    data: date | None = None, dir_base: Path | None = None
+) -> dict:
+    """Agregador oficial de custo POR SISTEMA (F4-f §F.1) — a base do gate D5 e
+    da seção "sistemas gerados" do /sitrep.
+
+    Itera as MESMAS linhas TOLERANTES de `resumo_do_dia` e agrupa por
+    `reg["sistema"]` (None → "athena-geral", a captura/geral). Cada valor traz
+    `custo_medido_usd` e `custo_presumido_usd` SEPARADOS — jamais um total único
+    (regra inviolável nº2: somar estimativa com fatura é mentir com autoridade).
+    Custos de reescrita (`origem="athena/reescrita"`) já carregam `sistema=slug`,
+    então caem no orçamento do próprio sistema — engenharia gasta o teto dele.
+
+    Dia sem arquivo → dict vazio (nunca exceção). Linha inválida (sintática ou
+    semântica) é pulada, igual a `resumo_do_dia` — corrupção parcial nunca
+    derruba o agregador (nem o /sitrep e o gate D5 com ele)."""
+    data = data if data is not None else datetime.now().astimezone().date()
+    base = Path(dir_base) if dir_base is not None else DIR_PADRAO
+    arq = _arquivo_do_dia(data.isoformat(), base)
+
+    por_sistema: dict[str, dict] = {}
+
+    for reg in _ler_linhas(arq):
+        if reg is None or not isinstance(reg, dict):
+            continue
+        try:
+            t_in = int(reg.get("tokens_in", 0) or 0)
+            t_out = int(reg.get("tokens_out", 0) or 0)
+            custo = float(reg.get("custo_usd", 0.0) or 0.0)
+        except Exception:
+            continue
+
+        chave = reg.get("sistema") or "athena-geral"
+        alvo = por_sistema.setdefault(chave, _zerado_por_sistema())
+
+        tipo = reg.get("tipo", "decisao")
+        if tipo == "decisao":
+            alvo["n_decisoes"] += 1
+        if bool(reg.get("escalada")) or tipo == "escalada":
+            alvo["n_escaladas"] += 1
+
+        alvo["tokens_in"] += t_in
+        alvo["tokens_out"] += t_out
+        # Default HONESTO: custo sem rótulo `medido` é PRESUMIDO, nunca medido.
+        if reg.get("medido", False):
+            alvo["custo_medido_usd"] += custo
+        else:
+            alvo["custo_presumido_usd"] += custo
+
+    return por_sistema

@@ -275,3 +275,102 @@ def test_p2_flap_dispara_alerta_de_morte(tmp_path):
         ex.matar(C1, exit_code=-9)
         t += 1
     assert any("FLAP" in motivo for _, motivo in alr.mortes)  # DENTES: alertou o flap
+
+
+# ==========================================================================
+# BUG DO SUPERVISOR — curso JÁ CONCLUÍDO sai LIMPO (exit 0, total=0, Notion estável):
+# NÃO é morte. Não conta flap, não vira "MORREU", não escala reseed, não avança o
+# backoff, e ENTRA EM COOLDOWN (não re-spawna a cada ciclo). No código bugado cada
+# saída-limpa virava falha -> re-dispara -> flap sobe -> alerta "FLAP: N mortes".
+# ==========================================================================
+def test_curso_concluido_saida_limpa_nao_e_morte_nem_flap_e_entra_em_cooldown(tmp_path):
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", total=0)]         # total desconhecido (curso concluído)
+    common = _reais(tmp_path, alr)
+    common["flap_min"] = 2                                  # 2 "mortes" já dispararia FLAP
+    prog = _prog({C1: (162, 0)})                           # 162 já no Notion, total=0
+    t = 1000.0
+    for _ in range(6):
+        athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+        if ex.curso_ativo(C1):                             # só morre um filho que existe
+            ex.matar(C1, exit_code=0, stderr="sessão: injetados 162 cookies")
+        t += 100.0
+    # DENTES: saída-limpa de curso concluído NUNCA vira alarme de morte/flap
+    assert alr.mortes == []                                # nada de "MORREU"/"FLAP"
+    assert alr.sessoes == []                               # NÃO escalou reseed (falso)
+    assert not estado[C1].get("irredutivel")
+    assert estado[C1].get("disj_falhas", 0) == 0           # backoff NÃO avançou (não é falha)
+    assert ex.disparos.count(C1) == 1                      # DENTES: 1 disparo + cooldown (não martelou)
+    assert estado[C1].get("cooldown_ate")                  # entrou em cooldown
+
+
+def test_cooldown_de_saida_limpa_expira_e_reavalia(tmp_path):
+    # O cooldown não é permanente: expirado, o curso volta a ser reavaliado (never-stop).
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", total=0)]
+    common = _reais(tmp_path, alr)
+    prog = _prog({C1: (162, 0)})
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1000.0, **common)
+    ex.matar(C1, exit_code=0, stderr="sessão viva")
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1100.0, **common)
+    assert ex.disparos.count(C1) == 1                      # em cooldown: não re-dispara
+    # MUITO depois (cooldown de horas expirou): reavalia e re-dispara (quieto, sem alarme).
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1100.0 + 3 * 86400,
+                             **common)
+    assert ex.disparos.count(C1) == 2                      # DENTES: cooldown expirou -> reavaliou
+    assert alr.mortes == []                                # e sem falso alarme
+
+
+def test_morte_real_exit2_sessao_ainda_conta_e_escala_reseed(tmp_path):
+    # DENTES anti-regressão do anti-ban: uma MORTE REAL (exit 2 = sessão morta pelo motor)
+    # NÃO pode cair no ramo de saída-limpa — CONTINUA irredutível + escala reseed.
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", total=0)]
+    common = _reais(tmp_path, alr)
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 0)}), voz, voo, estado,
+                             agora=1000.0, **common)
+    assert C1 in ex.disparos
+    ex.matar(C1, exit_code=2)                              # exit 2 = SessionLostError (motor)
+    n = len(ex.disparos)
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 0)}), voz, voo, estado,
+                             agora=1100.0, **common)
+    assert estado[C1].get("irredutivel") is True          # sessão morta = irredutível
+    assert len(ex.disparos) == n                           # não re-dispara (não martela)
+    assert alr.sessoes == ["hotmart"]                      # escalou reseed (correto)
+    assert not estado[C1].get("cooldown_ate")              # morte real NÃO vira cooldown de concluído
+
+
+def test_morte_real_limpa_cooldown_herdado_de_saida_limpa(tmp_path):
+    # DENTES anti-ban: se um curso estava em COOLDOWN (saída limpa) e depois MORRE de
+    # verdade (sessão), o cooldown herdado NÃO pode mascarar a escalada — é limpo, e o
+    # reseed escala normalmente.
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", total=0)]
+    common = _reais(tmp_path, alr)
+    prog = _prog({C1: (162, 0)})
+    # 1) dispara + sai LIMPO -> entra em cooldown
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1000.0, **common)
+    ex.matar(C1, exit_code=0, stderr="sessão viva")
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1100.0, **common)
+    assert estado[C1].get("cooldown_ate")                  # está em cooldown
+    # 2) cooldown expira, re-dispara, e AGORA morre de verdade (sessão)
+    t = 1100.0 + 3 * 86400
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t, **common)
+    assert ex.disparos.count(C1) == 2                      # reavaliou pós-cooldown
+    ex.matar(C1, exit_code=2)                              # morte real (sessão)
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=t + 100, **common)
+    assert estado[C1].get("irredutivel") is True           # DENTES: escalou como morte
+    assert not estado[C1].get("cooldown_ate")              # cooldown herdado foi limpo
+    assert alr.sessoes == ["hotmart"]

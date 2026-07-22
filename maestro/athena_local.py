@@ -71,6 +71,15 @@ FASE_CONCLUIDO = captura.FASE_CONCLUIDO
 # NUNCA um latch permanente. Anti-ban intacto: reseed continua irredutível.
 _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 
+# COOLDOWN de curso QUIESCIDO por SAÍDA LIMPA: quando o motor sai LIMPO (exit 0) sem
+# produzir nada novo (Notion não avançou), o curso está concluído/sem-pendência para o
+# denominador que temos. Em vez de re-spawnar a cada ciclo (o que floodava o vigia com
+# saídas-limpas e queimava sessão à toa), o curso entra num COOLDOWN: fica quieto por
+# esta janela e só é reavaliado ao expirar. NÃO é permanente (never-stop): se novo
+# conteúdo aparecer, um ciclo pós-cooldown o retoma; e QUALQUER avanço real no Notion
+# limpa o cooldown na hora. Default 6h; env ATHENA_COOLDOWN_CONCLUIDO_S calibra.
+_COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"))  # 6h
+
 
 # ---------------------------------------------------------------------------
 # NULL-OBJECTS (defaults) — assinaturas IDÊNTICAS às dos módulos reais (P3/P4/P5/P2),
@@ -169,6 +178,22 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     acao = getattr(decisao, "acao", None)
     plat = _plataforma_de(curso, meta_por_curso)
     st["ultima_causa"] = acao
+
+    # SAÍDA LIMPA (exit 0 SEM assinatura alarmante): o motor rodou e saiu sem erro — NÃO é
+    # morte. Exigimos DOIS sinais concordantes: exit_code == 0 E a causa classificada como
+    # `aguardar_backoff` (o veredito da causa.py para saída limpa). Se o stderr denunciasse
+    # sessão/token morta, a causa seria escalar_reseed/escalar_token e cairíamos no ramo de
+    # MORTE REAL abaixo — anti-ban intacto (uma sessão morta que saiu 0 ainda escala). Aqui
+    # NÃO se conta flap, NÃO se escala, NÃO se avança o backoff, NÃO se marca _morte_ciclo:
+    # a passada decide cooldown/conclusão pela completude/avanço no Notion.
+    if getattr(obito, "exit_code", None) == 0 and acao == "aguardar_backoff":
+        st["_saida_limpa_ciclo"] = agora
+        return
+
+    # MORTE REAL (não é saída limpa): um cooldown de 'concluído' herdado de um run limpo
+    # anterior NÃO se aplica a um curso que acabou de MORRER — limpa-o para não atrasar a
+    # escalada nem mascarar o disjuntor. (Anti-ban: a escalada de reseed abaixo é imediata.)
+    st.pop("cooldown_ate", None)
     st["_morte_ciclo"] = agora                       # a passada NÃO re-trata esta morte
 
     flaps = int(getattr(obito, "flaps_na_janela", 0) or 0)
@@ -249,7 +274,7 @@ def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st):
 
 
 def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disjuntor,
-                      agora):
+                      agora, cooldown_s=_COOLDOWN_SAIDA_LIMPA_S):
     """Fábrica da `passada_fn` LOCAL que o owner (`orquestrar_captura`) invoca por curso.
 
     A máquina de estados por-curso (persiste em `estado[curso]` entre ciclos):
@@ -285,6 +310,7 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                     disjuntor.registrar_sucesso(st)
                 except Exception:
                     pass
+                st.pop("cooldown_ate", None)               # AVANÇO real: sai do cooldown (há trabalho)
             st["ultimo_no_notion"] = int(no_notion)
         if no_notion is not None and int(total) > 0 and int(no_notion) >= int(total):
             st["fase"] = FASE_CONCLUIDO
@@ -295,14 +321,34 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return acao
         if executor.curso_ativo(curso):
             return None                                    # capturando: quieto
-        # FALLBACK de morte (default/no-autópsia): estava CAPTURANDO e caiu; se a autópsia
-        # do ciclo NÃO tratou esta morte, conta a falha (backoff) e reabilita a tentativa.
-        if st.get("fase") == FASE_CAPTURANDO and st.get("_morte_ciclo") != agora:
-            try:
-                disjuntor.registrar_falha(st, agora)
-            except Exception:
-                pass
-            st["fase"] = FASE_NOVO
+        # O processo encerrou. Distinguir SAÍDA LIMPA (concluído/quiescido) de MORTE.
+        if st.get("fase") == FASE_CAPTURANDO:
+            if st.get("_saida_limpa_ciclo") == agora:
+                # SAÍDA LIMPA (exit 0): NÃO é falha (backoff intacto), NÃO escala. Se o
+                # Notion NÃO avançou desde o disparo, o run nada produziu -> curso quiescido:
+                # entra em COOLDOWN (evita re-spawn a cada ciclo, que floodava o vigia com
+                # saídas-limpas). Se avançou, houve progresso -> sem cooldown (deixa
+                # continuar já no próximo ciclo). Nunca conta morte/flap.
+                ref = st.get("_no_notion_no_disparo")
+                avancou = (no_notion is not None and ref is not None
+                           and int(no_notion) > int(ref))
+                if not avancou:
+                    st["cooldown_ate"] = agora + cooldown_s
+                st["fase"] = FASE_NOVO
+            elif st.get("_morte_ciclo") != agora:
+                # FALLBACK de MORTE (default/no-autópsia): caiu sem saída-limpa e a autópsia
+                # NÃO tratou -> conta a falha (backoff) e reabilita a tentativa.
+                try:
+                    disjuntor.registrar_falha(st, agora)
+                except Exception:
+                    pass
+                st["fase"] = FASE_NOVO
+        # COOLDOWN de saída-limpa: curso quiescido fica quieto até a janela expirar (não é
+        # falha nem escala — só evita o re-spawn apertado de um curso concluído). Ao expirar,
+        # cai adiante e reavalia (never-stop). Qualquer avanço no Notion já limpou o cooldown.
+        cd = st.get("cooldown_ate")
+        if cd is not None and agora < cd:
+            return None
         try:
             pode = disjuntor.pode_tentar(st, agora)
         except Exception:
@@ -336,6 +382,9 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return Acao("", False, True, pedido)
         st["tentativas"] = st.get("tentativas", 0) + 1
         st["fase"] = FASE_CAPTURANDO
+        # Marca-d'água do Notion no disparo: se a saída-limpa não a ultrapassar, o run nada
+        # produziu (curso quiescido -> cooldown); se ultrapassar, houve progresso (segue).
+        st["_no_notion_no_disparo"] = st.get("ultimo_no_notion")
         acao = Acao(f"[{projeto_nome}] captura LOCAL de {curso} iniciada "
                     f"(tentativa {st['tentativas']}): {conf}", True, False)
         voz.avisar_acao(acao)

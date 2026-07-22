@@ -172,6 +172,59 @@ def test_flap_fora_da_janela_nao_conta(dirs):
     assert obs[0].flaps_na_janela == 1
 
 
+# --------------------------------------------------------------------------
+# SAÍDA LIMPA (exit 0) — não é MORTE: não infla o flap nem vira alarme
+# --------------------------------------------------------------------------
+def test_saida_limpa_exit0_marca_obito_e_flap_zero(dirs):
+    # DENTES: exit_code 0 é SAÍDA LIMPA (curso concluído/nada pendente), NÃO morte.
+    # O óbito é marcado (saida_limpa) e o flap dela é 0 — não conta como morte na janela.
+    d, lock_dir, aut_dir = dirs
+    _lock(lock_dir, "acme", "http://curso", 1)
+    obs = vigia.autopsia(lock_dir, {"acme": vigia.FonteFilho(exit_code=0)},
+                         pid_vivo=_vivos(), autopsia_dir=aut_dir, agora=1000.0)
+    assert len(obs) == 1
+    assert obs[0].saida_limpa is True
+    assert obs[0].exit_code == 0
+    assert obs[0].flaps_na_janela == 0          # saída limpa não é um evento de flap
+    # e NÃO polui o diretório de autópsias (que é de MORTES)
+    arqs = [x for x in os.listdir(aut_dir) if x.endswith(".json")] if os.path.isdir(aut_dir) else []
+    assert arqs == []
+
+
+def test_saidas_limpas_nao_inflam_flap_de_morte_real(dirs):
+    # DENTES do bug: N saídas limpas (exit 0) na MESMA conta NÃO podem inflar o flap de
+    # uma morte real subsequente. No código bugado, cada exit-0 gravava autópsia e a
+    # morte real via flap=N+1 (falso alarme "FLAP: N mortes na janela").
+    d, lock_dir, aut_dir = dirs
+    for i in range(5):
+        _lock(lock_dir, "acme", "http://curso", 1)
+        vigia.autopsia(lock_dir, {"acme": vigia.FonteFilho(exit_code=0)},
+                       pid_vivo=_vivos(), autopsia_dir=aut_dir, agora=1000.0 + i,
+                       janela_s=1800)
+    _lock(lock_dir, "acme", "http://curso", 1)
+    err = _stderr(d, "boom real\n")
+    obs = vigia.autopsia(lock_dir, {"acme": vigia.FonteFilho(exit_code=2, stderr_path=err)},
+                         pid_vivo=_vivos(), autopsia_dir=aut_dir, agora=1006.0, janela_s=1800)
+    assert obs[0].saida_limpa is False
+    assert obs[0].flaps_na_janela == 1          # as 5 saídas limpas NÃO contaram
+
+
+def test_saida_limpa_nao_conta_flap_mesmo_com_autopsia_legada_em_disco(dirs):
+    # DENTES de retrocompat: autópsias exit_code=0 JÁ gravadas em disco (o bug antigo
+    # deixou dezenas) NÃO podem contar como flap de uma morte real — o contador filtra.
+    d, lock_dir, aut_dir = dirs
+    os.makedirs(aut_dir, exist_ok=True)
+    for i in range(9):                          # legado do bug: exit_code=0 no disco
+        import json as _json
+        with open(os.path.join(aut_dir, "leg-%02d.json" % i), "w") as f:
+            _json.dump({"conta": "acme", "exit_code": 0, "ts_epoch": 1000.0 + i}, f)
+    _lock(lock_dir, "acme", "http://curso", 1)
+    err = _stderr(d, "morte de verdade\n")
+    obs = vigia.autopsia(lock_dir, {"acme": vigia.FonteFilho(exit_code=1, stderr_path=err)},
+                         pid_vivo=_vivos(), autopsia_dir=aut_dir, agora=1005.0, janela_s=1800)
+    assert obs[0].flaps_na_janela == 1          # legado exit-0 ignorado
+
+
 def test_flap_por_conta_e_isolado(dirs):
     d, lock_dir, aut_dir = dirs
     err = _stderr(d, "morre\n")

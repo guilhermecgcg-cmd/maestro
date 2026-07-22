@@ -64,13 +64,22 @@ class FonteFilho:
 @dataclass(frozen=True)
 class Obito:
     """Uma morte de filho, com o material da autópsia. `flaps_na_janela` é quantas mortes
-    (INCLUINDO esta) a conta acumulou na janela — >= flap_min é flapping."""
+    (INCLUINDO esta) a conta acumulou na janela — >= flap_min é flapping.
+
+    `saida_limpa`: True quando o filho encerrou LIMPO (exit_code == 0). NÃO é uma morte —
+    é um run que terminou sem erro (curso concluído / nada pendente / fim de passe). Um
+    `Obito` com `saida_limpa` é REPORTADO (o loop precisa do sinal de que o processo
+    encerrou), mas NÃO é um evento de flap: não conta na janela nem grava autópsia (o
+    diretório de autópsias é de MORTES). Distinguir os dois é o que impede um curso já
+    100% capturado — que a cada disparo injeta a sessão, roda e sai 0 — de ser contado
+    como 'morte' e disparar o falso alarme 'FLAP: N mortes na janela'."""
     conta: str
     curso: str
     exit_code: Optional[int]
     stderr_tail: str
     flaps_na_janela: int
     ts: str = ""                 # ISO-8601 do momento da autópsia
+    saida_limpa: bool = False    # exit_code == 0: encerrou LIMPO, NÃO é morte
 
 
 # --------------------------------------------------------------------------
@@ -159,8 +168,13 @@ def _stderr_tail(fonte: FonteFilho, n_linhas: int) -> str:
 # flapping — contado a partir das autópsias em disco (recomputável, never-stop)
 # --------------------------------------------------------------------------
 def _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) -> int:
-    """Quantas autópsias JÁ gravadas desta conta caem em [agora-janela, agora]. NÃO conta
-    a atual (ainda não escrita)."""
+    """Quantas MORTES já gravadas desta conta caem em [agora-janela, agora]. NÃO conta
+    a atual (ainda não escrita).
+
+    IGNORA registros de SAÍDA LIMPA (`saida_limpa` True ou `exit_code == 0`): um exit 0 é
+    um encerramento sem erro, não uma morte, e não pode inflar o flap. O filtro por
+    `exit_code == 0` também neutraliza as autópsias exit-0 LEGADAS que o bug antigo já
+    deixou no disco (dezenas), para uma morte real não herdar um flap falso delas."""
     if not os.path.isdir(autopsia_dir):
         return 0
     limite = agora - janela_s
@@ -173,6 +187,8 @@ def _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) -> int:
             continue
         if str(rec.get("conta")) != str(conta):
             continue
+        if rec.get("saida_limpa") or rec.get("exit_code") == 0:
+            continue                      # saída limpa não é morte -> não conta flap
         ts = rec.get("ts_epoch")
         if isinstance(ts, (int, float)) and limite <= ts <= agora:
             n += 1
@@ -241,8 +257,23 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
 
         curso = fonte.curso or (lock.get("course_url") if lock else "") or ""
         stderr_tail = _stderr_tail(fonte, stderr_linhas)
-        flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) + 1
         ts_iso = datetime.fromtimestamp(agora).isoformat()
+
+        # SAÍDA LIMPA (exit_code == 0): o filho encerrou SEM erro — NÃO é morte. É o run de
+        # um curso já concluído / passe sem nada pendente. Reporta-se o Obito (o loop
+        # precisa saber que o processo encerrou, p/ cooldown/conclusão), mas: (a) o flap
+        # dela é o das MORTES anteriores (SEM +1 — saída limpa não é evento de flap); e
+        # (b) NÃO se grava autópsia (o diretório é de mortes, e gravar exit-0 é o que
+        # inflava o flap e produzia o falso 'FLAP: N mortes na janela'). É o ponto exato
+        # onde, no bug, uma saída de motor virava 'morte' no contador de FLAP.
+        if fonte.exit_code == 0:
+            flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s)
+            obitos.append(Obito(conta=conta, curso=curso, exit_code=0,
+                                stderr_tail=stderr_tail, flaps_na_janela=flaps,
+                                ts=ts_iso, saida_limpa=True))
+            continue
+
+        flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) + 1
         obito = Obito(conta=conta, curso=curso, exit_code=fonte.exit_code,
                       stderr_tail=stderr_tail, flaps_na_janela=flaps, ts=ts_iso)
         _gravar_autopsia(autopsia_dir, obito, ts_epoch=agora, detectado_por=detectado_por)

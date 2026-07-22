@@ -153,6 +153,36 @@ def test_p3p4_sessao_morta_vira_irredutivel_e_alerta(tmp_path):
 
 
 # ==========================================================================
+# P3+P4 — MORTE por TOKEN (credencial de API) -> NÃO é irredutível: back off + alerta,
+# e RE-TENTA sob o gate. A chave é uma API DOWNSTREAM (Groq/Anthropic), não a plataforma
+# raspada: latch permanente não evita ban nenhum, só condena o curso a parar de vez (o
+# bug do incidente Stoa, 1h28 latchado). DENTES: contra o antigo (escalar_token
+# irredutível), o curso NUNCA voltaria a disparar.
+# ==========================================================================
+def test_p3p4_token_nao_e_irredutivel_backoff_e_realerta(tmp_path):
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, alr)
+    prog = _prog({C1: (0, 18)})
+    # dispara + morre por credencial de API (401) — causa.classificar -> escalar_token.
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1000.0, **common)
+    n_antes = ex.disparos.count(C1)                        # 1 disparo inicial
+    ex.matar(C1, exit_code=1, stderr="openai.AuthenticationError: HTTP 401 Unauthorized")
+    # ciclo seguinte: autopsia -> escalar_token -> back off (NÃO irredutível) -> re-dispara.
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1001.0, **common)
+
+    assert not estado[C1].get("irredutivel")               # DENTES: token NÃO latcha de vez
+    assert estado[C1].get("disj_falhas", 0) >= 1           # o disjuntor CONTABILIZOU a falha
+    assert any("troque o token" in m for _, m in alr.mortes)  # alerta ao dono mantido
+    # DENTES: no antigo (escalar_token irredutível) o curso ficava travado e NUNCA
+    # re-disparava; agora o recozimento o reabre já no crédito livre.
+    assert ex.disparos.count(C1) == n_antes + 1
+
+
+# ==========================================================================
 # P3+P4 — MORTE transitória (SIGKILL) -> causa relancar -> RECOZIMENTO do disjuntor:
 # re-tenta enquanto no crédito; após o limiar arma o backoff (não dispara na janela) e
 # RE-ARMA quando a janela expira. Prova que o disjuntor está fiado no gate.

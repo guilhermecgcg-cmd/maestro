@@ -113,6 +113,44 @@ def test_circuit_breaker_exit4_nao_vira_reseed_falso():
     assert d.fonte == "deterministico", d      # decidido pelo exit-code, sem LLM
 
 
+# Cauda de stderr REAL do incidente Stoa (21/07 21:12): um abort de circuit-breaker
+# (exit 4) cujo tail contém a linha httpx de um POST BEM-SUCEDIDO à Groq (200 OK). A
+# regex antiga tinha `groq` como âncora NUA e casava esta linha de sucesso -> classificava
+# "troque o token" (escalar_token -> IRREDUTÍVEL) -> a captura latchava de vez, com as
+# chaves VÁLIDAS (Groq e Anthropic testadas ao vivo = 200). O nome do provedor num log
+# de sucesso NÃO é sinal de credencial ruim.
+_ABORT_COM_LOG_GROQ_200 = (
+    "2026-07-21 21:10:19,728 INFO httpx: HTTP Request: POST "
+    "https://api.groq.com/openai/v1/audio/transcriptions \"HTTP/1.1 200 OK\"\n"
+    "2026-07-21 21:10:42,426 INFO httpx: HTTP Request: POST "
+    "https://api.anthropic.com/v1/messages \"HTTP/1.1 200 OK\"\n"
+    "2026-07-21 21:11:08,359 ERROR motor.orchestrator: RUN ABORTADO com 1/7 aulas "
+    "concluídas: 5 erros nas últimas 6 aulas. Algo está sistematicamente errado do "
+    "lado da Hotmart — pode ser o anti-bot, a sessão, a rede, ou um detector nosso "
+    "ruim. Continuar martelando é o caminho do banimento. Parando com ok=1 audio=0 "
+    "falhou=5 de 7.\n"
+    "As aulas não processadas continuam pendentes. Olhe os erros no tracker antes de "
+    "retomar; se for anti-bot, espere e NÃO force novo login."
+)
+
+
+def test_log_de_sucesso_groq_200_NAO_vira_token_falso():
+    # DENTES (incidente Stoa 21/07): o nome "groq" numa linha httpx de SUCESSO 200
+    # jamais pode classificar como escalar_token (que é IRREDUTÍVEL -> latch de 1h28
+    # com chaves válidas). exit 4 = causa desconhecida -> escalar_humano (retentável).
+    d = causa.classificar(_obito(exit_code=4, stderr=_ABORT_COM_LOG_GROQ_200))
+    assert d.acao != "escalar_token", d        # o bug: casava "groq" no log 200
+    assert d.acao == "escalar_humano", d       # exit 4 honesto: humano olha o tracker
+
+
+def test_provedor_mencionado_sem_falha_nao_vira_token():
+    # Guarda geral: mencionar o provedor (Groq/Anthropic/OpenAI) sem um sinal de FALHA
+    # de credencial não pode escalar troca de token. Aqui um SIGKILL (-9) transitório.
+    d = causa.classificar(_obito(exit_code=-9, stderr="usando api.groq.com e api.anthropic.com"))
+    assert d.acao != "escalar_token", d
+    assert d.acao == "relancar", d             # SIGKILL -> transitório de recurso/SO
+
+
 @pytest.mark.parametrize("exit_code,stderr", [
     (2, "SESSÃO MORREU NO MEIO DO RUN: redirecionado pro login ao abrir a aula: http://x"),
     (3, "SESSÃO MORTA: Login manual não concluído dentro do timeout"),

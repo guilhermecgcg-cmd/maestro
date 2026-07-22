@@ -5,7 +5,9 @@ o QUE fazer — sem nunca propor login automático (inviolável anti-ban).
 FLUXO (2 camadas, determinístico-primeiro):
   1. ASSINATURAS DETERMINÍSTICAS sobre (exit_code, stderr_tail):
        - stderr DECLARA sessão morta          -> escalar_reseed  (humano refaz login HEADED)
-       - GROQ/401/403/api key                 -> escalar_token   (credencial de API ruim)
+       - 401/403/"invalid api key"/auth-error -> escalar_token   (credencial de API ruim;
+                                                                  NÃO o nome de um provedor
+                                                                  num log de sucesso 200)
        - exit 2/3 (Session{Lost,Dead}/NavDead) -> escalar_reseed  (veredito do motor)
        - exit 4 (CircuitBreaker/excesso falhas) -> escalar_humano  (causa DESCONHECIDA)
        - SIGKILL/OOM/timeout                  -> relancar        (transitório de recurso/SO)
@@ -93,11 +95,28 @@ _RE_SESSAO = re.compile(
 _EXIT_SESSAO_MORTA = frozenset({2, 3})
 _EXIT_CIRCUIT_BREAKER = 4
 
-# Credencial de API ruim (GROQ/401/403/api key). É o que escala TROCA DE TOKEN.
+# Credencial de API ruim (401/403/api key inválida). É o que escala TROCA DE TOKEN.
+#
+# REGRA DE OURO (irmã da _RE_SESSAO): casa só frases que DECLARAM uma FALHA de
+# credencial — nunca o NOME de um provedor nem a palavra "api key" nuas. O motor
+# loga o httpx de operação NORMAL, e uma transcrição/resumo BEM-SUCEDIDO emite
+# `POST https://api.groq.com/... "HTTP/1.1 200 OK"`. A regex antiga tinha `groq`
+# como alternativa NUA, então casava esse log de SUCESSO 200 e classificava um
+# abort de causa desconhecida (exit 4) como "troque o token" -> irredutível ->
+# a captura latchava de vez com AS CHAVES VÁLIDAS (incidente Stoa 21/07, 1h28
+# parada; Groq e Anthropic testadas ao vivo = 200). O nome do provedor num log
+# não é sinal de credencial ruim; só um 401/403/"invalid api key"/AuthenticationError
+# é. Removidas as âncoras nuas `groq`/`x-api-key`/`api_key`; exigido um qualificador
+# de FALHA junto de "api key". `\b40[13]\b` nu também caiu (um id/contagem 401/403
+# em log benigno dava falso) — fica só 401/403 com contexto http/status, além de
+# unauthorized/forbidden, que não aparecem em log de raspagem normal.
 _RE_TOKEN = re.compile(
-    r"(groq|x-api-key|api[_\s-]?key|authenticationerror|"
-    r"\b40[13]\b|http\s*40[13]|status\s*40[13]|unauthorized|forbidden|"
-    r"invalid\s+api\s+key|incorrect\s+api\s+key|insufficient[_\s]permission)", re.I)
+    r"(authenticationerror|permissiondeniederror|unauthorized|forbidden|"
+    r"http\s*40[13]\b|status\s*40[13]\b|"
+    r"invalid\s+api[_\s-]?key|incorrect\s+api[_\s-]?key|"
+    r"api[_\s-]?key\s+(invalid|incorrect|missing|expired|revoked|not\s+found)|"
+    r"(invalid|incorrect|missing|expired|revoked)\s+api[_\s-]?key|"
+    r"insufficient[_\s]permission)", re.I)
 
 # OOM / falta de recurso -> relançar (o SO matou; provável transitório de memória).
 _RE_OOM = re.compile(

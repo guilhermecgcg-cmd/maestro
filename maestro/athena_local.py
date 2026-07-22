@@ -58,10 +58,18 @@ FASE_NOVO = captura.FASE_NOVO
 FASE_CAPTURANDO = captura.FASE_CAPTURANDO
 FASE_CONCLUIDO = captura.FASE_CONCLUIDO
 
-# Ações da causa-raiz (maestro.causa.ACOES) que exigem HUMANO e NÃO devem ser marteladas:
-# a sessão/credencial só o dono conserta (reseed HEADED / troca de token). Marcam o curso
-# como IRREDUTÍVEL -> o disjuntor abre de vez (não re-tenta) até o humano agir.
-_CAUSAS_IRREDUTIVEIS = ("escalar_reseed", "escalar_token")
+# Causa que trava o curso de VEZ (irredutível): SÓ a SESSÃO morta. Uma sessão morta
+# é a SUPERFÍCIE DE BAN — martelá-la deslogado é o caminho do banimento da conta paga,
+# então o disjuntor abre até o humano refazer o login HEADED (reseed).
+#
+# `escalar_token` (credencial de API) SAIU daqui DE PROPÓSITO: a chave é de uma API
+# DOWNSTREAM (Groq/Anthropic), NÃO da plataforma raspada — travar de vez NÃO protege
+# de ban NENHUM, só condena o curso a parar até um humano agir. Um blip de auth
+# momentâneo latchava a captura permanentemente (ver incidente Stoa 21/07). Agora o
+# token vai pro ramo de BACKOFF (recozimento) com alerta: um blip se cura sozinho, e
+# uma chave de fato revogada re-tenta com atraso crescente (10min→...→24h) + alerta,
+# NUNCA um latch permanente. Anti-ban intacto: reseed continua irredutível.
+_CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +158,10 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
 
       transitório (relancar/aguardar_backoff/None) -> `registrar_falha` avança o backoff
         do disjuntor; o curso volta a NOVO e re-tenta SOB o gate (recozimento, não martelo).
-      IRREDUTÍVEL (escalar_reseed/escalar_token) -> marca `st['irredutivel']`: o disjuntor
-        abre de vez (não re-tenta) e ALERTA o humano (a sessão/credencial só ele conserta).
+      IRREDUTÍVEL (escalar_reseed) -> marca `st['irredutivel']`: o disjuntor abre de vez
+        (não re-tenta) e ALERTA o humano. SÓ a sessão morta (superfície de ban) latcha.
+      TOKEN (escalar_token) -> back off + ALERTA "troque o token": o disjuntor RECOZE e
+        re-tenta (a chave é API downstream, não a plataforma — travar de vez não evita ban).
       desconhecida (escalar_humano) -> back off + ALERTA (fail-closed: chama o dono).
       FLAP (>= flap_min mortes na janela) -> ALERTA de captura morrendo em loop, seja qual
         for a causa.
@@ -166,23 +176,26 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
         alertas.captura_morreu(
             plat, f"FLAP: {flaps} mortes na janela (curso {curso}, causa={acao})")
 
-    if acao in _CAUSAS_IRREDUTIVEIS:
+    if acao in _CAUSAS_IRREDUTIVEIS:      # só escalar_reseed: sessão morta = superfície de ban
         st["irredutivel"] = True
         st["esgotado_avisado"] = True                # o alerta typado abaixo já cobre
-        if acao == "escalar_reseed":
-            alertas.sessao_expirada(plat)
-        else:  # escalar_token
-            alertas.captura_morreu(
-                plat, f"credencial de API inválida — troque o token (curso {curso})")
+        alertas.sessao_expirada(plat)
         st["fase"] = FASE_NOVO
         return
 
-    # transitório OU desconhecida: back off (recozimento) e re-tenta sob o gate.
+    # transitório / TOKEN / desconhecida: back off (recozimento) e re-tenta sob o gate.
+    # `escalar_token` cai AQUI (não mais irredutível): alertamos o dono para trocar a
+    # chave, mas o disjuntor RECOZE e re-tenta — um blip de credencial se cura sozinho e
+    # uma chave revogada re-tenta com backoff crescente + alerta, sem latch permanente
+    # (a chave é uma API downstream, não a plataforma raspada: zero risco de ban).
     try:
         disjuntor.registrar_falha(st, agora)
     except Exception:
         pass
-    if acao == "escalar_humano":
+    if acao == "escalar_token":
+        alertas.captura_morreu(
+            plat, f"credencial de API inválida — troque o token (curso {curso})")
+    elif acao == "escalar_humano":
         alertas.captura_morreu(
             plat, f"causa desconhecida (fail-closed): {getattr(decisao, 'motivo', '')}")
     st["fase"] = FASE_NOVO

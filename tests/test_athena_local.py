@@ -399,3 +399,117 @@ def test_progresso_local_fn_combina_numerador_e_total():
 
     fn = athena_local.progresso_local_fn("/py", "/dir", {C1: 18}, run=fake_run)
     assert fn(C1) == (7, 18)
+
+
+# ==========================================================================
+# HIGIENE (2) — COOLDOWN-DE-CONCLUÍDO: curso SEM pendência capturável no tracker
+# (só restam terminais: no_notion/sem_conteudo/falhou) NÃO é re-selecionado NEM
+# escala exit-4 a cada ciclo. Falso-positivo real: invistodireito 533/547 no Notion
+# (14 terminais: 13 sem_conteudo + 1 falhou) — nunca "completo por Notion" (533<547),
+# mas ZERO trabalho capturável. Entra em cooldown longo.
+# INVARIANTE: curso com pendência REAL (pendente/in-flight = throttle/parede) AINDA
+# dispara e AINDA escala — done != bloqueado.
+# ==========================================================================
+def _pend(valor):
+    """pendencia_fn dublê: curso -> nº de aulas capturáveis pendentes (None = desconhecido)."""
+    return lambda curso: valor
+
+
+def test_sem_pendencia_capturavel_nao_dispara_nem_escala():
+    # invistodireito: Notion 533/547 (parcial), mas tracker sem pendência capturável.
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    athena_local.ciclo_local([_curso(C1, total=547)], ex, _prog({C1: (533, 547)}), voz,
+                             voo, estado, agora=1000.0, pendencia_fn=_pend(0))
+    assert ex.disparos == []                               # DENTE: NÃO re-dispara o done
+    assert estado[C1].get("cooldown_ate") is not None      # entrou em cooldown longo
+    assert voz.escaladas == []                             # DENTE: NÃO escala exit-4
+
+
+def test_sem_pendencia_fica_quieto_dentro_do_cooldown():
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, total=547)]
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1000.0, pendencia_fn=_pend(0))
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1100.0, pendencia_fn=_pend(0))   # dentro da janela
+    assert ex.disparos == []                               # segue quieto
+    assert voz.escaladas == []
+
+
+def test_pendencia_real_ainda_dispara():
+    # INVARIANTE: há trabalho capturável (pendente/parede) -> dispara normalmente.
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    athena_local.ciclo_local([_curso(C1, total=547)], ex, _prog({C1: (533, 547)}), voz,
+                             voo, estado, agora=1000.0, pendencia_fn=_pend(14))
+    assert ex.disparos == [C1]                             # DENTE: pendência real -> captura
+
+
+def test_pendencia_real_ainda_escala_no_teto():
+    # INVARIANTE: disjuntor no teto + pendência REAL -> AINDA escala (done != bloqueado).
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, total=547)]
+    prog = _prog({C1: (533, 547)})
+    for t in range(3):
+        athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1000.0 + t,
+                                 pendencia_fn=_pend(14))
+        ex.terminar(C1)
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=2000.0,
+                             pendencia_fn=_pend(14))
+    esgotadas = [p for p, _ in voz.escaladas if p.tipo == "captura_local_esgotada"]
+    assert len(esgotadas) == 1                             # DENTE: pendência real AINDA escala
+
+
+def test_pendencia_desconhecida_fail_open_dispara():
+    # tracker ilegível / curso não semeado -> None -> comportamento antigo (dispara).
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    athena_local.ciclo_local([_curso(C1, total=547)], ex, _prog({C1: (533, 547)}), voz,
+                             voo, estado, agora=1000.0, pendencia_fn=_pend(None))
+    assert ex.disparos == [C1]                             # fail-open: NÃO trava a captura
+
+
+def test_sem_pendencia_com_avanco_no_notion_sai_do_cooldown():
+    # Se o Notion AVANÇA (apareceu trabalho novo) o cooldown some e a captura retoma.
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, total=547)]
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1000.0, pendencia_fn=_pend(0))
+    assert ex.disparos == []
+    # próximo ciclo: Notion subiu (534) E há pendência -> avanço limpa o cooldown, captura.
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (534, 547)}), voz, voo, estado,
+                             agora=1100.0, pendencia_fn=_pend(5))
+    assert ex.disparos == [C1]
+
+
+# ==========================================================================
+# HIGIENE (1) — REAPER no BOOT da lane: `rodar` chama o reaper UMA vez ANTES do
+# primeiro ciclo (limpa órfãos async de uma encarnação anterior antes de capturar).
+# ==========================================================================
+def test_rodar_chama_reaper_no_boot_antes_do_primeiro_ciclo(monkeypatch):
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    ordem = []
+    orig_ciclo = athena_local.ciclo_local
+
+    def espia_ciclo(*a, **k):
+        ordem.append("ciclo")
+        return orig_ciclo(*a, **k)
+
+    monkeypatch.setattr(athena_local, "ciclo_local", espia_ciclo)
+    asyncio.run(athena_local.rodar(
+        [_curso(C1, total=18)], ex, _prog({C1: (0, 18)}), voz,
+        sleep=_noop_sleep, max_iters=1, intervalo_s=0.0,
+        reaper_fn=lambda: ordem.append("reaper")))
+    assert ordem and ordem[0] == "reaper"                  # DENTE: reaper ANTES do 1º ciclo
+    assert "ciclo" in ordem

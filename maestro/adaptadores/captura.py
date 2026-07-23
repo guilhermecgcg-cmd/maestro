@@ -673,6 +673,116 @@ def _pendencias_tracker_stoa(curso_url, motor_dir):
 _PENDENCIAS_PADRAO = {"stoa": _pendencias_tracker_stoa}
 
 
+# --- HIGIENE (1): REAPER DE ÓRFÃOS NO BOOT DA LANE (Camada A, process-based) --------
+# O motor (aula/motor/tracker.py) tem `reap_orphans` (Camada B): reset STALE de
+# LEGENDA_INFLIGHT por TEMPO. Ele NÃO toca os in-flight ASSÍNCRONOS — a limpeza deles
+# é de PROCESSO ("Camada A, no runner da lane"), que nunca era feita. Uma captura async
+# que MORREU (crash/redeploy) deixa a aula presa em `transcrevendo`/`capturando_nao_video`
+# etc. para SEMPRE: só o passe DONO daquele estado a retoma, e ele não roda se o processo
+# caiu. Este reaper roda no BOOT da lane e, para um curso cujo processo de captura NÃO
+# está vivo, devolve essas órfãs a `pendente`.
+#
+# ESPELHO de motor/tracker.py::ASYNC_INFLIGHT (a FONTE-VERDADE vive lá; se mudar, ESTA
+# lista muda junto — contrato de espelho, igual a _PENDING_EXCLUDED acima).
+_ASYNC_INFLIGHT = ("transcrevendo", "transcrevendo_embed", "capturando_nao_video",
+                   "transcrevendo_youtube")
+
+
+def reap_orphans_local(curso_url, motor_dir, *, curso_ativo) -> int:
+    """REAPER de órfãos ASSÍNCRONOS no BOOT da lane. Uma aula in-flight async
+    (transcrevendo*/capturando_nao_video) cujo PROCESSO de captura NÃO está vivo volta a
+    `pendente` (re-selecionável). Devolve quantas resetou.
+
+    DENTES / INVIOLÁVEIS:
+      - `curso_ativo(curso_url)` True (captura VIVA) => NO-OP (retorna 0). NUNCA toca uma
+        aula cujo dono ainda roda — mexer no tracker de um motor vivo é corrida + risco de
+        double-select. É a Ordem IV (nunca perturba processo vivo).
+      - Só toca `_ASYNC_INFLIGHT`; terminais (`no_notion`/`sem_conteudo`/`falhou`…) e
+        `pendente` ficam intocados. LEGENDA_INFLIGHT é da Camada B (motor, por tempo) —
+        aqui não se mexe.
+      - PRESERVA `notion_page_id` e `error` (só o `status` muda): o resume ARQUIVA a
+        página órfã antes de recriar (fail-closed — nunca promove a `no_notion` de graça).
+      - Fail-open: db ausente / course_id não resolve / erro de SQL => 0 (nunca estoura o
+        boot da lane por causa de higiene)."""
+    if curso_ativo(curso_url):
+        return 0                                            # captura VIVA: intocável
+    course_id = _course_id_de_url(curso_url)
+    if not course_id:
+        return 0
+    db_path = os.path.join(motor_dir, "tracker.db")
+    if not os.path.exists(db_path):
+        return 0
+    con = None
+    try:
+        con = sqlite3.connect(db_path, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        marcadores = ",".join("?" * len(_ASYNC_INFLIGHT))
+        cur = con.execute(
+            f"UPDATE lessons SET status='pendente', updated_at=? "
+            f"WHERE course_id=? AND status IN ({marcadores})",
+            (time.time(), course_id, *_ASYNC_INFLIGHT))
+        con.commit()
+        return cur.rowcount or 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        if con is not None:
+            con.close()
+
+
+# --- HIGIENE (2): PENDÊNCIA CAPTURÁVEL (detecta "essencialmente pronto") ------------
+# Um curso pode ter `no_notion < total` no Notion PARA SEMPRE sem estar bloqueado: as
+# aulas TERMINAIS (sem_conteudo = sem conteúdo real; falhou/audio_erro/nao_video_erro =
+# falha DETERMINÍSTICA per-aula, K falhas idênticas) nunca chegam ao Notion. Falso-
+# positivo real: invistodireito = 533 no_notion + 13 sem_conteudo + 1 falhou (total 547)
+# -> Notion nunca "completo" (533<547), mas ZERO trabalho capturável.
+#
+# CONSERVADOR de propósito (viés a NÃO-pronto): só entram no set TERMINAL os estados
+# inequivocamente sem trabalho de captura restante. Uma PAREDE/throttle deixa a aula num
+# estado PENDENTE/in-flight (o motor só promove a terminal após K falhas IDÊNTICAS de
+# CONTEÚDO) => conta como capturável => o curso NÃO é "pronto" e SEGUE escalando (a
+# invariante do cooldown-de-concluído). Estados benignos que passes POSTERIORES retomam
+# (sem_legenda→áudio, sem_video→embed, sem_embed→não-vídeo, video_youtube→youtube) NÃO
+# são terminais aqui: há trabalho capturável.
+_TERMINAIS_DONE = frozenset({
+    "no_notion", "anexos_baixados",        # sucesso terminal
+    "sem_conteudo",                        # sem conteúdo real (benigno terminal)
+    "falhou", "audio_erro", "nao_video_erro",  # falha DETERMINÍSTICA per-aula (K idênticas)
+})
+
+
+def pendencia_capturavel_local(curso_url, motor_dir):
+    """Nº de aulas com trabalho de captura AINDA pendente no tracker local (status NÃO
+    em `_TERMINAIS_DONE`). 0 => "essencialmente pronto" (só restam terminais).
+
+    Devolve **None** (DESCONHECIDO => fail-open, o chamador NÃO conclui) quando: db
+    ausente, course_id não resolve, erro de SQL, **ou o curso não tem NENHUMA linha** no
+    tracker (nunca semeado localmente). Este último caso é CRÍTICO: 0-linhas != pronto —
+    tratá-lo como 0-pendente marcaria um curso NUNCA capturado como concluído e o
+    STARVARIA. Só um curso COM linhas e SEM capturável é 'pronto'."""
+    course_id = _course_id_de_url(curso_url)
+    if not course_id:
+        return None
+    db_path = os.path.join(motor_dir, "tracker.db")
+    if not os.path.exists(db_path):
+        return None
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        con.execute("PRAGMA busy_timeout=5000")
+        linhas = con.execute(
+            "SELECT status, COUNT(*) FROM lessons WHERE course_id=? GROUP BY status",
+            (course_id,)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        if con is not None:
+            con.close()
+    if not linhas:
+        return None                                        # nunca semeado: NÃO é 'pronto'
+    return sum(n for (s, n) in linhas if s not in _TERMINAIS_DONE)
+
+
 def _passe_ativavel(passe, plataforma="hotmart"):
     """Um passe pode ser DISPARADO? Gates de ativação POR FLAG (mesmo mecanismo p/ todos:
     o código fica WIRED e a operação liga por env + restart guardado, sem tocar código):

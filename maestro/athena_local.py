@@ -97,6 +97,15 @@ _BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
 # limpa o cooldown na hora. Default 6h; env ATHENA_COOLDOWN_CONCLUIDO_S calibra.
 _COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"))  # 6h
 
+# COOLDOWN de curso SEM PENDÊNCIA CAPTURÁVEL (higiene 2): o tracker prova que só restam
+# aulas TERMINAIS (no_notion/sem_conteudo/falhou…), mesmo com o Notion < total (aulas
+# terminais nunca chegam ao Notion). É "essencialmente pronto" — não re-disparar NEM
+# escalar exit-4 a cada ciclo (falso-positivo invistodireito 533/547). Cooldown LONGO
+# (mais que a saída-limpa: aqui o tracker PROVA que não há trabalho, então revisitar é
+# ainda mais raro). QUALQUER avanço no Notion / pendência nova limpa na hora (never-stop).
+# INVARIANTE: pendência REAL (parede/throttle => aula pendente/in-flight) NÃO cai aqui.
+_COOLDOWN_SEM_PENDENCIA_S = float(os.getenv("ATHENA_COOLDOWN_SEM_PENDENCIA_S", "86400"))  # 24h
+
 
 # ---------------------------------------------------------------------------
 # NULL-OBJECTS (defaults) — assinaturas IDÊNTICAS às dos módulos reais (P3/P4/P5/P2),
@@ -467,7 +476,8 @@ def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st, *, espinha=None):
 
 
 def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disjuntor,
-                      agora, cooldown_s=_COOLDOWN_SAIDA_LIMPA_S, espinha=None):
+                      agora, cooldown_s=_COOLDOWN_SAIDA_LIMPA_S, espinha=None,
+                      pendencia_fn=None, cooldown_sem_pendencia_s=_COOLDOWN_SEM_PENDENCIA_S):
     """Fábrica da `passada_fn` LOCAL que o owner (`orquestrar_captura`) invoca por curso.
 
     A máquina de estados por-curso (persiste em `estado[curso]` entre ciclos):
@@ -571,6 +581,32 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         cd = st.get("cooldown_ate")
         if cd is not None and agora < cd:
             return None
+        # HIGIENE (2) — SEM PENDÊNCIA CAPTURÁVEL ("essencialmente pronto"): o tracker prova
+        # que só restam terminais (no_notion/sem_conteudo/falhou…), mesmo com o Notion <
+        # total. NÃO re-disparar NEM escalar exit-4 a cada ciclo (falso invistodireito
+        # 533/547): entra em cooldown LONGO. Roda ANTES do disjuntor/dispatch, de modo que
+        # o curso nem é RE-SELECIONADO (não spawna -> não morre -> não vira exit-4 escalado).
+        # None (desconhecido/não semeado) => fail-open (segue o fluxo antigo). >0 (pendência
+        # REAL: parede/throttle deixam a aula PENDENTE/in-flight) => NÃO cai aqui e SEGUE
+        # para o disjuntor/escala — a INVARIANTE "done != bloqueado".
+        if pendencia_fn is not None:
+            try:
+                pend = pendencia_fn(curso)
+            except Exception:
+                pend = None                                # fail-open: higiene nunca trava captura
+            if pend == 0:
+                st["cooldown_ate"] = agora + cooldown_sem_pendencia_s
+                if not st.get("sem_pendencia_avisado"):
+                    st["sem_pendencia_avisado"] = True      # latch: só loga a TRANSIÇÃO
+                    _registrar(esp, f"{curso} sem pendência capturável — cooldown "
+                               f"{int(cooldown_sem_pendencia_s)}s",
+                               "só restam aulas terminais (sem_conteudo/falhou/no_notion) — "
+                               "NÃO re-disparo nem escalo exit-4 (Notion < total é benigno)",
+                               reversivel=True, fonte="deterministico", curso=curso,
+                               plataforma=plat, origem="athena-local/passada")
+                return None
+            if pend is not None and pend > 0:
+                st.pop("sem_pendencia_avisado", None)       # há trabalho: re-arma o latch
         try:
             pode = disjuntor.pode_tentar(st, agora)
         except Exception:
@@ -1223,7 +1259,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 flap_min=None, llm=None, espinha=None, sistemas=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
                 sistema_lock_dir=None, sistema_autopsia_dir=None,
-                gasto_por_sistema_fn=None, budget_modo=None):
+                gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -1284,7 +1320,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     # (4) passada LOCAL + owner.
     passada = _passada_local_fn(executor, progresso_cached, voz, estado,
                                 projeto_nome=projeto_nome, disjuntor=disjuntor,
-                                agora=agora, espinha=espinha)
+                                agora=agora, espinha=espinha, pendencia_fn=pendencia_fn)
 
     def notion_fn(curso):
         try:
@@ -1341,7 +1377,8 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 lock_dir=None, autopsia_dir=None, meta_por_curso=None, flap_min=None,
                 llm=None, espinha=None, sistemas=None, sistema_executor=None,
                 causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None,
-                gasto_por_sistema_fn=None, budget_modo=None):
+                gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
+                reaper_fn=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). A cada
     ciclo grava o PULSO e chama o BATIMENTO — ambos BEST-EFFORT (observabilidade nunca mata
@@ -1362,6 +1399,16 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     ultimo_erro = None
     ultimo_batimento = 0.0
     t0 = time.time()
+    # HIGIENE (1) — REAPER NO BOOT DA LANE: ANTES do 1º ciclo, devolve a `pendente` as
+    # aulas in-flight async órfãs (transcrevendo*/capturando_nao_video) de uma encarnação
+    # ANTERIOR cujo processo NÃO está mais vivo (crash/redeploy). Sem isso elas ficam presas
+    # para sempre. Best-effort: a higiene NUNCA pode impedir o loop de subir. Gate anti-ban
+    # é do próprio reaper (só toca curso SEM captura viva — ver captura.reap_orphans_local).
+    if reaper_fn is not None:
+        try:
+            reaper_fn()
+        except Exception:
+            pass
     i = 0
     while max_iters is None or i < max_iters:
         i += 1
@@ -1376,7 +1423,8 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         sistema_executor=sistema_executor, causa_sistema=causa_sistema,
                         estado_sistemas=estado_sistemas, sistema_lock_dir=sistema_lock_dir,
                         sistema_autopsia_dir=sistema_autopsia_dir,
-                        gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo)
+                        gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
+                        pendencia_fn=pendencia_fn)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -1547,6 +1595,27 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     total_por_curso = {c.url: c.total_esperado for c in cursos}
     progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso)
 
+    # HIGIENE — motor_dir POR CURSO (Stoa vive noutro worktree): o mesmo mapa que o
+    # executor usa (`_motor_dir_de`), para que reaper/pendência leiam o tracker.db CERTO.
+    _plat_por_curso = {c.url: c.plataforma for c in cursos}
+
+    def _motor_dir_do_curso(url):
+        return executor._motor_dir_de(_plat_por_curso.get(url, "hotmart"))
+
+    # HIGIENE (2): pendência capturável por curso (None = desconhecido -> fail-open).
+    def pendencia_fn(url):
+        return captura.pendencia_capturavel_local(url, _motor_dir_do_curso(url))
+
+    # HIGIENE (1): reaper de órfãos async no BOOT da lane — só toca curso SEM captura viva
+    # (gate anti-ban dentro de `reap_orphans_local`). Best-effort por curso.
+    def reaper_fn():
+        for c in cursos:
+            try:
+                captura.reap_orphans_local(c.url, _motor_dir_do_curso(c.url),
+                                           curso_ativo=executor.curso_ativo)
+            except Exception:
+                pass
+
     plataformas = frozenset(
         p for p in os.getenv(
             "PLATAFORMAS_SUPORTADAS", ",".join(PLATAFORMAS_SUPORTADAS_PADRAO))
@@ -1608,7 +1677,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         espinha=decisoes_mod, sistemas=sistemas, sistema_executor=sistema_executor,
         causa_sistema=causa_sistema_mod, sistema_lock_dir=sistema_lock_dir,
         sistema_autopsia_dir=sistema_autopsia_dir,
-        gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo))
+        gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
+        pendencia_fn=pendencia_fn, reaper_fn=reaper_fn))
 
 
 if __name__ == "__main__":  # pragma: no cover

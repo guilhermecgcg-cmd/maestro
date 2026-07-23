@@ -103,3 +103,46 @@ def test_reaper_url_sem_course_id_e_noop(tmp_path):
     # URL sem /products/<id> -> course_id não resolve -> no-op (fail-open), não toca nada.
     assert captura.reap_orphans_local("https://x/sem-id", md, curso_ativo=lambda u: False) == 0
     assert _status(md)["a"][0] == "transcrevendo"
+
+
+# ==========================================================================
+# BLOQUEANTE 1 (review) — STARVATION do --youtube pelo cooldown-de-concluído:
+# `pendencia_capturavel_local` punha `nao_video_erro` em _TERMINAIS_DONE
+# INCONDICIONALMENTE, mas o rodízio (`_pendencias_tracker`) conta as
+# `nao_video_erro` com assinatura YouTube ('provedor não suportado'+'youtube',
+# _SQL_YOUTUBE_RESGATE) como TRABALHO do passe --youtube. Um curso só com essas
+# aulas (ciro-gestor: 68) seria tratado como DONE -> cooldown -> resgate morto.
+# DENTE: nao_video_erro-youtube é CAPTURÁVEL (curso NÃO é 'pronto').
+# ==========================================================================
+def test_nao_video_erro_youtube_e_capturavel_nao_done(tmp_path):
+    md = _tracker(tmp_path)
+    _seed(md, [(f"y{i}", "nao_video_erro", None,
+                "captura não-vídeo: provedor não suportado (youtube.com/embed/x)")
+               for i in range(3)])
+    # DENTE: 3 aulas de resgate --youtube = 3 capturáveis (NÃO 0 => NÃO entra em cooldown)
+    assert captura.pendencia_capturavel_local(CURSO, md) == 3
+
+
+def test_nao_video_erro_generico_segue_terminal_done(tmp_path):
+    # INVARIANTE (não reabrir o falso-positivo invistodireito): `nao_video_erro` SEM a
+    # assinatura de resgate segue TERMINAL — inclusive o terminal defensivo do próprio
+    # passe --youtube ('nenhum vídeo YouTube capturável', que contém 'youtube' mas NÃO
+    # 'provedor não suportado') — senão o rodízio dispararia --youtube à toa p/ sempre.
+    md = _tracker(tmp_path)
+    _seed(md, [
+        ("a", "nao_video_erro", None, "nenhum vídeo YouTube capturável"),
+        ("b", "nao_video_erro", None, "download falhou: timeout"),
+        ("ok", "no_notion", "pg", None),
+    ])
+    assert captura.pendencia_capturavel_local(CURSO, md) == 0   # done REAL -> cooldown OK
+
+
+def test_mix_youtube_resgate_soma_com_pendentes(tmp_path):
+    # resgate youtube SOMA com o capturável normal (não substitui nem duplica).
+    md = _tracker(tmp_path)
+    _seed(md, [
+        ("p1", "pendente", None, None),
+        ("y1", "nao_video_erro", None, "provedor não suportado: youtube"),
+        ("t1", "sem_conteudo", None, None),
+    ])
+    assert captura.pendencia_capturavel_local(CURSO, md) == 2   # 1 pendente + 1 resgate

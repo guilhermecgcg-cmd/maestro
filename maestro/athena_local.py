@@ -93,7 +93,8 @@ _BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
 # denominador que temos. Em vez de re-spawnar a cada ciclo (o que floodava o vigia com
 # saídas-limpas e queimava sessão à toa), o curso entra num COOLDOWN: fica quieto por
 # esta janela e só é reavaliado ao expirar. NÃO é permanente (never-stop): se novo
-# conteúdo aparecer, um ciclo pós-cooldown o retoma; e QUALQUER avanço real no Notion
+# conteúdo aparecer, um ciclo pós-cooldown o retoma; e QUALQUER avanço real no Notion —
+# ou pendência capturável NOVA no tracker (acima do baseline do arme; ex.: reseed) —
 # limpa o cooldown na hora. Default 6h; env ATHENA_COOLDOWN_CONCLUIDO_S calibra.
 _COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"))  # 6h
 
@@ -548,6 +549,17 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return acao
         if executor.curso_ativo(curso):
             return None                                    # capturando: quieto
+        # PENDÊNCIA CAPTURÁVEL (tracker), lida UMA vez por passada e ANTES da máquina de
+        # cooldown: serve (a) de BASELINE no arme do cooldown de saída-limpa e (b) de
+        # gatilho never-stop DENTRO da janela (pendência NOVA limpa o cooldown na hora —
+        # BLOQUEANTE-2 do review: antes só avanço-no-Notion/morte limpavam, e um reseed
+        # dentro da janela ficava preso). None = desconhecido (fail-open).
+        pend = None
+        if pendencia_fn is not None:
+            try:
+                pend = pendencia_fn(curso)
+            except Exception:
+                pend = None                                # fail-open: higiene nunca trava captura
         # O processo encerrou. Distinguir SAÍDA LIMPA (concluído/quiescido) de MORTE.
         if st.get("fase") == FASE_CAPTURANDO:
             if st.get("_saida_limpa_ciclo") == agora:
@@ -561,6 +573,10 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                            and int(no_notion) > int(ref))
                 if not avancou:
                     st["cooldown_ate"] = agora + cooldown_s
+                    # BASELINE do never-stop: só pendência ACIMA disto é 'nova' e limpa a
+                    # janela — a preexistente (ex.: sem_legenda à espera do --audio) NÃO
+                    # limpa, senão o cooldown anti-flood viraria letra morta.
+                    st["_pend_no_cooldown"] = pend
                     # E8: saída limpa sem avanço → curso quiescido entra em cooldown.
                     _registrar(esp, f"{curso} quiescido — cooldown {int(cooldown_s)}s",
                                "saída limpa (exit 0) sem avanço no Notion",
@@ -577,10 +593,24 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                 st["fase"] = FASE_NOVO
         # COOLDOWN de saída-limpa: curso quiescido fica quieto até a janela expirar (não é
         # falha nem escala — só evita o re-spawn apertado de um curso concluído). Ao expirar,
-        # cai adiante e reavalia (never-stop). Qualquer avanço no Notion já limpou o cooldown.
+        # cai adiante e reavalia (never-stop). O cooldown limpa ANTES de expirar em: avanço
+        # no Notion, morte real, e (aqui) pendência capturável NOVA acima do baseline do
+        # arme — reseed/conteúdo novo dentro da janela re-seleciona NA HORA (never-stop).
+        # Baseline desconhecido (None) => conservador: a janela segura até expirar.
         cd = st.get("cooldown_ate")
         if cd is not None and agora < cd:
-            return None
+            base = st.get("_pend_no_cooldown")
+            if pend is not None and base is not None and int(pend) > int(base):
+                st.pop("cooldown_ate", None)               # NEVER-STOP: há trabalho NOVO
+                st.pop("sem_pendencia_avisado", None)      # re-arma o latch do E13
+                # E14: pendência nova dentro da janela — cooldown limpo na hora.
+                _registrar(esp, f"{curso}: pendência nova ({base}→{pend}) limpou o cooldown",
+                           "never-stop: trabalho capturável apareceu dentro da janela "
+                           "(reseed/conteúdo novo) — re-seleciono já",
+                           reversivel=True, fonte="deterministico", curso=curso,
+                           plataforma=plat, origem="athena-local/passada")
+            else:
+                return None
         # HIGIENE (2) — SEM PENDÊNCIA CAPTURÁVEL ("essencialmente pronto"): o tracker prova
         # que só restam terminais (no_notion/sem_conteudo/falhou…), mesmo com o Notion <
         # total. NÃO re-disparar NEM escalar exit-4 a cada ciclo (falso invistodireito
@@ -589,24 +619,20 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         # None (desconhecido/não semeado) => fail-open (segue o fluxo antigo). >0 (pendência
         # REAL: parede/throttle deixam a aula PENDENTE/in-flight) => NÃO cai aqui e SEGUE
         # para o disjuntor/escala — a INVARIANTE "done != bloqueado".
-        if pendencia_fn is not None:
-            try:
-                pend = pendencia_fn(curso)
-            except Exception:
-                pend = None                                # fail-open: higiene nunca trava captura
-            if pend == 0:
-                st["cooldown_ate"] = agora + cooldown_sem_pendencia_s
-                if not st.get("sem_pendencia_avisado"):
-                    st["sem_pendencia_avisado"] = True      # latch: só loga a TRANSIÇÃO
-                    _registrar(esp, f"{curso} sem pendência capturável — cooldown "
-                               f"{int(cooldown_sem_pendencia_s)}s",
-                               "só restam aulas terminais (sem_conteudo/falhou/no_notion) — "
-                               "NÃO re-disparo nem escalo exit-4 (Notion < total é benigno)",
-                               reversivel=True, fonte="deterministico", curso=curso,
-                               plataforma=plat, origem="athena-local/passada")
-                return None
-            if pend is not None and pend > 0:
-                st.pop("sem_pendencia_avisado", None)       # há trabalho: re-arma o latch
+        if pend == 0:
+            st["cooldown_ate"] = agora + cooldown_sem_pendencia_s
+            st["_pend_no_cooldown"] = 0                     # baseline 'done': QUALQUER >0 é nova
+            if not st.get("sem_pendencia_avisado"):
+                st["sem_pendencia_avisado"] = True          # latch: só loga a TRANSIÇÃO
+                _registrar(esp, f"{curso} sem pendência capturável — cooldown "
+                           f"{int(cooldown_sem_pendencia_s)}s",
+                           "só restam aulas terminais (sem_conteudo/falhou/no_notion) — "
+                           "NÃO re-disparo nem escalo exit-4 (Notion < total é benigno)",
+                           reversivel=True, fonte="deterministico", curso=curso,
+                           plataforma=plat, origem="athena-local/passada")
+            return None
+        if pend is not None and pend > 0:
+            st.pop("sem_pendencia_avisado", None)           # há trabalho: re-arma o latch
         try:
             pode = disjuntor.pode_tentar(st, agora)
         except Exception:

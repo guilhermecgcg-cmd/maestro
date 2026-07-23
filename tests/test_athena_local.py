@@ -493,6 +493,46 @@ def test_sem_pendencia_com_avanco_no_notion_sai_do_cooldown():
 
 
 # ==========================================================================
+# BLOQUEANTE 2 (review) — invariante never-stop era FALSA: o comentário prometia
+# "qualquer pendência nova limpa o cooldown na hora", mas o código só limpava em
+# AVANÇO no Notion e em MORTE. Pendência NOVA dentro da janela (ex.: reseed via
+# Telegram adiciona linhas `pendente` num curso 'done') NÃO limpava -> curso preso
+# em cooldown de até 24h. DENTE: pendência nova DENTRO da janela limpa NA HORA.
+# ==========================================================================
+def test_pendencia_nova_dentro_do_cooldown_limpa_na_hora():
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, total=547)]
+    caixa = {"pend": 0}
+    fn = lambda curso: caixa["pend"]                       # noqa: E731 — dublê mutável
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1000.0, pendencia_fn=fn)
+    assert ex.disparos == []                               # done -> cooldown longo (24h)
+    assert estado[C1].get("cooldown_ate") is not None
+    caixa["pend"] = 68                                     # RESEED: pendência NOVA na janela
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1100.0, pendencia_fn=fn)   # BEM dentro da janela
+    assert ex.disparos == [C1]                             # DENTE: limpou NA HORA e capturou
+    assert estado[C1].get("cooldown_ate") is None          # cooldown foi embora
+
+
+def test_pendencia_igual_ao_baseline_nao_limpa_cooldown():
+    # INVARIANTE anti-flood: pendência que JÁ existia quando o cooldown armou (baseline)
+    # não é 'nova' — o cooldown segura. Só o delta acima do baseline limpa.
+    voz = FakeVoz()
+    ex = FakeExecutor({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, total=547)]
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1000.0, pendencia_fn=_pend(0))
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (533, 547)}), voz, voo, estado,
+                             agora=1100.0, pendencia_fn=_pend(0))   # nada novo
+    assert ex.disparos == []                               # segue em cooldown (done real)
+    assert estado[C1].get("cooldown_ate") is not None
+
+
+# ==========================================================================
 # HIGIENE (1) — REAPER no BOOT da lane: `rodar` chama o reaper UMA vez ANTES do
 # primeiro ciclo (limpa órfãos async de uma encarnação anterior antes de capturar).
 # ==========================================================================

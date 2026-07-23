@@ -749,11 +749,18 @@ _TERMINAIS_DONE = frozenset({
     "sem_conteudo",                        # sem conteúdo real (benigno terminal)
     "falhou", "audio_erro", "nao_video_erro",  # falha DETERMINÍSTICA per-aula (K idênticas)
 })
+# EXCEÇÃO ao terminal `nao_video_erro` (espelha `_pendencias_tracker`): as com a
+# assinatura YouTube-resgate (_SQL_YOUTUBE_RESGATE: 'provedor não suportado'+'youtube')
+# são TRABALHO do passe --youtube — o rodízio as conta como pool capturável. Sem esta
+# exceção, um curso SÓ com elas (ciro-gestor: 68 aulas) seria 'done' aqui, entraria no
+# cooldown-de-concluído e o resgate --youtube MORRERIA de starvation (o rodízio nunca
+# mais o veria). Elas somam de volta ao capturável em `pendencia_capturavel_local`.
 
 
 def pendencia_capturavel_local(curso_url, motor_dir):
     """Nº de aulas com trabalho de captura AINDA pendente no tracker local (status NÃO
-    em `_TERMINAIS_DONE`). 0 => "essencialmente pronto" (só restam terminais).
+    em `_TERMINAIS_DONE`, MAIS as `nao_video_erro` de resgate YouTube — ver a exceção
+    acima). 0 => "essencialmente pronto" (só restam terminais).
 
     Devolve **None** (DESCONHECIDO => fail-open, o chamador NÃO conclui) quando: db
     ausente, course_id não resolve, erro de SQL, **ou o curso não tem NENHUMA linha** no
@@ -773,6 +780,9 @@ def pendencia_capturavel_local(curso_url, motor_dir):
         linhas = con.execute(
             "SELECT status, COUNT(*) FROM lessons WHERE course_id=? GROUP BY status",
             (course_id,)).fetchall()
+        # BLOQUEANTE-1 do review: resgate YouTube conta como CAPTURÁVEL (não terminal).
+        resgate_youtube = con.execute(
+            _SQL_YOUTUBE_RESGATE, (course_id,)).fetchone()[0]
     except sqlite3.Error:
         return None
     finally:
@@ -780,7 +790,7 @@ def pendencia_capturavel_local(curso_url, motor_dir):
             con.close()
     if not linhas:
         return None                                        # nunca semeado: NÃO é 'pronto'
-    return sum(n for (s, n) in linhas if s not in _TERMINAIS_DONE)
+    return sum(n for (s, n) in linhas if s not in _TERMINAIS_DONE) + resgate_youtube
 
 
 def _passe_ativavel(passe, plataforma="hotmart"):

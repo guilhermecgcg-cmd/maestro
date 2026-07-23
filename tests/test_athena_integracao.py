@@ -327,6 +327,49 @@ def test_cooldown_de_saida_limpa_expira_e_reavalia(tmp_path):
     assert alr.mortes == []                                # e sem falso alarme
 
 
+# ==========================================================================
+# BLOQUEANTE 2 (review) no cooldown de SAÍDA-LIMPA: pendência NOVA (acima do
+# baseline snapshotado no ARME) limpa a janela na hora (never-stop); pendência
+# PREEXISTENTE (ex.: sem_legenda à espera do passe --audio quando o run base sai
+# limpo) NÃO limpa — senão o cooldown anti-flood viraria letra morta.
+# ==========================================================================
+def test_cooldown_saida_limpa_pendencia_nova_limpa_na_hora(tmp_path):
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", total=0)]
+    common = _reais(tmp_path, alr)
+    caixa = {"pend": 30}                                   # 30 capturáveis cross-passe
+    common["pendencia_fn"] = lambda u: caixa["pend"]
+    prog = _prog({C1: (162, 0)})
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1000.0, **common)
+    ex.matar(C1, exit_code=0, stderr="sessão viva")        # saída LIMPA sem avanço
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1100.0, **common)
+    assert ex.disparos.count(C1) == 1                      # em cooldown (nada novo ainda)
+    caixa["pend"] = 45                                     # RESEED: 15 pendências NOVAS
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1200.0, **common)
+    assert ex.disparos.count(C1) == 2                      # DENTE: limpou NA HORA
+    assert alr.mortes == []                                # sem falso alarme
+
+
+def test_cooldown_saida_limpa_pendencia_preexistente_nao_limpa(tmp_path):
+    # INVARIANTE anti-flood: pend estável (== baseline do arme) mantém a janela.
+    voz = FakeVoz()
+    alr = SpyAlertas()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", total=0)]
+    common = _reais(tmp_path, alr)
+    common["pendencia_fn"] = lambda u: 30                  # estável: nada NOVO
+    prog = _prog({C1: (162, 0)})
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1000.0, **common)
+    ex.matar(C1, exit_code=0, stderr="sessão viva")
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1100.0, **common)
+    athena_local.ciclo_local(cursos, ex, prog, voz, voo, estado, agora=1200.0, **common)
+    assert ex.disparos.count(C1) == 1                      # DENTES: cooldown segurou
+
+
 def test_morte_real_exit2_sessao_ainda_conta_e_escala_reseed(tmp_path):
     # DENTES anti-regressão do anti-ban: uma MORTE REAL (exit 2 = sessão morta pelo motor)
     # NÃO pode cair no ramo de saída-limpa — CONTINUA irredutível + escala reseed.

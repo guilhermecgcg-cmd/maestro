@@ -236,11 +236,14 @@ def test_curso_ativo_reflete_o_ciclo_de_vida():
 # FAIL-CLOSED: plataforma desconhecida / curso sem metadados -> LEVANTA
 # ==========================================================================
 def test_plataforma_desconhecida_levanta_e_nao_spawna():
+    # NB: o exemplo era 'kiwify' até a fiação dos 5 adaptadores novos — agora ela É
+    # integrada. A intenção do teste é a MESMA de sempre: plataforma fora do
+    # _PLATAFORMAS => fail-closed, jamais spawn às cegas (exemplo real-desconhecido).
     sp = FakeSpawn()
-    ex = _exec(captura.CursoLocal(url="https://kiwify.com.br/z", conta="k",
-                                  plataforma="kiwify"), spawn=sp)
+    ex = _exec(captura.CursoLocal(url="https://udemy.com/z", conta="k",
+                                  plataforma="udemy"), spawn=sp)
     with pytest.raises(RuntimeError):
-        ex.disparar("https://kiwify.com.br/z")
+        ex.disparar("https://udemy.com/z")
     assert sp.calls == []                                  # nada disparado às cegas
 
 

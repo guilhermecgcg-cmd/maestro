@@ -1453,10 +1453,24 @@ def progresso_local_fn(motor_python, motor_dir, total_por_curso, *, run=None):
     return _fn
 
 
+# Gate de DOMÍNIO default (main() -> `plataformas_suportadas`, casada por sufixo de host
+# em `adaptador_pipeline.plataforma_suportada`). Fora desta lista => o ciclo NÃO despacha
+# (Capacidade B: plataforma nova escala, nunca captura às cegas). ADITIVO: os 4 primeiros
+# são as plataformas vivas de sempre; os 5 seguintes são os adaptadores novos fiados em
+# 22/07 (kiwify/nutror/alpaclass/hubla/greenn — sessões semeadas 20/07). Env
+# PLATAFORMAS_SUPORTADAS sobrepõe (ex.: para pausar uma plataforma sem tocar código).
+PLATAFORMAS_SUPORTADAS_PADRAO = (
+    "hotmart.com", "memberkit.com.br", "stoa.com.br", "mykajabi.com",
+    "kiwify.com.br", "nutror.com", "alpaclass.com", "hub.la", "greenn.com.br")
+
+
 def carregar_cursos(path) -> list:
     """Lê a lista de cursos desejados do YAML doméstico. Cada entrada:
-    {url, conta, plataforma?, total_esperado?}. `conta` é OBRIGATÓRIA (chave anti-ban) — a
-    ausência LEVANTA (fail-closed)."""
+    {url, conta, plataforma?, total_esperado?, session_path?}. `conta` é OBRIGATÓRIA
+    (chave anti-ban) — a ausência LEVANTA (fail-closed). `session_path` (opcional)
+    aponta o storage_state EXISTENTE da conta (semeado por login manual do usuário);
+    só é INJETADO no motor pelas plataformas cujo spec declara `session_env` (as 5
+    novas) — nas demais é carregado mas inerte (comportamento vivo intacto)."""
     import yaml
     with open(path) as f:
         dados = yaml.safe_load(f) or []
@@ -1465,7 +1479,8 @@ def carregar_cursos(path) -> list:
         out.append(captura.CursoLocal(
             url=d["url"], conta=d["conta"],
             plataforma=d.get("plataforma", "hotmart"),
-            total_esperado=int(d.get("total_esperado", 0))))
+            total_esperado=int(d.get("total_esperado", 0)),
+            session_path=str(d.get("session_path", "") or "")))
     return out
 
 
@@ -1534,8 +1549,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
 
     plataformas = frozenset(
         p for p in os.getenv(
-            "PLATAFORMAS_SUPORTADAS",
-            "hotmart.com,memberkit.com.br,stoa.com.br,mykajabi.com")
+            "PLATAFORMAS_SUPORTADAS", ",".join(PLATAFORMAS_SUPORTADAS_PADRAO))
         .replace(" ", "").split(",") if p)
     plataformas_suportadas = plataformas or None
     max_tentativas = int(os.getenv("ATHENA_MAX_TENTATIVAS", "3"))

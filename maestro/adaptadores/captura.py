@@ -384,11 +384,15 @@ class CursoLocal:
     anti-ban (contas diferentes rodam em paralelo; a MESMA conta, nunca). `plataforma`
     escolhe o módulo do motor e a política headed/headless. `total_esperado` é o
     DENOMINADOR (opcional) da completude-por-Notion — 0 = desconhecido => o owner
-    NUNCA declara concluído (fail-closed, anti-falso-pronto)."""
+    NUNCA declara concluído (fail-closed, anti-falso-pronto). `session_path` (opcional)
+    aponta o storage_state EXISTENTE da conta (semeado por login manual — NUNCA
+    re-logamos): quando a plataforma declara um `session_env` no spec, `_montar` injeta
+    este caminho no env do motor; vazio => o motor usa o default dele (cwd=motor_dir)."""
     url: str
     conta: str
     plataforma: str = "hotmart"
     total_esperado: int = 0
+    session_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -423,13 +427,18 @@ class PlataformaSpec:
       - `env`: env FIXO extra da plataforma (perfil Chrome DEDICADO por conta via
         CHROME_USER_DATA_DIR; LESSON_TIMEOUT_S). Aplicado DEPOIS do extra_env global (a
         config da plataforma vence) e ANTES dos invioláveis (Groq/HEADLESS/MOTOR_BROWSER
-        vencem tudo)."""
+        vencem tudo).
+      - `session_env`: nome do env que recebe o `CursoLocal.session_path` (o
+        storage_state EXISTENTE, semeado por login manual). '' => não injeta nada e o
+        motor usa o default dele relativo ao cwd — é o caso das plataformas já
+        integradas (hotmart/memberkit/stoa/kajabi), mantidas INTACTAS de propósito."""
     modulo: str
     passes: tuple = ("base",)
     headless: bool = False
     chromium: bool = False
     url_env: str = ""
     env: tuple = ()
+    session_env: str = ""
 
 
 # plataforma -> como invocar o motor. Fora deste mapa => fail-closed (o motor só sabe
@@ -467,6 +476,31 @@ _PLATAFORMAS = {
     "kajabi": PlataformaSpec(
         "motor.kajabi", chromium=True, url_env="KAJABI_URL",
         env=(("CHROME_USER_DATA_DIR", ".chrome-profile-kajabi"),)),
+    # ---- 5 ADAPTADORES NOVOS (sessões semeadas 20/07 por login manual) ----------
+    # Todos: passe ÚNICO ("base" — os CLIs não conhecem --audio/--embed; a transcrição
+    # é áudio-nativa via Groq dentro do próprio pipeline), HEADLESS (no motor,
+    # HEADLESS=1 => `allow_reseed=False` => sessão morta ABORTA com SessionDeadError e
+    # a autópsia escala reseed — fail-closed, NUNCA login automático), channel=chrome
+    # (chromium=False: o MESMO canal que SEMEOU as sessões; trocar de engine mudaria o
+    # fingerprint) e perfil DEDICADO por conta via `_perfil_de_conta` (sem
+    # CHROME_USER_DATA_DIR no spec) — nunca colidem no ProcessSingleton. `session_env`
+    # aponta o storage_state EXISTENTE (CursoLocal.session_path do YAML); `url_env`
+    # espelha o argv (argv-first no CLI), como Stoa/Kajabi.
+    "kiwify": PlataformaSpec(
+        "motor.kiwify", headless=True, url_env="KIWIFY_URL",
+        session_env="KIWIFY_SESSION_PATH"),
+    "nutror": PlataformaSpec(
+        "motor.nutror", headless=True, url_env="NUTROR_URL",
+        session_env="NUTROR_SESSION_PATH"),
+    "alpaclass": PlataformaSpec(
+        "motor.alpaclass", headless=True, url_env="ALPACLASS_URL",
+        session_env="ALPACLASS_SESSION_PATH"),
+    "hubla": PlataformaSpec(
+        "motor.hubla", headless=True, url_env="HUBLA_URL",
+        session_env="HUBLA_SESSION_PATH"),
+    "greenn": PlataformaSpec(
+        "motor.greenn", headless=True, url_env="GREENN_URL",
+        session_env="GREENN_SESSION_PATH"),
 }
 
 
@@ -1071,6 +1105,13 @@ class LocalExecutor:
             env["CHROME_USER_DATA_DIR"] = _perfil_de_conta(meta.conta)
         if spec.url_env:                                   # STOA_URL / KAJABI_URL = meta.url
             env[spec.url_env] = meta.url
+        # SESSÃO EXISTENTE (INVIOLÁVEL anti-login): aponta o storage_state que o usuário
+        # semeou por login manual. Só quando o spec declara `session_env` E o curso traz
+        # `session_path` — plataformas antigas (session_env='') ficam INTACTAS, e um
+        # session_path vazio deixa o motor no default dele (cwd) em vez de inventar
+        # caminho. O motor NUNCA loga sozinho: sessão morta = SessionDeadError (abort).
+        if spec.session_env and getattr(meta, "session_path", ""):
+            env[spec.session_env] = meta.session_path
         # PYTHONPATH = a árvore do motor DESTA plataforma, p/ o `python -m <modulo>`
         # resolver o pacote certo (ex.: Stoa vive no worktree, não em /aula). Sobrepõe
         # o PYTHONPATH herdado do daemon (que aponta pra árvore da Athena, sem `motor`).

@@ -59,16 +59,20 @@ class Alertas:
         self._relogio = relogio
         self._ultimo_envio = {}          # chave -> ts do último envio Telegram
 
-    def _enviar(self, texto: str) -> None:
+    def _enviar(self, texto: str) -> bool:
+        """True = o texto CHEGOU a pelo menos um chat (só isso conta pro dedup)."""
         if self._tg is None or not self._chats:
             log.warning("alerta sem canal Telegram (só-log): %s", texto)
-            return
+            return False
+        chegou = False
         for chat in self._chats:
             try:
                 self._tg.send_message(chat, texto)
+                chegou = True
             except Exception:
                 # best-effort: o alerta nunca pode derrubar quem o chamou.
                 log.exception("falha ao enviar alerta para chat %s", chat)
+        return chegou
 
     def _suprimido_nao_essencial(self, essencial: bool, texto: str) -> bool:
         """True = fica SÓ no log (auto-tratado; nenhuma ação do dono é necessária)."""
@@ -78,20 +82,32 @@ class Alertas:
         return True
 
     def _dedup_repetido(self, chave, texto: str) -> bool:
-        """True = mesma chave já alertou dentro da janela (vira só-log). Sem chave
-        ou com relógio quebrado, fail-safe = ENVIA (dedup nunca engole por bug)."""
-        if chave is None or self._dedup_janela_s <= 0:
+        """True = mesma chave já ENVIOU (com sucesso) dentro da janela — vira só-log.
+        Fail-safe total: sem chave, em nivel='tudo' (comportamento antigo integral),
+        com relógio quebrado ou chave não-hashable => ENVIA (o dedup jamais engole
+        por bug, e jamais levanta pro chamador)."""
+        if chave is None or self._dedup_janela_s <= 0 or self._nivel == "tudo":
             return False
         try:
             agora = float(self._relogio())
+            ts = self._ultimo_envio.get(chave)
         except Exception:
             return False
-        ts = self._ultimo_envio.get(chave)
         if ts is not None and (agora - ts) < self._dedup_janela_s:
             log.warning("alerta dedupado (mesma chave na janela, só-log): %s", texto)
             return True
-        self._ultimo_envio[chave] = agora
         return False
+
+    def _marcar_enviado(self, chave) -> None:
+        """Registra o envio BEM-SUCEDIDO da chave (review IMPORTANTE-1: um envio
+        que FALHOU não pode armar o dedup — a próxima morte re-tenta o Telegram).
+        Nunca levanta (chave não-hashable/relógio quebrado => só não marca)."""
+        if chave is None:
+            return
+        try:
+            self._ultimo_envio[chave] = float(self._relogio())
+        except Exception:
+            pass
 
     def captura_morreu(self, plataforma: str, motivo: str, *,
                        essencial: bool = False, chave=None) -> None:
@@ -103,10 +119,11 @@ class Alertas:
                  f"Fila sem supervisão; retomar exige olhar humano.")
         if self._suprimido_nao_essencial(essencial, texto):
             return
-        if self._dedup_repetido(("captura_morreu", chave) if chave is not None
-                                else None, texto):
+        chave_dedup = ("captura_morreu", chave) if chave is not None else None
+        if self._dedup_repetido(chave_dedup, texto):
             return
-        self._enviar(texto)
+        if self._enviar(texto):
+            self._marcar_enviado(chave_dedup)
 
     def sessao_expirada(self, plataforma: str) -> None:
         # INVARIANTE: reseed é sempre essencial e NUNCA dedupado — só o humano
@@ -119,9 +136,11 @@ class Alertas:
         # protege contra um chamador futuro que repita o evento a cada ciclo.
         texto = (f"✅ {plataforma}: curso '{curso}' concluído — "
                  f"{n} aulas capturadas.")
-        if self._dedup_repetido(("curso_concluido", plataforma, curso), texto):
+        chave_dedup = ("curso_concluido", plataforma, curso)
+        if self._dedup_repetido(chave_dedup, texto):
             return
-        self._enviar(texto)
+        if self._enviar(texto):
+            self._marcar_enviado(chave_dedup)
 
 
 def de_ambiente() -> "Alertas":

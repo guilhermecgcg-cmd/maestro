@@ -186,6 +186,54 @@ def test_sessao_expirada_nunca_dedupa():
     assert len(tg.msgs) == 2
 
 
+# ===========================================================================
+# Endurecimentos do review (IMPORTANTE-1/2): dedup só conta envio que CHEGOU,
+# e nenhum bug de dedup pode derrubar o chamador nem engolir alerta.
+# ===========================================================================
+class _TGFalhaUmaVez:
+    """Dublê: 1ª chamada levanta (Telegram fora do ar), depois entrega."""
+    def __init__(self):
+        self.msgs = []
+        self._falhou = False
+
+    def send_message(self, chat, texto):
+        if not self._falhou:
+            self._falhou = True
+            raise RuntimeError("telegram fora do ar")
+        self.msgs.append((chat, texto))
+
+
+def test_envio_falho_nao_marca_dedup_e_proxima_tentativa_envia():
+    # IMPORTANTE-1: se o 1º envio essencial FALHOU, a mesma chave na janela NÃO
+    # pode ser dedupada — senão o dono fica 1h sem saber de uma escalada.
+    tg = _TGFalhaUmaVez()
+    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))   # falha
+    a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))   # retenta
+    assert len(tg.msgs) == 1                               # a 2ª CHEGOU (não dedupada)
+
+
+def test_chave_nao_hashavel_nao_derruba_e_envia():
+    # IMPORTANTE-2: fail-safe total — bug de chave jamais levanta pro loop nem
+    # engole o alerta (na dúvida, ENVIA).
+    tg = _TG()
+    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a.captura_morreu("P", "m", essencial=True, chave=["lista", "nao-hashavel"])
+    a.captura_morreu("P", "m", essencial=True, chave=["lista", "nao-hashavel"])
+    assert len(tg.msgs) == 2                               # nunca levantou, sempre enviou
+
+
+def test_nivel_tudo_tambem_desliga_dedup():
+    # 'tudo' promete o comportamento ANTIGO por inteiro (debug): sem gate E sem dedup.
+    tg = _TG()
+    a = Alertas(tg, [10], nivel="tudo", relogio=lambda: 1000.0)
+    a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))
+    a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))
+    a.curso_concluido("P", "C", 1)
+    a.curso_concluido("P", "C", 1)
+    assert len(tg.msgs) == 4
+
+
 def test_de_ambiente_sem_token_vira_so_log(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "7, 8")

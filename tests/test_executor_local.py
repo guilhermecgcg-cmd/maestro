@@ -771,7 +771,10 @@ def test_pendencias_tracker_conta_por_course_id_da_url(tmp_path):
     import sqlite3
     db = tmp_path / "tracker.db"
     con = sqlite3.connect(db)
-    con.execute("CREATE TABLE lessons(hash TEXT PRIMARY KEY, course_id TEXT, status TEXT)")
+    # `error` faz parte do schema REAL (tracker.py CREATE TABLE lessons) — o dublê
+    # modela o mecanismo: a query de resgate YouTube filtra por essa coluna.
+    con.execute("CREATE TABLE lessons(hash TEXT PRIMARY KEY, course_id TEXT, "
+                "status TEXT, error TEXT)")
     linhas = [
         ("h1", "5431484", "sem_video"), ("h2", "5431484", "sem_video"),
         ("h3", "5431484", "transcrevendo_embed"),          # também é `embed`
@@ -781,12 +784,12 @@ def test_pendencias_tracker_conta_por_course_id_da_url(tmp_path):
         ("h7", "5431484", "no_notion"),                    # terminal: fora de tudo
         ("h8", "9999", "sem_video"),                       # OUTRO curso: ignorado
     ]
-    con.executemany("INSERT INTO lessons VALUES(?,?,?)", linhas)
+    con.executemany("INSERT INTO lessons(hash,course_id,status) VALUES(?,?,?)", linhas)
     con.commit()
     con.close()
     pend = captura._pendencias_tracker(
         "https://hotmart.com/pt-br/club/x/products/5431484", str(tmp_path))
-    assert pend == {"base": 2, "audio": 0, "embed": 3, "nao-video": 1}
+    assert pend == {"base": 2, "audio": 0, "embed": 3, "nao-video": 1, "youtube": 0}
 
 
 def test_pendencias_tracker_none_fail_open(tmp_path):
@@ -958,3 +961,90 @@ def test_stoa_default_sem_injecao_usa_o_leitor_proprio(tmp_path, monkeypatch):
     assert sp.calls[0]["cmd"] == [PY, "-m", "motor.stoa", STOA, "--embed"]
     assert sp.calls[0]["cwd"] == str(tmp_path)            # cwd = worktree da Stoa
     assert conf.endswith(":passe=embed")
+
+
+# ==========================================================================
+# PASSE --youtube DO HOTMART (braço YouTube, deploy 3517c47 do motor). O motor
+# JÁ sabe (`motor.cli --youtube` -> youtube_pending + requeue_youtube_from_
+# nao_video_erro), mas sem a fiação no daemon o passe NUNCA é despachado — as
+# 57 aulas ciro-gestor presas em nao_video_erro/video_youtube não drenam.
+# Mesmo padrão dos passes Stoa: gate por env (ativação deliberada + restart
+# guardado), pool próprio no leitor de pendências, anti-ban intacto (o passe
+# muda só o argv do ÚNICO spawn da conta).
+# ==========================================================================
+def test_youtube_desligado_por_default_nao_dispara_a_flag(monkeypatch):
+    """GATE: sem ATHENA_YOUTUBE_ATIVO, mesmo com video_youtube pendente NÃO
+    dispara --youtube — cai na sonda `base` (comportamento vivo de hoje). A
+    ativação é deliberada (env + restart guardado), nunca acidental."""
+    monkeypatch.delenv("ATHENA_YOUTUBE_ATIVO", raising=False)
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp,
+                 pendencias_fn=_pend(youtube=57)).disparar(C1)
+    assert "--youtube" not in sp.calls[0]["cmd"]
+    assert conf.endswith(":passe=base")
+
+
+def test_youtube_ligado_dispara_a_flag_quando_ha_pendencia(monkeypatch):
+    """DENTE (a lacuna): com ATHENA_YOUTUBE_ATIVO=1 e pendência youtube, o
+    daemon despacha `motor.cli <url> --youtube`. SEM a fiação (youtube fora de
+    `passes`/`_PASSE_FLAG`), este teste FALHA — o passe nunca é despachável e
+    as 57 aulas ciro-gestor ficam presas para sempre."""
+    monkeypatch.setenv("ATHENA_YOUTUBE_ATIVO", "1")
+    sp = FakeSpawn()
+    conf = _exec(_hot(C1), spawn=sp,
+                 pendencias_fn=_pend(youtube=57)).disparar(C1)
+    assert sp.calls[0]["cmd"] == [PY, "-m", "motor.cli", C1, "--youtube"]
+    assert conf.endswith(":passe=youtube")
+    # INVIOLÁVEL: o passe HERDA a política HEADED do Hotmart (a sonda de sessão
+    # falha headless) — nunca liga HEADLESS.
+    assert "HEADLESS" not in sp.calls[0]["env"]
+    assert sp.calls[0]["env"]["WHISPER_BACKEND"] == "groq"
+
+
+def test_youtube_anti_ban_nunca_segundo_motor_na_mesma_conta(monkeypatch):
+    """DENTE ANTI-BAN (INVIOLÁVEL): com o motor do passe youtube VIVO na conta,
+    um 2º disparo na MESMA conta é RECUSADO (ContaOcupada) — o passe novo não
+    abre exceção no lock 1-por-conta."""
+    monkeypatch.setenv("ATHENA_YOUTUBE_ATIVO", "1")
+    sp = FakeSpawn()
+    ex = _exec(_hot(C1, "a"), _hot(C2, "a"), spawn=sp,
+               pendencias_fn=_pend(youtube=57, base=5))
+    ex.disparar(C1)
+    with pytest.raises(captura.ContaOcupada):
+        ex.disparar(C2)                                   # MESMA conta "a"
+    assert len(sp.calls) == 1                             # 1 único motor na conta
+
+
+def test_pendencias_tracker_conta_youtube_incluindo_resgate_nao_video_erro(tmp_path):
+    """O leitor default conta o pool youtube: `video_youtube` + `transcrevendo_
+    youtube` (YOUTUBE_PENDING do tracker) E as `nao_video_erro` RESGATÁVEIS
+    (assinatura legada 'provedor não suportado'+'youtube' — o critério EXATO de
+    `requeue_youtube_from_nao_video_erro`). Sem contar as resgatáveis, o passe
+    nunca seria escolhido para as 57 ciro-gestor (elas só viram `video_youtube`
+    DEPOIS que o passe roda uma vez — deadlock). `nao_video_erro` de OUTRO
+    provedor (wistia) NÃO conta — senão o rodízio dispararia --youtube à toa
+    para sempre. E os 3 estados novos saem do `base` (espelho PENDING_EXCLUDED)."""
+    import sqlite3
+    db = tmp_path / "tracker.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE lessons(hash TEXT PRIMARY KEY, course_id TEXT, "
+                "status TEXT, error TEXT)")
+    linhas = [
+        ("h1", "5431484", "video_youtube", None),          # youtube (candidata)
+        ("h2", "5431484", "transcrevendo_youtube", None),  # youtube (resume)
+        ("h3", "5431484", "nao_video_erro",                # youtube (resgatável)
+         "vídeo de provedor não suportado (youtube) sem conteúdo-doc"),
+        ("h4", "5431484", "nao_video_erro",                # OUTRO provedor: fora
+         "vídeo de provedor não suportado (wistia) sem conteúdo-doc"),
+        ("h5", "5431484", "pendente", None),               # base
+        ("h6", "9999", "video_youtube", None),             # OUTRO curso: ignorado
+    ]
+    con.executemany("INSERT INTO lessons VALUES(?,?,?,?)", linhas)
+    con.commit()
+    con.close()
+    pend = captura._pendencias_tracker(
+        "https://hotmart.com/pt-br/club/x/products/5431484", str(tmp_path))
+    assert pend["youtube"] == 3                            # h1+h2+h3 (resgate conta)
+    # ESPELHO PENDING_EXCLUDED atualizado: nao_video_erro/video_youtube/
+    # transcrevendo_youtube NÃO contam como `base` (o passe de texto não os toca).
+    assert pend["base"] == 1                               # só h5

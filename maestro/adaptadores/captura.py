@@ -460,8 +460,13 @@ _PLATAFORMAS = {
     # do perfil") além do storage_state, então um perfil NOVO/vazio arriscaria a sessão. Não
     # colide: é conta ÚNICA (hotmart-principal) e os 3 Memberkit (que partilhavam este mesmo
     # default) agora têm perfis DEDICADOS — Hotmart fica sozinho no `.chrome-profile`.
+    # + passe "youtube" (braço YouTube do motor, deploy 3517c47): `motor.cli --youtube`
+    # re-seleciona `video_youtube`/`transcrevendo_youtube` e RESGATA as `nao_video_erro`
+    # por YouTube via `requeue_youtube_from_nao_video_erro` (as 57 do ciro-gestor).
+    # GATED por ATHENA_YOUTUBE_ATIVO (`_passe_ativavel`); HERDA a política do spec
+    # (HEADED, channel=chrome, mesmo perfil) — o rodízio muda só o argv do único spawn.
     "hotmart": PlataformaSpec(
-        "motor.cli", passes=("base", "embed", "audio", "nao-video"),
+        "motor.cli", passes=("base", "embed", "audio", "nao-video", "youtube"),
         env=(("CHROME_USER_DATA_DIR", ".chrome-profile"),)),
     # Memberkit: 3 tenants (contas distintas) — SEM perfil no spec => cada conta ganha o seu
     # (`.chrome-profile-<conta>`) em `_montar`. É o fix do flap: os 3 + Hotmart caíam todos
@@ -511,11 +516,13 @@ _PLATAFORMAS = {
 _ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
 
 
-# PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 4) E pela Stoa
+# PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 5) E pela Stoa
 # (motor.stoa: base/--embed/--nao-video). `base` = passe default SEM flag (legenda/vídeo
 # nativo no Hotmart; áudio-nativo na Stoa). Os demais ligam os seletores próprios do
-# tracker de cada motor (audio/embed/nao_video_pending; pools Stoa: _PENDING_POR_MODO).
-_PASSE_FLAG = {"base": None, "audio": "--audio", "embed": "--embed", "nao-video": "--nao-video"}
+# tracker de cada motor (audio/embed/nao_video/youtube_pending; pools Stoa:
+# _PENDING_POR_MODO). `youtube` é EXCLUSIVO do Hotmart (só motor.cli conhece --youtube).
+_PASSE_FLAG = {"base": None, "audio": "--audio", "embed": "--embed",
+               "nao-video": "--nao-video", "youtube": "--youtube"}
 
 # ESPELHO de motor/tracker.py::PENDING_EXCLUDED — a FONTE-VERDADE vive lá; o executor NÃO
 # pode importar o pacote `motor` (árvore/pkg separados, roda via `python -m` noutro cwd).
@@ -525,13 +532,31 @@ _PENDING_EXCLUDED = (
     "no_notion", "sem_legenda", "sem_video", "transcrevendo", "audio_erro",
     "sem_audio", "transcrevendo_embed", "sem_embed", "capturando_nao_video",
     "sem_conteudo",
+    # espelho do tracker pós-braço-YouTube (deploy 3517c47): nao_video_erro é terminal
+    # do braço de NÃO-VÍDEO (só o resgate --youtube o toca); video_youtube/
+    # transcrevendo_youtube pertencem EXCLUSIVAMENTE ao passe --youtube.
+    "nao_video_erro", "video_youtube", "transcrevendo_youtube",
 )
-# Espelho de AUDIO_PENDING / EMBED_PENDING / NAO_VIDEO_PENDING (tracker.py). Idem contrato.
+# Espelho de AUDIO_PENDING / EMBED_PENDING / NAO_VIDEO_PENDING / YOUTUBE_PENDING
+# (tracker.py). Idem contrato.
 _STATUSES_POR_PASSE = {
     "audio": ("sem_legenda", "transcrevendo"),
     "embed": ("sem_video", "transcrevendo_embed"),
     "nao-video": ("sem_embed", "capturando_nao_video"),
+    "youtube": ("video_youtube", "transcrevendo_youtube"),
 }
+
+# ESPELHO do critério de RESGATE de `requeue_youtube_from_nao_video_erro` (tracker.py):
+# `nao_video_erro` com a assinatura LEGADA ('provedor não suportado' + 'youtube') é
+# trabalho REAL do passe --youtube (o requeue roda DENTRO do passe), mas essas aulas só
+# viram `video_youtube` DEPOIS que o passe roda uma vez — sem contá-las aqui o rodízio
+# nunca escolheria o passe e o resgate jamais aconteceria (deadlock). Exigir 'provedor
+# não suportado' (e não '%youtube%' solto) espelha o motor: o terminal defensivo
+# 'nenhum vídeo YouTube capturável' NÃO conta (senão o rodízio dispararia --youtube à
+# toa para sempre). Se o critério mudar em tracker.py, ESTE SQL muda junto (contrato).
+_SQL_YOUTUBE_RESGATE = (
+    "SELECT COUNT(*) FROM lessons WHERE course_id=? AND status='nao_video_erro' "
+    "AND error LIKE '%provedor não suportado%' AND error LIKE '%youtube%'")
 
 # ESPELHO de motor/stoa/pipeline.py::_PENDING_POR_MODO (a FONTE-VERDADE vive lá; mesmo
 # contrato de espelho do Hotmart acima). Na Stoa os pools DIFEREM do Hotmart:
@@ -580,6 +605,11 @@ def _pendencias_tracker(curso_url, motor_dir):
             "SELECT status, COUNT(*) FROM lessons WHERE course_id=? GROUP BY status",
             (course_id,),
         ).fetchall()
+        # RESGATE YouTube: as `nao_video_erro` legadas por YouTube são trabalho do passe
+        # --youtube (o requeue do motor as move ao rodar) — contam no pool p/ o rodízio
+        # ESCOLHER o passe (ver o comentário de _SQL_YOUTUBE_RESGATE).
+        resgate_youtube = con.execute(
+            _SQL_YOUTUBE_RESGATE, (course_id,)).fetchone()[0]
     except sqlite3.Error:
         return None
     finally:
@@ -592,6 +622,7 @@ def _pendencias_tracker(curso_url, motor_dir):
             pend["base"] += n
     for passe, statuses in _STATUSES_POR_PASSE.items():
         pend[passe] = sum(por_status.get(s, 0) for s in statuses)
+    pend["youtube"] += resgate_youtube
     return pend
 
 
@@ -650,13 +681,17 @@ def _passe_ativavel(passe, plataforma="hotmart"):
         comportamento vivo de hoje (só o `base` áudio-nativo) — nada muda até a ativação
         deliberada. O gate NÃO afeta o anti-ban (1 motor/conta é o lock durável).
       - Hotmart: `nao-video` liga com `ATHENA_NAO_VIDEO_ATIVO` (o gate original do braço
-        doc->Notion da remediação #2). Os demais passes são sempre ativáveis."""
+        doc->Notion da remediação #2); `youtube` (braço YouTube, deploy 3517c47 do motor)
+        liga com `ATHENA_YOUTUBE_ATIVO` — desligado => comportamento vivo de hoje. Os
+        demais passes são sempre ativáveis."""
     if plataforma == "stoa":
         if passe in ("embed", "nao-video"):
             return bool(os.getenv("ATHENA_STOA_PASSES_ATIVO"))
         return True
     if passe == "nao-video":
         return bool(os.getenv("ATHENA_NAO_VIDEO_ATIVO"))
+    if passe == "youtube":
+        return bool(os.getenv("ATHENA_YOUTUBE_ATIVO"))
     return True
 
 

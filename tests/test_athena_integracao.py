@@ -40,13 +40,13 @@ class SpyAlertas:
         self.sessoes = []
         self.conclusoes = []
 
-    def captura_morreu(self, plataforma, motivo):
+    def captura_morreu(self, plataforma, motivo, **kw):
         self.mortes.append((plataforma, motivo))
 
-    def sessao_expirada(self, plataforma):
+    def sessao_expirada(self, plataforma, **kw):
         self.sessoes.append(plataforma)
 
-    def curso_concluido(self, plataforma, curso, n):
+    def curso_concluido(self, plataforma, curso, n, **kw):
         self.conclusoes.append((plataforma, curso, n))
 
 
@@ -626,3 +626,82 @@ def test_obito_fantasma_sem_exit_code_nao_zera_a_serie_do_bench(tmp_path):
         C1, st, real, None, disjuntor=SpyDisj(), alertas=SpyAlertas(),
         agora=1001.0, meta_por_curso=None, flap_min=99)
     assert "exit5_seguidas" not in st                       # morte confirmada ≠ exit-5: zera
+
+
+# ==========================================================================
+# GATE DE ESSENCIALIDADE no CANAL Telegram (fiação real): só o que exige AÇÃO
+# HUMANA pinga o dono; auto-tratado (flap/relancar/bench) vira SÓ-LOG. Estes
+# dentes usam o Alertas REAL com dublê de TelegramClient — provam o fio inteiro
+# ciclo_local -> _aplicar_decisao -> Alertas -> Telegram.
+# ==========================================================================
+class _TGSpy:
+    def __init__(self):
+        self.msgs = []
+
+    def send_message(self, chat, texto):
+        self.msgs.append((chat, texto))
+
+
+def _alertas_reais(tg):
+    from maestro.alertas import Alertas
+    return Alertas(tg, [1])
+
+
+def test_flap_relancar_nao_pinga_telegram_mas_fica_no_log(tmp_path, caplog):
+    # RUÍDO nº1 de hoje: morte transitória (SIGKILL -> relancar) em flap dispara
+    # "MORREU" no Telegram a cada ciclo — mas o sistema re-tenta SOZINHO sob o
+    # disjuntor. Essencial = NADA a fazer pelo dono => Telegram em silêncio; o
+    # log continua registrando o flap (observabilidade intacta).
+    voz = FakeVoz()
+    tg = _TGSpy()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, _alertas_reais(tg))
+    common["flap_min"] = 2
+    t = 1000.0
+    with caplog.at_level(logging.WARNING, logger="athena.alertas"):
+        for _ in range(3):
+            athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo,
+                                     estado, agora=t, **common)
+            ex.matar(C1, exit_code=-9)                     # SIGKILL -> relancar
+            t += 1
+    assert tg.msgs == []                                   # DENTES: zero Telegram
+    assert any("FLAP" in r.message for r in caplog.records)  # mas o log viu o flap
+
+
+def test_sessao_morta_SEMPRE_pinga_telegram(tmp_path):
+    # INVARIANTE: reseed é o único evento que SÓ o humano destrava — o gate de
+    # essencialidade JAMAIS pode engoli-lo.
+    voz = FakeVoz()
+    tg = _TGSpy()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, _alertas_reais(tg))
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1000.0, **common)
+    ex.matar(C1, exit_code=5, stderr="SESSÃO MORTA: refaça o login headed")
+    athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo, estado,
+                             agora=1100.0, **common)
+    assert any("expirou" in texto for _, texto in tg.msgs)  # DENTES: reseed alertado
+
+
+def test_escalar_humano_dedupado_1_envio_por_curso_na_janela(tmp_path):
+    # Exit 4 (circuit-breaker, causa desconhecida) exige humano -> ALERTA, mas
+    # DEDUPADO: 2 mortes do MESMO curso na mesma janela = 1 ping (não metralha).
+    voz = FakeVoz()
+    tg = _TGSpy()
+    ex = FakeExecutorObitos({C1: "a"})
+    estado, voo = {}, {}
+    cursos = [_curso(C1, "a", "hotmart", 18)]
+    common = _reais(tmp_path, _alertas_reais(tg))
+    common["flap_min"] = 99                                 # isola o ramo escalar_humano
+    t = 1000.0
+    for _ in range(3):
+        athena_local.ciclo_local(cursos, ex, _prog({C1: (0, 18)}), voz, voo,
+                                 estado, agora=t, **common)
+        ex.matar(C1, exit_code=4)                          # circuit-breaker -> humano
+        t += 1
+    mortes = [texto for _, texto in tg.msgs if "MORREU" in texto]
+    assert len(mortes) == 1                                # DENTES: dedup na janela

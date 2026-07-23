@@ -148,14 +148,15 @@ class _BatimentoNulo:
 
 
 class _AlertasNulo:
-    """DEFAULT P2: alertas typados viram no-op (o loop segue sem canal de supervisão)."""
-    def captura_morreu(self, plataforma, motivo):
+    """DEFAULT P2: alertas typados viram no-op (o loop segue sem canal de supervisão).
+    Aceita os kwargs do gate de essencialidade (`essencial`/`chave`) do Alertas real."""
+    def captura_morreu(self, plataforma, motivo, **kw):
         return None
 
-    def sessao_expirada(self, plataforma):
+    def sessao_expirada(self, plataforma, **kw):
         return None
 
-    def curso_concluido(self, plataforma, curso, n):
+    def curso_concluido(self, plataforma, curso, n, **kw):
         return None
 
 
@@ -248,6 +249,9 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
 
     flaps = int(getattr(obito, "flaps_na_janela", 0) or 0)
     if flaps >= flap_min:
+        # SÓ-LOG por default (não-essencial): o flap re-tenta SOZINHO sob o
+        # disjuntor — nenhuma ação do dono. Se a CAUSA pedir humano
+        # (reseed/token/desconhecida), os ramos abaixo alertam essencial.
         alertas.captura_morreu(
             plat, f"FLAP: {flaps} mortes na janela (curso {curso}, causa={acao})")
         # E5: flapping detectado — escalada (a captura morre em loop, seja a causa
@@ -295,6 +299,9 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
             st["benched_exit5"] = True
             st["esgotado_avisado"] = True             # o alerta typado abaixo já cobre
             st["fase"] = FASE_NOVO
+            # SÓ-LOG por default (não-essencial): o bench é auto-contido (para SÓ
+            # este curso, sem reseed; avanço no Notion desbencha) — o /sitrepcaptura
+            # e o log mostram o curso benched quando o dono for olhar o YAML.
             alertas.captura_morreu(
                 plat, f"BENCH exit-5: {n5} sondas de sessão INCONCLUSIVAS seguidas "
                 f"em {curso} — curso benched (cheque a URL no YAML: provável "
@@ -323,8 +330,11 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     except Exception:
         pass
     if acao == "escalar_token":
+        # ESSENCIAL (só o dono troca a chave) + dedup por curso: o backoff re-tenta
+        # e re-morre na mesma chave ruim — 1 ping por janela basta.
         alertas.captura_morreu(
-            plat, f"credencial de API inválida — troque o token (curso {curso})")
+            plat, f"credencial de API inválida — troque o token (curso {curso})",
+            essencial=True, chave=("token", curso))
         # E2: credencial de API ruim → backoff + alerta (reversível, NÃO latcha —
         # a chave é API downstream, não a plataforma: recoze e re-tenta).
         _registrar(espinha, f"backoff+alerta de token em {curso}",
@@ -332,8 +342,11 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
                    escalada=True, trava=None, curso=curso, plataforma=plat,
                    fonte=fonte_causa, origem="athena-local/causa")
     elif acao == "escalar_humano":
+        # ESSENCIAL (fail-closed chama o dono) + dedup por curso na janela: o
+        # mesmo curso re-morrendo da mesma incógnita não metralha o Telegram.
         alertas.captura_morreu(
-            plat, f"causa desconhecida (fail-closed): {getattr(decisao, 'motivo', '')}")
+            plat, f"causa desconhecida (fail-closed): {getattr(decisao, 'motivo', '')}",
+            essencial=True, chave=("humano", curso))
         # E3: causa desconhecida fail-closed → chama o dono.
         _registrar(espinha, f"escalei {curso} (causa desconhecida)",
                    motivo_causa or "fail-closed: causa desconhecida",
@@ -776,7 +789,8 @@ def _gate_d5(slug, spec, st, espinha, agora, *, gasto_por_sistema_fn, budget_mod
         try:
             alertas.captura_morreu(
                 slug, f"sistema {slug}: teto D5 US${teto:.2f}/dia atingido "
-                f"(conservador US${conservador:.4f}) — modo {budget_modo}")
+                f"(conservador US${conservador:.4f}) — modo {budget_modo}",
+                essencial=True)   # ordem 22/07: budget ALERTA (latch 1×/dia já dedupa)
         except Exception:
             pass
         _registrar(espinha, f"teto D5 atingido em {slug} (modo {budget_modo})",
@@ -799,7 +813,8 @@ def _brainstorm_gate_escalar(slug, etapa, st, *, alertas, espinha, llm, motivo):
                    custo_usd=_CUSTO_PROXY_BRAINSTORM_USD, medido=False,
                    sistema=slug, fonte="llm", origem="athena-local/brainstorm")
     try:
-        alertas.captura_morreu(slug, f"sistema {slug}: {motivo} — só humano destrava")
+        alertas.captura_morreu(slug, f"sistema {slug}: {motivo} — só humano destrava",
+                               essencial=True, chave=("humano-sistema", slug))
     except Exception:
         pass
     _registrar(espinha, f"escalei {slug}:{etapa} — só humano destrava", motivo,
@@ -933,6 +948,8 @@ def _aplicar_decisao_sistema(slug, st, obito, decisao, *, disjuntor, alertas, ag
     except Exception:
         pass
     if acao == "acionar_engenharia":
+        # SÓ-LOG por default (não-essencial): a engenharia RECONSTRÓI sozinha
+        # (F4-e); se ela esgotar, o brainstorm-gate escala essencial ao humano.
         alertas.captura_morreu(slug, f"sistema {slug}: defeito → engenharia ({motivo})")
         # T1 (óbito exit 30/40/traceback): tenta identificar a etapa em curso pelo
         # heartbeat (run_id + etapa). Com etapa → FLAG de engenharia (o
@@ -952,12 +969,14 @@ def _aplicar_decisao_sistema(slug, st, obito, decisao, *, disjuntor, alertas, ag
                    reversivel=True, escalada=True, trava="executor_ausente",
                    sistema=slug, fonte=fonte, origem="athena-local/causa-sistema")
     elif acao == "escalar_token":
-        alertas.captura_morreu(slug, f"sistema {slug}: credencial de API — troque o token")
+        alertas.captura_morreu(slug, f"sistema {slug}: credencial de API — troque o token",
+                               essencial=True, chave=("token-sistema", slug))
         _registrar(espinha, f"backoff+alerta de token em {slug}", motivo,
                    reversivel=True, escalada=True, sistema=slug, fonte=fonte,
                    origem="athena-local/causa-sistema")
     elif acao in ("escalar_humano", "pausar_sistema"):
-        alertas.captura_morreu(slug, f"sistema {slug}: {acao} ({motivo})")
+        alertas.captura_morreu(slug, f"sistema {slug}: {acao} ({motivo})",
+                               essencial=True, chave=(acao, slug))
         if acao == "pausar_sistema":
             st["pausado_por_causa"] = True
         _registrar(espinha, f"escalei {slug} ({acao})", motivo, tipo="escalada",

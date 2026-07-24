@@ -387,12 +387,18 @@ class CursoLocal:
     NUNCA declara concluído (fail-closed, anti-falso-pronto). `session_path` (opcional)
     aponta o storage_state EXISTENTE da conta (semeado por login manual — NUNCA
     re-logamos): quando a plataforma declara um `session_env` no spec, `_montar` injeta
-    este caminho no env do motor; vazio => o motor usa o default dele (cwd=motor_dir)."""
+    este caminho no env do motor; vazio => o motor usa o default dele (cwd=motor_dir).
+    `tenant` (opcional) é o identificador do TENANT em plataformas white-label
+    (Curseduca: uuid do tenant, exigido pelo motor p/ resolver vídeo no player — NÃO é
+    segredo): quando o spec declara `tenant_env`, `_montar` o injeta DEPOIS do
+    `spec.env`, logo um tenant por-curso VENCE o default fixado no spec; vazio => vale
+    o default do spec (o caso de hoje: tenant único segueadi)."""
     url: str
     conta: str
     plataforma: str = "hotmart"
     total_esperado: int = 0
     session_path: str = ""
+    tenant: str = ""
 
 
 @dataclass(frozen=True)
@@ -431,7 +437,12 @@ class PlataformaSpec:
       - `session_env`: nome do env que recebe o `CursoLocal.session_path` (o
         storage_state EXISTENTE, semeado por login manual). '' => não injeta nada e o
         motor usa o default dele relativo ao cwd — é o caso das plataformas já
-        integradas (hotmart/memberkit/stoa/kajabi), mantidas INTACTAS de propósito."""
+        integradas (hotmart/memberkit/stoa/kajabi), mantidas INTACTAS de propósito.
+      - `tenant_env`: nome do env que recebe o `CursoLocal.tenant` (identificador do
+        TENANT em plataformas white-label — Curseduca: CURSEDUCA_TENANT_UUID). Injetado
+        DEPOIS do `spec.env`, então o tenant POR-CURSO (YAML) vence o default fixado no
+        spec — é o caminho multi-tenant sem tocar código. '' => não injeta nada
+        (todas as plataformas exceto curseduca; aditivo, vivas intactas)."""
     modulo: str
     passes: tuple = ("base",)
     headless: bool = False
@@ -439,6 +450,7 @@ class PlataformaSpec:
     url_env: str = ""
     env: tuple = ()
     session_env: str = ""
+    tenant_env: str = ""
 
 
 # plataforma -> como invocar o motor. Fora deste mapa => fail-closed (o motor só sabe
@@ -506,6 +518,25 @@ _PLATAFORMAS = {
     "greenn": PlataformaSpec(
         "motor.greenn", headless=True, url_env="GREENN_URL",
         session_env="GREENN_SESSION_PATH"),
+    # ---- CURSEDUCA (white-label; tenant segueadi) — PROVADO AO VIVO 24/07 -------
+    # Smoke real: `python -m motor.curseduca --limit 2 --course 164` HEADLESS
+    # capturou 2/2 aulas (download HLS Bunny funciona headless) → páginas REAIS no
+    # Notion. Mesmo padrão dos 5 novos: passe ÚNICO ("base" — o CLI não tem flags
+    # de passe; enumeração + vídeo + Whisper/Groq + Notion num run só), HEADLESS
+    # (allow_reseed=False => sessão morta ABORTA fail-closed, nunca login
+    # automático — e o usuário dormindo não vê janela), channel=chrome (o MESMO
+    # canal que semeou a sessão), perfil DEDICADO por conta via `_perfil_de_conta`
+    # (sem CHROME_USER_DATA_DIR no spec — nunca o `.chrome-profile` do Hotmart).
+    # TENANT (CURSEDUCA_TENANT_UUID — identificador, não segredo; o motor o exige
+    # p/ resolver o vídeo no player): é POR-TENANT. Hoje há UM tenant Curseduca
+    # (segueadi), fixado AQUI como default. ATENÇÃO multi-tenant futuro: um 2º
+    # tenant Curseduca EXIGE tenant por-curso — já plumbado via `CursoLocal.tenant`
+    # (YAML `tenant:`) → `tenant_env`, injetado DEPOIS deste env => VENCE o
+    # default. Basta a entrada YAML; não toque neste spec.
+    "curseduca": PlataformaSpec(
+        "motor.curseduca", headless=True, url_env="CURSEDUCA_URL",
+        session_env="CURSEDUCA_SESSION_PATH", tenant_env="CURSEDUCA_TENANT_UUID",
+        env=(("CURSEDUCA_TENANT_UUID", "4037b710-50c5-11ed-b97b-16058182e383"),)),
 }
 
 
@@ -1267,6 +1298,12 @@ class LocalExecutor:
         # caminho. O motor NUNCA loga sozinho: sessão morta = SessionDeadError (abort).
         if spec.session_env and getattr(meta, "session_path", ""):
             env[spec.session_env] = meta.session_path
+        # TENANT por-curso (white-label — Curseduca): aplicado DEPOIS do spec.env de
+        # propósito, para que o `tenant:` do YAML VENÇA o default fixado no spec (o
+        # caminho multi-tenant sem tocar código). Só quando o spec declara `tenant_env`
+        # E o curso traz `tenant` — nas demais plataformas (tenant_env='') é inerte.
+        if spec.tenant_env and getattr(meta, "tenant", ""):
+            env[spec.tenant_env] = meta.tenant
         # PYTHONPATH = a árvore do motor DESTA plataforma, p/ o `python -m <modulo>`
         # resolver o pacote certo (ex.: Stoa vive no worktree, não em /aula). Sobrepõe
         # o PYTHONPATH herdado do daemon (que aponta pra árvore da Athena, sem `motor`).

@@ -1531,20 +1531,25 @@ def progresso_local_fn(motor_python, motor_dir, total_por_curso, *, run=None):
 # em `adaptador_pipeline.plataforma_suportada`). Fora desta lista => o ciclo NÃO despacha
 # (Capacidade B: plataforma nova escala, nunca captura às cegas). ADITIVO: os 4 primeiros
 # são as plataformas vivas de sempre; os 5 seguintes são os adaptadores novos fiados em
-# 22/07 (kiwify/nutror/alpaclass/hubla/greenn — sessões semeadas 20/07). Env
-# PLATAFORMAS_SUPORTADAS sobrepõe (ex.: para pausar uma plataforma sem tocar código).
+# 22/07 (kiwify/nutror/alpaclass/hubla/greenn — sessões semeadas 20/07); o último é o
+# Curseduca (white-label — o host é DO TENANT, não da plataforma: segueadi, provado ao
+# vivo 24/07; um tenant Curseduca novo = host novo AQUI + entrada YAML com `tenant:`).
+# Env PLATAFORMAS_SUPORTADAS sobrepõe (ex.: para pausar uma plataforma sem tocar código).
 PLATAFORMAS_SUPORTADAS_PADRAO = (
     "hotmart.com", "memberkit.com.br", "stoa.com.br", "mykajabi.com",
-    "kiwify.com.br", "nutror.com", "alpaclass.com", "hub.la", "greenn.com.br")
+    "kiwify.com.br", "nutror.com", "alpaclass.com", "hub.la", "greenn.com.br",
+    "membros.segueadi.com")
 
 
 def carregar_cursos(path) -> list:
     """Lê a lista de cursos desejados do YAML doméstico. Cada entrada:
-    {url, conta, plataforma?, total_esperado?, session_path?}. `conta` é OBRIGATÓRIA
-    (chave anti-ban) — a ausência LEVANTA (fail-closed). `session_path` (opcional)
-    aponta o storage_state EXISTENTE da conta (semeado por login manual do usuário);
-    só é INJETADO no motor pelas plataformas cujo spec declara `session_env` (as 5
-    novas) — nas demais é carregado mas inerte (comportamento vivo intacto)."""
+    {url, conta, plataforma?, total_esperado?, session_path?, tenant?}. `conta` é
+    OBRIGATÓRIA (chave anti-ban) — a ausência LEVANTA (fail-closed). `session_path`
+    (opcional) aponta o storage_state EXISTENTE da conta (semeado por login manual do
+    usuário); só é INJETADO no motor pelas plataformas cujo spec declara `session_env`
+    — nas demais é carregado mas inerte (comportamento vivo intacto). `tenant`
+    (opcional, white-label — Curseduca) idem: só é injetado via `tenant_env` do spec,
+    e VENCE o default fixado no spec (o caminho multi-tenant sem tocar código)."""
     import yaml
     with open(path) as f:
         dados = yaml.safe_load(f) or []
@@ -1554,7 +1559,8 @@ def carregar_cursos(path) -> list:
             url=d["url"], conta=d["conta"],
             plataforma=d.get("plataforma", "hotmart"),
             total_esperado=int(d.get("total_esperado", 0)),
-            session_path=str(d.get("session_path", "") or "")))
+            session_path=str(d.get("session_path", "") or ""),
+            tenant=str(d.get("tenant", "") or "")))
     return out
 
 

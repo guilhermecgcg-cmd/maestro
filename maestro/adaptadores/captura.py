@@ -484,7 +484,13 @@ _PLATAFORMAS = {
     # (`.chrome-profile-<conta>`) em `_montar`. É o fix do flap: os 3 + Hotmart caíam todos
     # no `.chrome-profile` e colidiam no ProcessSingleton. Sessão é storage_state (provado:
     # os 3 injetam cookies e enumeram o próprio tenant), então perfil dedicado não perde login.
-    "memberkit": PlataformaSpec("motor.memberkit", headless=True),
+    # `session_env`: cada tenant tem seu PRÓPRIO storage_state (session_path no YAML) — o motor
+    # (motor.memberkit) lê UM único MEMBERKIT_SESSION_PATH do env (default .memberkit-session.json).
+    # SEM esta injeção, os 3 tenants caíam TODOS no mesmo default e disputavam UMA sessão (só o
+    # que casasse o .env capturava; os outros falhavam a sonda e escalavam reseed). Com o
+    # session_env, `_montar` injeta o session_path POR-CURSO => cada tenant usa a SUA sessão.
+    "memberkit": PlataformaSpec(
+        "motor.memberkit", headless=True, session_env="MEMBERKIT_SESSION_PATH"),
     "stoa": PlataformaSpec(
         "motor.stoa", passes=("base", "embed", "nao-video"),
         chromium=True, url_env="STOA_URL",

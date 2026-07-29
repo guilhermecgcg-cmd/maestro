@@ -13,9 +13,9 @@ contrato da INTEGRAÇÃO (dublês, zero captura real):
      contas distintas rodam em paralelo (dente);
   4. o gate de domínio (`PLATAFORMAS_SUPORTADAS`) conhece os 5 domínios novos SEM
      perder os 4 antigos (aditivo);
-  5. `carregar_cursos` plumba o `session_path` do YAML até o executor — e as
-     plataformas JÁ integradas (hotmart/memberkit/stoa/kajabi) ficam INTACTAS
-     (nenhum env de sessão novo é injetado nelas).
+  5. `carregar_cursos` plumba o `session_path` do YAML até o executor — Memberkit
+     (3 tenants, sessões próprias) agora recebe MEMBERKIT_SESSION_PATH POR-CURSO
+     (fix tenant-por-sessão); hotmart/stoa/kajabi (sem session_env) seguem INTACTAS.
 """
 import pytest
 
@@ -178,15 +178,48 @@ def test_carregar_cursos_le_session_path(tmp_path):
     assert cursos[1].session_path == ""                    # ausente => vazio (default)
 
 
-def test_plataformas_antigas_nao_ganham_env_de_sessao():
-    # ADITIVO: memberkit/hotmart seguem EXATAMENTE como antes — mesmo que o YAML
-    # traga session_path (as entradas memberkit já o têm, ainda não-plumbado), o
-    # executor NÃO injeta env de sessão nelas (a plumbação delas é outra tarefa).
+def test_memberkit_injeta_session_path_por_curso():
+    # FIX tenant-por-sessão: o motor.memberkit lê UM único MEMBERKIT_SESSION_PATH do
+    # env; com o session_env no spec, `_montar` injeta o session_path POR-CURSO (YAML)
+    # nesse env — cada tenant usa a SUA sessão em vez de todos caírem no default.
     sp = FakeSpawn()
-    mk = captura.CursoLocal(url="https://minha.memberkit.com.br/", conta="mk",
-                            plataforma="memberkit",
+    mk = captura.CursoLocal(url="https://comunidade-triade.memberkit.com.br/",
+                            conta="memberkit-triade", plataforma="memberkit",
                             session_path=f"{AULA}/.memberkit-session.json")
     _exec(mk, spawn=sp).disparar(mk.url)
     env = sp.calls[0]["env"]
-    assert "MEMBERKIT_SESSION_PATH" not in env             # comportamento vivo intacto
+    assert env["MEMBERKIT_SESSION_PATH"] == f"{AULA}/.memberkit-session.json"
     assert sp.calls[0]["cmd"] == [PY, "-m", "motor.memberkit", mk.url]
+
+
+def test_memberkit_tenants_recebem_sessoes_distintas():
+    # DENTE do fix: dois tenants Memberkit com session_path DIFERENTES (A e B) têm de
+    # receber MEMBERKIT_SESSION_PATH distintos. SEM o plumbing (session_env=''), ambos
+    # ficariam SEM o env e cairiam no MESMO default do motor => disputa da sessão.
+    # Contas distintas => paralelo legítimo (anti-ban é por-conta), 2 spawns.
+    sp = FakeSpawn()
+    a = captura.CursoLocal(url="https://comunidade-triade.memberkit.com.br/",
+                           conta="memberkit-triade", plataforma="memberkit",
+                           session_path=f"{AULA}/.memberkit-session.json")
+    b = captura.CursoLocal(url="https://empreenderdinheiro.memberkit.com.br/",
+                           conta="memberkit-empreender", plataforma="memberkit",
+                           session_path=f"{AULA}/.memberkit-empreender-session.json")
+    ex = _exec(a, b, spawn=sp)
+    ex.disparar(a.url)
+    ex.disparar(b.url)
+    envs = {c["cmd"][3]: c["env"]["MEMBERKIT_SESSION_PATH"] for c in sp.calls}
+    assert envs[a.url] == f"{AULA}/.memberkit-session.json"
+    assert envs[b.url] == f"{AULA}/.memberkit-empreender-session.json"
+    assert envs[a.url] != envs[b.url]                      # sessões NÃO se misturam
+
+
+def test_hotmart_sem_session_env_fica_intacta():
+    # ADITIVO: hotmart NÃO declara session_env => mesmo trazendo session_path no YAML,
+    # o executor NÃO injeta env de sessão nela (comportamento vivo intacto).
+    sp = FakeSpawn()
+    ht = captura.CursoLocal(url=C1, conta="hotmart-principal", plataforma="hotmart",
+                            session_path=f"{AULA}/.hotmart-session.json")
+    _exec(ht, spawn=sp).disparar(ht.url)
+    env = sp.calls[0]["env"]
+    assert "HOTMART_SESSION_PATH" not in env
+    assert "MEMBERKIT_SESSION_PATH" not in env

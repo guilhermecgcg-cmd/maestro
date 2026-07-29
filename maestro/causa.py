@@ -136,10 +136,29 @@ _RE_OOM = re.compile(
 _RE_TIMEOUT = re.compile(r"(time(d)?\s*out|timeouterror|timeout)", re.I)
 
 # Transitório de rede/servidor -> aguardar backoff (espera e o loop reavalia).
+# Inclui os net-errors de CONECTIVIDADE do Chromium (host não resolveu, conexão
+# recusada/resetada, internet caiu, timeout de rede): são transitórios de rede — o
+# host/DNS/link falhou ANTES de a navegação lógica acontecer. NÃO confundir com
+# net::ERR_ABORTED, que é a navegação abortada DEPOIS de conectar (bug do adaptador,
+# tratado à parte em _RE_NAV_ABORTED). Sem esta linha, um ERR_NAME_NOT_RESOLVED caía
+# na causa DESCONHECIDA e escalava humano à toa em vez de só reesperar a rede.
 _RE_TRANSITORIO = re.compile(
     r"(connection\s+reset|connectionreseterror|connection\s+refused|"
     r"temporarily\s+unavailable|try\s+again|\b50[0234]\b|service\s+unavailable|"
-    r"bad\s+gateway|gateway\s+timeout|econnreset|network\s+is\s+unreachable)", re.I)
+    r"bad\s+gateway|gateway\s+timeout|econnreset|network\s+is\s+unreachable|"
+    r"net::err_(connection_[a-z_]+|name_not_resolved|internet_disconnected|"
+    r"timed_out|address_unreachable|network_changed|socket_not_connected))", re.I)
+
+# NAVEGAÇÃO abortada pelo Chromium (net::ERR_ABORTED no page.goto). É uma assinatura
+# CLARA — e NÃO é nenhuma das três coisas que o daemon sabe tratar sozinho: não é
+# sessão morta (a sessão pode estar viva; o /carrega respondeu), não é credencial de
+# API, não é rede caída (o host resolveu e conectou). É a NAVEGAÇÃO do adaptador que
+# abortou: rota/token inválido, redirect inesperado, ou um download servido no lugar
+# de uma página. Foi o incidente Stoa 27/07 — enumerate.open_course abortou em
+# /carrega/<token> (exit 1, traceback Playwright) e a autópsia, sem assinatura, caiu
+# no cego "causa desconhecida e nenhum LLM disponível". Classificar aqui, de forma
+# determinística, dá ao dono a causa NOMEADA (bug de navegação) sem depender do LLM.
+_RE_NAV_ABORTED = re.compile(r"net::err_aborted", re.I)
 
 # exit codes de SIGKILL: -9 (Popen) e 137 (128+9, via shell).
 _EXIT_SIGKILL = {-9, 137}
@@ -272,7 +291,19 @@ def _deterministico(obito, tracker_dir=None):
     if _RE_TIMEOUT.search(err):
         return "relancar", "assinatura de timeout no stderr"
 
-    # 6) TRANSITÓRIO de rede/servidor, ou saída LIMPA (a completude é do loop/Notion).
+    # 6) NAVEGAÇÃO abortada (net::ERR_ABORTED): assinatura CLARA de bug de navegação
+    #    do adaptador — NÃO é sessão morta, credencial nem rede caída. Determinístico
+    #    aqui mata a autópsia cega "causa desconhecida e nenhum LLM disponível" (o
+    #    incidente Stoa 27/07). A AÇÃO é escalar_humano (um dev corrige a rota/
+    #    navegação), mas com a causa NOMEADA — o dono sabe onde olhar sem depender do
+    #    LLM. Vem DEPOIS de sessão/token/exit-code/OOM (se o filho também denunciou
+    #    sessão morta ou OOM, aquilo é a causa-raiz), e ANTES do transitório/exit-0.
+    if _RE_NAV_ABORTED.search(err):
+        return "escalar_humano", (
+            "bug de navegação (net::ERR_ABORTED): page.goto abortou ao abrir a "
+            "página — NÃO é sessão morta; dev corrige a navegação do adaptador")
+
+    # 7) TRANSITÓRIO de rede/servidor, ou saída LIMPA (a completude é do loop/Notion).
     if code == 0:
         return "aguardar_backoff", "saída limpa (exit 0) — completude é do owner/Notion"
     if _RE_TRANSITORIO.search(err):

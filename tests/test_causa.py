@@ -190,6 +190,73 @@ def test_log_benigno_de_sessao_viva_nao_vira_reseed(stderr):
 
 
 # --------------------------------------------------------------------------
+# NAVEGAÇÃO abortada (net::ERR_ABORTED) — assinatura CLARA, não "desconhecida"
+# --------------------------------------------------------------------------
+# Cauda de stderr REAL do incidente Stoa 27/07 10:19: enumerate.open_course fez
+# page.goto("/carrega/<token>") e o Chromium abortou (net::ERR_ABORTED). exit 1,
+# traceback Playwright. A autópsia gravada escalou como "causa desconhecida e
+# nenhum LLM disponível" (fail-closed cego) — sendo que a assinatura é CLARA:
+# navegação abortada = bug do adaptador, não sessão morta.
+_STDERR_STOA_ERR_ABORTED = (
+    '  File ".../motor/stoa/enumerate.py", line 274, in open_course\n'
+    '    return await _content_at(page, urljoin(base_url, f"/carrega/{card.token}"))\n'
+    '  File ".../motor/stoa/enumerate.py", line 254, in _content_at\n'
+    '    await page.goto(url, wait_until="domcontentloaded")\n'
+    "playwright._impl._errors.Error: Page.goto: net::ERR_ABORTED at "
+    "https://educacao.stoa.com.br/carrega/QVlRHZlbopUYxoFWXpmRpFmVwNXVxw2\n"
+    "Call log:\n  - navigating to \"https://educacao.stoa.com.br/carrega/QVlR\", "
+    'waiting until "domcontentloaded"\n'
+)
+
+
+def test_err_aborted_e_bug_de_navegacao_nao_desconhecida():
+    # DENTES (incidente Stoa 27/07): net::ERR_ABORTED tem que ser classificado
+    # DETERMINISTICAMENTE como bug de navegação — nunca cair no cego "causa
+    # desconhecida e nenhum LLM disponível" (o que o daemon fez ao vivo).
+    d = causa.classificar(_obito(exit_code=1, stderr=_STDERR_STOA_ERR_ABORTED))
+    assert d.acao == "escalar_humano", d
+    assert d.fonte == "deterministico", d          # decidido SEM LLM (a prova)
+    assert "navegação" in d.motivo.lower(), d       # causa NOMEADA
+    assert "ERR_ABORTED" in d.motivo, d
+    assert "desconhecida" not in d.motivo.lower(), d
+
+
+def test_err_aborted_dispensa_o_llm():
+    # Mesmo com o LLM DESLIGADO (llm=None, como no daemon vivo), a classificação
+    # sai determinística — o seam nunca é tocado. Se este teste falhar, a autópsia
+    # voltou a depender do LLM para uma assinatura que é clara.
+    chamado = []
+    def llm(_):                                     # sentinela: NÃO pode ser chamado
+        chamado.append(1)
+        return '{"acao": "escalar_humano"}'
+    d = causa.classificar(_obito(exit_code=1, stderr=_STDERR_STOA_ERR_ABORTED), llm=llm)
+    assert d.fonte == "deterministico", d
+    assert chamado == [], "o LLM foi consultado para uma assinatura determinística"
+
+
+def test_err_aborted_nao_e_confundido_com_sessao_nem_token():
+    # A navegação abortada NÃO pode virar reseed (bench permanente do curso) nem
+    # troca de token (também irredutível). É bug de código -> humano.
+    d = causa.classificar(_obito(exit_code=1, stderr=_STDERR_STOA_ERR_ABORTED))
+    assert d.acao not in ("escalar_reseed", "escalar_token"), d
+
+
+@pytest.mark.parametrize("stderr", [
+    "Page.goto: net::ERR_NAME_NOT_RESOLVED at https://x/y",   # DNS não resolveu
+    "net::ERR_CONNECTION_REFUSED",                             # conexão recusada
+    "net::ERR_INTERNET_DISCONNECTED at https://x",            # link caiu
+    "net::ERR_TIMED_OUT",                                     # timeout de rede
+])
+def test_neterror_de_conectividade_e_transitorio_nao_desconhecida(stderr):
+    # Os net-errors de CONECTIVIDADE (host/DNS/link) são transitórios de rede —
+    # aguardar_backoff, não o cego "desconhecida". Distinto do ERR_ABORTED, que é
+    # bug de navegação depois de conectar.
+    d = causa.classificar(_obito(exit_code=1, stderr=stderr))
+    assert d.acao == "aguardar_backoff", d
+    assert d.fonte == "deterministico", d
+
+
+# --------------------------------------------------------------------------
 # seam do LLM (desconhecida)
 # --------------------------------------------------------------------------
 def test_desconhecida_consulta_llm_uma_vez():

@@ -1639,10 +1639,15 @@ def progresso_local_fn(motor_python, motor_dir, total_por_curso, *, run=None):
 # 22/07 (kiwify/nutror/alpaclass/hubla/greenn — sessões semeadas 20/07); o último é o
 # Curseduca (white-label — o host é DO TENANT, não da plataforma: segueadi, provado ao
 # vivo 24/07; um tenant Curseduca novo = host novo AQUI + entrada YAML com `tenant:`).
+# GREENN: o CLUB (onde o aluno assiste e de onde o motor.greenn enumera) vive em
+# `<tenant>.greenn.club` (ex.: ytubeclass.greenn.club; API em api.greenn.club — ver
+# motor/greenn/cli.py). `greenn.com.br` é o painel do PRODUTOR (adm.greenn.com.br), não
+# o club: com ele no default, nenhuma URL de curso Greenn passava o gate (casa por
+# sufixo) e uma URL do painel passaria. Por isso o sufixo é `greenn.club`.
 # Env PLATAFORMAS_SUPORTADAS sobrepõe (ex.: para pausar uma plataforma sem tocar código).
 PLATAFORMAS_SUPORTADAS_PADRAO = (
     "hotmart.com", "memberkit.com.br", "stoa.com.br", "mykajabi.com",
-    "kiwify.com.br", "nutror.com", "alpaclass.com", "hub.la", "greenn.com.br",
+    "kiwify.com.br", "nutror.com", "alpaclass.com", "hub.la", "greenn.club",
     "membros.segueadi.com")
 
 

@@ -36,7 +36,9 @@ PLATS = [
      "ALPACLASS_SESSION_PATH", f"{AULA}/.alpaclass-session.json"),
     ("hubla", "https://app.hub.la", "HUBLA_URL",
      "HUBLA_SESSION_PATH", f"{AULA}/.hubla-session.json"),
-    ("greenn", "https://adm.greenn.com.br/", "GREENN_URL",
+    # Greenn: o CLUB vive em <tenant>.greenn.club (motor/greenn/cli.py: "home do tenant,
+    # ex.: https://ytubeclass.greenn.club/"). adm.greenn.com.br é o painel do PRODUTOR.
+    ("greenn", "https://ytubeclass.greenn.club/", "GREENN_URL",
      "GREENN_SESSION_PATH", f"{AULA}/.greenn-session.json"),
 ]
 
@@ -151,6 +153,25 @@ def test_dominios_antigos_continuam_suportados():
               "https://nepq-training.mykajabi.com/"):
         assert adaptador_pipeline.plataforma_suportada(
             u, athena_local.PLATAFORMAS_SUPORTADAS_PADRAO)
+
+
+@pytest.mark.parametrize("url", [
+    "https://ytubeclass.greenn.club/",
+    "https://sierramkt.greenn.club/",
+])
+def test_greenn_club_de_qualquer_tenant_passa_o_gate_default(url):
+    # DENTES: o default antigo dizia `greenn.com.br` e o gate casa por SUFIXO de host —
+    # nenhum curso Greenn (<tenant>.greenn.club) passava; virava "plataforma nova".
+    assert adaptador_pipeline.plataforma_suportada(
+        url, athena_local.PLATAFORMAS_SUPORTADAS_PADRAO)
+
+
+def test_painel_do_produtor_greenn_nao_passa_o_gate_default():
+    # adm.greenn.com.br é o painel do PRODUTOR, não o club (o motor.greenn não enumera
+    # dali). Uma entrada YAML apontando pra lá escala como plataforma nova (sinal para
+    # corrigir a URL) em vez de disparar o motor contra o host errado.
+    assert not adaptador_pipeline.plataforma_suportada(
+        "https://adm.greenn.com.br/", athena_local.PLATAFORMAS_SUPORTADAS_PADRAO)
 
 
 def test_sem_o_dominio_no_gate_a_plataforma_nao_e_despachada():

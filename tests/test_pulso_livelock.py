@@ -234,6 +234,103 @@ def test_pulso_de_boot_substitui_o_orfao_da_encarnacao_anterior_antes_do_reaper(
     assert boot["pid"] == os.getpid()
 
 
+# ==========================================================================
+# O BOOT não pode apagar a EVIDÊNCIA da morte da encarnação anterior (achado da revisão)
+# ==========================================================================
+# Um lock de PID MORTO em ~/.athena-local/locks é a ÚNICA evidência de que a captura da
+# encarnação anterior morreu (o loop novo não tem o Popen dela para drenar). Quem acha
+# esse lock é a 1ª varredura de autópsia (vigia.autopsia(lock_dir), fase "autopsia" do 1º
+# ciclo). O pulso de boot cheio e o reaper de boot rodam ANTES e chamavam
+# LocalExecutor.curso_ativo -> _ler_lock, que APAGA lock de PID morto: a morte sumia sem
+# autópsia. Dublês: o LocalExecutor REAL (lock_dir em tmp), o vigia e a causa REAIS, e um
+# PID que o os.kill(pid, 0) real dá como inexistente.
+_PID_MORTO = 99_999_999                        # > pid_max (macOS 99998) -> ProcessLookupError
+
+
+class _SpawnEspiao:
+    """Nenhuma captura real sobe no teste; registra se alguém tentou disparar."""
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, cmd, *, env, cwd):          # pragma: no cover — não deve ser chamado
+        self.calls.append(cmd)
+        raise AssertionError("o teste não dispara captura")
+
+
+def _executor_local(cursos, tmp_path, spawn=None):
+    return captura.LocalExecutor(
+        cursos, motor_python="/nao/existe/python", motor_dir=str(tmp_path / "motor"),
+        spawn=spawn or _SpawnEspiao(), lock_dir=str(tmp_path / "locks"),
+        motor_log_dir=str(tmp_path / "logs"), pendencias_fn=lambda u, d: None)
+
+
+def _autopsias_em(d):
+    import glob
+    return [json.loads(open(p).read()) for p in sorted(glob.glob(os.path.join(str(d), "*.json")))]
+
+
+def _rodar_boot(cursos, executor, tmp_path, *, max_iters=1, reaper_fn=None):
+    from maestro import causa, vigia
+    return asyncio.run(athena_local.rodar(
+        cursos, executor, lambda c: (18, 18), FakeVoz(), sleep=_noop_sleep,
+        max_iters=max_iters, intervalo_s=0.0, pulso_path=str(tmp_path / "pulso.json"),
+        vigia=vigia, causa=causa, lock_dir=str(tmp_path / "locks"),
+        autopsia_dir=str(tmp_path / "aut"), reaper_fn=reaper_fn))
+
+
+def test_lock_de_pid_morto_no_boot_ainda_gera_autopsia_no_1o_ciclo(tmp_path):
+    cursos = [_curso(C1, conta="a")]
+    # a encarnação ANTERIOR disparou C1 (lock durável com o PID) e a captura morreu
+    # enquanto o loop estava fora do ar.
+    _executor_local(cursos, tmp_path)._escrever_lock("a", C1, _PID_MORTO)
+    novo = _executor_local(cursos, tmp_path)           # a encarnação que acabou de subir
+    _rodar_boot(cursos, novo, tmp_path, max_iters=2)
+    auts = _autopsias_em(tmp_path / "aut")
+    # DENTES: com o pulso de boot CHEIO o lock era apagado antes da varredura -> 0 autópsias.
+    assert len(auts) == 1, auts                        # e só UMA: o lock é limpo DEPOIS
+    assert auts[0]["conta"] == "a" and auts[0]["curso"] == C1
+    assert auts[0]["detectado_por"] == "pid"
+    assert not os.listdir(tmp_path / "locks")           # limpo pelo pulso cheio de "fim"
+    assert _ler(tmp_path / "pulso.json")["fase"] == "fim"
+
+
+def test_reaper_de_boot_de_producao_nao_apaga_lock_de_pid_morto(tmp_path):
+    # O reaper de PRODUÇÃO (`_reaper_de_boot`, o que o main() injeta) roda entre o pulso de
+    # boot e o 1º ciclo e sondava a liveness com o curso_ativo DESTRUTIVO: mesma perda.
+    from tests.test_reap_orphans_lane import _seed, _status, _tracker
+    cursos = [_curso(C1, conta="a")]                    # C1 = .../products/111
+    motor_dir = _tracker(tmp_path)
+    _seed(motor_dir, [("h1", "transcrevendo", "pg-1", None)])   # órfão async da anterior
+    _executor_local(cursos, tmp_path)._escrever_lock("a", C1, _PID_MORTO)
+    novo = _executor_local(cursos, tmp_path)
+    reaper = athena_local._reaper_de_boot(cursos, novo, lambda url: motor_dir)
+    _rodar_boot(cursos, novo, tmp_path, reaper_fn=reaper)
+    auts = _autopsias_em(tmp_path / "aut")
+    assert len(auts) == 1 and auts[0]["detectado_por"] == "pid", auts   # DENTES
+    # o gate anti-ban do reaper responde IGUAL (PID morto = sem captura viva -> reapa):
+    assert _status(motor_dir)["h1"][0] == "pendente"
+
+
+def test_curso_ativo_so_leitura_responde_igual_sem_apagar_o_lock(tmp_path):
+    # Contrato do modo só-leitura: MESMA resposta do curso_ativo padrão em todos os casos
+    # (vivo -> True; intenção pid=None -> True, fail-closed anti-ban; morto -> False);
+    # a ÚNICA diferença é não apagar o lock obsoleto.
+    cursos = [_curso(C1, conta="a"), _curso(C2, conta="b"),
+              _curso("https://hotmart.com/pt-br/z/products/333", conta="c")]
+    ex = captura.LocalExecutor(
+        cursos, motor_python="/nao/existe/python", motor_dir=str(tmp_path / "motor"),
+        spawn=_SpawnEspiao(), lock_dir=str(tmp_path / "locks"),
+        motor_log_dir=str(tmp_path / "logs"), pid_vivo=lambda pid: pid == 4242)
+    ex._escrever_lock("a", C1, 4242)                                   # vivo
+    ex._escrever_lock("b", C2, None)                                   # intenção
+    ex._escrever_lock("c", "https://hotmart.com/pt-br/z/products/333", _PID_MORTO)  # morto
+    urls = [c.url for c in cursos]
+    assert [ex.curso_ativo(u, limpar=False) for u in urls] == [True, True, False]
+    assert len(os.listdir(tmp_path / "locks")) == 3                    # nada apagado
+    assert [ex.curso_ativo(u) for u in urls] == [True, True, False]    # padrão: igual...
+    assert len(os.listdir(tmp_path / "locks")) == 2                    # ...mas limpa o morto
+
+
 def test_espera_longa_entre_ciclos_e_fatiada_e_regrava_o_pulso(tmp_path):
     """Um MAESTRO_INTERVALO_S > 900 faria o vigia matar o loop DURANTE o sono entre
     ciclos. A espera é fatiada (<=300s) e cada fatia regrava o pulso (fase=dormindo)."""

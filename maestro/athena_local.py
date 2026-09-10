@@ -1496,12 +1496,19 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
 
     # 1º ATO da encarnação: pulsar — ANTES do reaper e do 1º ciclo. O pulso órfão de uma
     # encarnação anterior (morta/pré-reboot) deixa de valer AGORA, não ao fim do 1º ciclo.
-    _pulsar(0, "boot", cheio=True)
+    # Pulso MAGRO (cheio=False, `ativos` vazio até o 1º pulso cheio de "fim"): o cheio
+    # chama executor.curso_ativo -> LocalExecutor._ler_lock, que APAGA lock de PID morto.
+    # No boot esse lock é a ÚNICA evidência da morte da encarnação anterior, e a 1ª
+    # varredura de autópsia (vigia.autopsia(lock_dir), fase "autopsia" do 1º ciclo) ainda
+    # não rodou: apagá-lo aqui era perder a autópsia (achado da revisão do livelock).
+    _pulsar(0, "boot")
     # HIGIENE (1) — REAPER NO BOOT DA LANE: ANTES do 1º ciclo, devolve a `pendente` as
     # aulas in-flight async órfãs (transcrevendo*/capturando_nao_video) de uma encarnação
     # ANTERIOR cujo processo NÃO está mais vivo (crash/redeploy). Sem isso elas ficam presas
     # para sempre. Best-effort: a higiene NUNCA pode impedir o loop de subir. Gate anti-ban
     # é do próprio reaper (só toca curso SEM captura viva — ver captura.reap_orphans_local).
+    # O reaper também roda ANTES da 1ª autópsia: o de produção (`_reaper_de_boot`) sonda a
+    # liveness em modo SÓ-LEITURA pelo mesmo motivo do pulso de boot acima.
     if reaper_fn is not None:
         try:
             reaper_fn()
@@ -1645,6 +1652,29 @@ def carregar_cursos(path) -> list:
     return out
 
 
+def _reaper_de_boot(cursos, executor, motor_dir_do_curso):
+    """O `reaper_fn` de PRODUÇÃO (main -> rodar): devolve a `pendente` as aulas in-flight
+    async órfãs de cada curso SEM captura viva (`captura.reap_orphans_local`).
+
+    A liveness é sondada em modo SÓ-LEITURA (`executor.curso_ativo(url, limpar=False)`):
+    o reaper roda no BOOT, ANTES da 1ª varredura de autópsia, e o `curso_ativo` padrão
+    APAGA o lock de PID morto — a única evidência da morte da encarnação anterior (a
+    autópsia sumia). A resposta do gate anti-ban é IDÊNTICA (vivo/intenção -> intocável;
+    morto -> reapável); só o efeito colateral some. O lock morto é limpo depois da
+    autópsia, pelo pulso cheio de fim de ciclo / pela passada. Best-effort por curso."""
+    def _vivo(url):
+        return executor.curso_ativo(url, limpar=False)
+
+    def reaper_fn():
+        for c in cursos:
+            try:
+                captura.reap_orphans_local(c.url, motor_dir_do_curso(c.url),
+                                           curso_ativo=_vivo)
+            except Exception:
+                pass
+    return reaper_fn
+
+
 def _motor_dirs_por_plataforma() -> dict:
     """Overrides de diretório do motor POR PLATAFORMA, lidos de env ATHENA_MOTOR_DIR_<PLAT>."""
     prefixo = "ATHENA_MOTOR_DIR_"
@@ -1721,13 +1751,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
 
     # HIGIENE (1): reaper de órfãos async no BOOT da lane — só toca curso SEM captura viva
     # (gate anti-ban dentro de `reap_orphans_local`). Best-effort por curso.
-    def reaper_fn():
-        for c in cursos:
-            try:
-                captura.reap_orphans_local(c.url, _motor_dir_do_curso(c.url),
-                                           curso_ativo=executor.curso_ativo)
-            except Exception:
-                pass
+    reaper_fn = _reaper_de_boot(cursos, executor, _motor_dir_do_curso)
 
     plataformas = frozenset(
         p for p in os.getenv(

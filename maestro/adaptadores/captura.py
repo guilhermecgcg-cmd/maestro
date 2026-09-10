@@ -1038,10 +1038,16 @@ class LocalExecutor:
         slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
         return os.path.join(self._motor_log_dir, slug + ".err")
 
-    def _ler_lock(self, conta):
+    def _ler_lock(self, conta, *, limpar=True):
         """Lê o lock da conta e devolve o dict {pid, course_url, conta} SE o PID ainda
         roda; senão devolve None e REMOVE o lock obsoleto (processo morreu -> conta
-        livre). É aqui que o restart libera uma conta cujo processo antigo já terminou."""
+        livre). É aqui que o restart libera uma conta cujo processo antigo já terminou.
+
+        `limpar=False` = SÓ LEITURA: mesma resposta (vivo/intenção -> dict; morto/ilegível
+        -> None), mas NÃO apaga o lock obsoleto. Um lock de PID MORTO de uma encarnação
+        anterior é a ÚNICA evidência dessa morte para a autópsia (vigia.autopsia varre o
+        lock_dir no 1º ciclo); quem consulta a liveness ANTES dessa varredura (o boot da
+        lane) tem de usar só-leitura, senão a morte some sem autópsia."""
         path = self._lock_path(conta)
         try:
             with open(path) as f:
@@ -1050,7 +1056,8 @@ class LocalExecutor:
             return None
         except (ValueError, OSError):
             # lock corrompido/ilegível: trata como obsoleto (não pode travar para sempre).
-            self._remover_lock(path)
+            if limpar:
+                self._remover_lock(path)
             return None
         if data.get("pid") is None:
             # LOCK DE INTENÇÃO (gravado ANTES do spawn, ver `disparar`): FAIL-CLOSED. Ou o
@@ -1063,7 +1070,8 @@ class LocalExecutor:
             # a completude-por-Notion ou o disjuntor/stall do owner escalam esse curso).
             return data
         if not self._pid_vivo(data.get("pid")):
-            self._remover_lock(path)              # PID morto -> lock obsoleto -> libera
+            if limpar:
+                self._remover_lock(path)          # PID morto -> lock obsoleto -> libera
             return None
         return data
 
@@ -1125,12 +1133,16 @@ class LocalExecutor:
         self._obitos = {}
         return out
 
-    def curso_ativo(self, curso_url) -> bool:
+    def curso_ativo(self, curso_url, *, limpar=True) -> bool:
+        """O curso tem captura VIVA agora? `limpar=False` responde IGUAL mas sem apagar
+        lock de PID morto (ver `_ler_lock`) — é o que o boot da lane usa antes da 1ª
+        autópsia. O `_reap` segue nos dois modos: ele só colhe filhos DESTA encarnação e
+        guarda o óbito (exit_code) em `_obitos` ANTES de soltar o lock — nada se perde."""
         self._reap()
         meta = self._meta.get(curso_url)
         if meta is None:
             return False
-        lock = self._ler_lock(meta.conta)
+        lock = self._ler_lock(meta.conta, limpar=limpar)
         return lock is not None and lock.get("course_url") == curso_url
 
     def conta_de(self, curso_url) -> str:

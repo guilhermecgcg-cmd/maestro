@@ -80,7 +80,11 @@ echo "[1] launchd subiu o dublê: PID1=$PID1 ; pulso backdatado p/ 2026-01-01 (v
 
 # --- roda o vigia contra o dublê (pulso velho + carregado -> KILL). Mudo (sem token).
 echo "[2] rodando vigia_externo (STALL_S=900, pulso muito velho) ..."
+# fix-livelock-loop: o dublê tem SEGUNDOS de vida — pela graça NASCENTE o vigia esperaria
+# (correto em produção). Aqui zeramos essa graça e a de SONO (VG_WAKETIME=0 = wake
+# desconhecido) para exercitar o caminho KILL -> ressurreição que este teste prova.
 DECISAO="$(VG_DAEMON_LABEL="$LABEL" VG_DAEMON_PATTERN="$MARKER" VG_PULSO="$PULSO" \
+    VG_GRACA_NASCENTE_S=0 VG_WAKETIME=0 \
     VG_LOG="$TMPD/vigia.log" VG_STATE="$TMPD/estado" VG_STALL_S=900 VG_KILL_GRACE_S=5 \
     VG_ENV_FILE="$TMPD/env.inexistente" VG_TELEGRAM_TOKEN="" VG_TELEGRAM_CHAT_ID="" \
     bash "$VIGIA")"

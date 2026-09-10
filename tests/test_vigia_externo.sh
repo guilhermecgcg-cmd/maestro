@@ -58,6 +58,106 @@ if telegram_alerta "teste mudo"; then muted_rc=0; else muted_rc=1; fi
 check "telegram MUDO retorna !=0" 1 "$muted_rc"
 grep -q "MUDO" "$TMPD/log" && check "telegram MUDO loga honesto" ok ok || check "telegram MUDO loga honesto" ok NAO
 
+# =============================================================================
+# fix-livelock-loop — FALSO LIVELOCK. Evidência (vigia_externo.log x wtmp x pmset):
+# 123 de 130 KILLs vieram DEPOIS de o próprio vigia ficar 21min..7,5d sem rodar (Mac
+# dormindo de tampa fechada na bateria / desligado / sem login); o do 10/09 16:29 matou
+# um loop de ~20s de vida (nascido no login) por um pulso de 6 dias; 07/08 11:32-11:52
+# matou 4 loops recém-nascidos seguidos. Dois fatos novos entram na decisão:
+#   VG_DESDE_ACORDAR : s desde o último wake do Mac (kern.waketime), -1 = desconhecido
+#   VG_LOOP_IDADE    : s de vida do processo de loop MAIS NOVO,     -1 = desconhecido
+# =============================================================================
+decidir2() {  # decidir2 <loaded> <age> <desde_acordar> <loop_idade> [stall]
+    VG_DAEMON_LOADED="$1" VG_PULSO_AGE="$2" VG_DESDE_ACORDAR="$3" VG_LOOP_IDADE="$4" \
+        VG_STALL_S="${5:-900}" vigia_decidir
+}
+# o caso do 10/09 16:29: pulso 545295s, Mac acordado há 14min, loop com 20s -> NÃO mata
+check "10/09: pulso 6d, acordou ha 870s"      SONO     "$(decidir2 1 545295 870 20)"
+check "10/09 sem wake: loop de 20s"           NASCENTE "$(decidir2 1 545295 -1 20)"
+# 07/08 11:37: loop nascido há 4,5min (reiniciado pelo KILL anterior), Mac acordado há horas
+check "07/08: loop de 270s, acordado ha 3h"   NASCENTE "$(decidir2 1 1407 10800 270)"
+# 03/09 09:01: acordou após 7,5 dias dormindo; loop antigo (congelado pelo SO)
+check "03/09: acordou ha 5s, loop velho"      SONO     "$(decidir2 1 644251 5 900000)"
+# LIVELOCK REAL continua morto: acordado há muito, loop velho, pulso velho
+check "livelock real acordado"                KILL     "$(decidir2 1 5000 10800 10800)"
+check "fronteira: acordou ha 901s"            KILL     "$(decidir2 1 5000 901 10800)"
+check "fronteira: acordou ha 900s"            SONO     "$(decidir2 1 5000 900 10800)"
+check "fronteira: loop com 901s"              KILL     "$(decidir2 1 5000 -1 901)"
+check "fronteira: loop com 900s"              NASCENTE "$(decidir2 1 5000 -1 900)"
+# fatos desconhecidos (-1) = comportamento ANTIGO (retrocompat da tabela de cima)
+check "desconhecidos -> KILL antigo"          KILL     "$(decidir2 1 901 -1 -1)"
+check "pulso fresco ignora o resto"           HEALTHY  "$(decidir2 1 120 5 5)"
+check "descarregado nunca vira SONO"          DOWN_ALERT "$(decidir2 0 9999 5 5)"
+check "sem pulso nunca vira NASCENTE"         NO_HEARTBEAT "$(decidir2 1 -1 5 5)"
+# graças configuráveis (o teste de fogo zera a de nascente p/ exercitar o KILL real)
+check "graca nascente 0: loop 1s"             KILL \
+    "$(VG_GRACA_NASCENTE_S=0 decidir2 1 5000 -1 1)"
+check "graca sono 0: acordou ha 1s"           KILL \
+    "$(VG_GRACA_SONO_S=0 decidir2 1 5000 1 10800)"
+
+# ---- parsers ------------------------------------------------------------------
+check "etime mm:ss"            20      "$(_etime_para_s '00:20')"
+check "etime 4:31"             271     "$(_etime_para_s '04:31')"
+check "etime octal-trap 08:09" 489     "$(_etime_para_s '08:09')"
+check "etime hh:mm:ss"         3723    "$(_etime_para_s '01:02:03')"
+check "etime d-hh:mm:ss"       535560  "$(_etime_para_s '6-04:46:00')"
+check "etime com espacos"      725     "$(_etime_para_s '   12:05')"
+check "etime vazio"            -1      "$(_etime_para_s '')"
+check "etime lixo"             -1      "$(_etime_para_s 'abc')"
+check "etime so segundos"      -1      "$(_etime_para_s '42')"
+check "waketime sysctl"        1789071287 \
+    "$(_parse_waketime '{ sec = 1789071287, usec = 206221 } Thu Sep 10 16:14:47 2026')"
+check "waketime lixo"          ""      "$(_parse_waketime 'nada aqui')"
+agora_t="$(date +%s)"
+d="$(VG_WAKETIME=$((agora_t - 42)) desde_acordar_s)"
+if [ "$d" -ge 41 ] && [ "$d" -le 45 ]; then check "desde_acordar ~42s" ok ok; else check "desde_acordar ~42s" ok "$d"; fi
+check "waketime 0 -> desconhecido"      -1 "$(VG_WAKETIME=0 desde_acordar_s)"
+check "waketime futuro -> desconhecido" -1 "$(VG_WAKETIME=$((agora_t + 999)) desde_acordar_s)"
+check "waketime lixo -> desconhecido"   -1 "$(VG_WAKETIME=abc desde_acordar_s)"
+d="$(desde_acordar_s)"   # sysctl REAL desta máquina (só leitura): tem de ser número >= -1
+case "$d" in -1|[0-9]*) check "desde_acordar real e numerico" ok ok ;; *) check "desde_acordar real e numerico" ok "$d" ;; esac
+
+# ---- ponta-a-ponta do main (SEM launchd, SEM o daemon real) --------------------
+# Um "loop" DUBLÊ (python com um MARCADOR único no argv — o padrão do vigia só casa ELE) e
+# um pulso VELHO com fase/curso. daemon_carregado é sobreposto (nada de launchctl).
+PY="$(command -v python3)"
+MARK="athena_vigia_e2e_MARKER_$$_$RANDOM"
+"$PY" -c 'import time,sys; time.sleep(120)' "$MARK" &
+FAKE=$!
+sleep 1.2                                      # etime >= 1s
+PULSO_T="$TMPD/pulso.json"
+printf '{"ts": %s, "ciclo": 7, "ativos": [], "pid": 4242, "fase": "passada", "curso": "https://x/c2"}' \
+    "$(( $(date +%s) - 3000 ))" > "$PULSO_T"
+touch -t 202601010000 "$PULSO_T"               # mtime velho também (max(mtime,ts) velho)
+e2e() {  # e2e <graca_nascente> -> decisão
+    # SEGURANÇA DO VIVO: roda num bash NOVO com TODO caminho e o PADRÃO do loop fixados no
+    # ambiente ANTES do source — o default `maestro[.]athena_local` (o daemon REAL) nunca
+    # chega a existir lá dentro. Guarda dura: sem o marcador do dublê, aborta sem agir.
+    env VG_ATHENA_HOME="$TMPD/home" VG_PULSO="$PULSO_T" VG_LOG="$TMPD/e2e.log" \
+        VG_STATE="$TMPD/e2e.estado" VG_LOCK_DIR="$TMPD/home/locks" \
+        VG_DAEMON_LABEL="com.athena.E2E.naoexiste" VG_DAEMON_PATTERN="$MARK" \
+        VG_STALL_S=900 VG_KILL_GRACE_S=3 VG_WAKETIME=0 VG_GRACA_NASCENTE_S="$1" \
+        VG_ENV_FILE="$TMPD/env.inexistente" VG_TELEGRAM_TOKEN="" VG_TELEGRAM_CHAT_ID="" \
+        /bin/bash -c '
+            source "$1"
+            case "$VG_DAEMON_PATTERN" in
+                athena_vigia_e2e_MARKER_*) ;;
+                *) echo "ABORT-padrao-inseguro"; exit 99 ;;
+            esac
+            daemon_carregado() { echo 1; }   # dublê: "carregado" sem tocar o launchd
+            main' _ "$SCRIPT"
+}
+check "e2e: loop recém-nascido NÃO é morto" NASCENTE "$(e2e 900)"
+if kill -0 "$FAKE" 2>/dev/null; then check "e2e: dublê segue VIVO" ok ok; else check "e2e: dublê segue VIVO" ok MORTO; fi
+grep -q "NASCENTE" "$TMPD/e2e.log" && check "e2e: log honesto NASCENTE" ok ok || check "e2e: log honesto NASCENTE" ok NAO
+check "e2e: sem graça -> KILL (livelock real)" KILL "$(e2e 0)"
+sleep 0.5
+if kill -0 "$FAKE" 2>/dev/null; then check "e2e: dublê MORTO pelo KILL" ok VIVO; kill -9 "$FAKE" 2>/dev/null; else check "e2e: dublê MORTO pelo KILL" ok ok; fi
+# só a linha do KILL (a do NASCENTE, acima no mesmo log, também traz o contexto)
+grep "LIVELOCK" "$TMPD/e2e.log" | grep -q "fase=passada curso=https://x/c2 ciclo=7 pid=4242" \
+    && check "e2e: KILL diz ONDE parou" ok ok || check "e2e: KILL diz ONDE parou" ok NAO
+wait "$FAKE" 2>/dev/null
+
 echo "-----------------------------------------"
 echo "PASS=$pass FAIL=$fails"
 [ "$fails" -eq 0 ]

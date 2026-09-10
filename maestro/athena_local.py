@@ -1285,14 +1285,32 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 flap_min=None, llm=None, espinha=None, sistemas=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
                 sistema_lock_dir=None, sistema_autopsia_dir=None,
-                gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None):
+                gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
+                pulsar=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
     `orquestrar_captura` com a passada LOCAL (disjuntor no gate de re-tentativa).
 
     A serialização anti-ban 1-por-conta é EMERGENTE (o executor levanta `ContaOcupada`). A
-    contagem-verdade do Notion é lida UMA vez por curso por ciclo (cache)."""
+    contagem-verdade do Notion é lida UMA vez por curso por ciclo (cache).
+
+    `pulsar(fase, curso=None)` (fix-livelock-loop): batida de PROGRESSO chamada no início,
+    antes de cada escalada de plataforma-nova, antes da autópsia, ANTES DE CADA CURSO e
+    antes de cada sistema. Um ciclo é SERIAL (42 cursos x leitura do Notion de até 120s +
+    escalada no Telegram de até 30s): sem isto o pulso só existia no FIM do ciclo e o vigia
+    externo (limiar 900s) matava um loop que estava AVANÇANDO. A batida é SÍNCRONA e ligada
+    ao progresso (nunca uma thread independente): se uma chamada travar de verdade, o
+    pulso CONGELA apontando a fase/curso — o livelock real continua detectável."""
+    def _bater(fase, curso=None):
+        if pulsar is None:
+            return
+        try:
+            pulsar(fase, curso)
+        except Exception:
+            pass                                           # observabilidade NUNCA derruba o ciclo
+
+    _bater("inicio")
     if agora is None:
         agora = time.time()
     controle = controle or _ControleNulo()
@@ -1332,21 +1350,32 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
         st = estado.setdefault(c.url, {})
         if (plataformas_suportadas is not None and
                 not adaptador_pipeline.plataforma_suportada(c.url, plataformas_suportadas)):
+            # a escalada vai ao Telegram (até 30s/tentativa com a rede ruim — 07/08 11:32
+            # mostra 30s entre cada 'plataforma nova'): bate ANTES de cada uma.
+            _bater("gate", c.url)
             _escalar_plataforma_nova(projeto_nome, voz, c.url, st, espinha=espinha)
             continue
         cursos_ok.append(c.url)
 
     # (3) AUTÓPSIA dos mortos (P3 -> P4): antes das passadas, para que a decisão da causa
     # (backoff vs irredutível) já esteja no `st` quando a passada consultar o disjuntor.
+    _bater("autopsia")
     _autopsiar_ciclo(executor, estado, vigia=vigia, causa=causa, disjuntor=disjuntor,
                      alertas=alertas, lock_dir=lock_dir, autopsia_dir=autopsia_dir,
                      agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min,
                      llm=llm, espinha=espinha)
 
     # (4) passada LOCAL + owner.
-    passada = _passada_local_fn(executor, progresso_cached, voz, estado,
-                                projeto_nome=projeto_nome, disjuntor=disjuntor,
-                                agora=agora, espinha=espinha, pendencia_fn=pendencia_fn)
+    passada_do_curso = _passada_local_fn(executor, progresso_cached, voz, estado,
+                                         projeto_nome=projeto_nome, disjuntor=disjuntor,
+                                         agora=agora, espinha=espinha,
+                                         pendencia_fn=pendencia_fn)
+
+    def passada(curso):
+        # batida ANTES de cada curso: a janela entre duas batidas é UM curso (leitura do
+        # Notion <=120s + escalada), não o ciclo inteiro (N cursos).
+        _bater("passada", curso)
+        return passada_do_curso(curso)
 
     def notion_fn(curso):
         try:
@@ -1368,6 +1397,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
             estado_sistemas = {}
         for spec in sistemas:
             st_s = estado_sistemas.setdefault(spec.slug, {})
+            _bater("sistema", spec.slug)
             try:
                 acao = passada_sistema(
                     spec, st_s, sistema_executor, vigia=vigia,
@@ -1384,14 +1414,30 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     return resultado_captura
 
 
-def _escrever_pulso(path, *, ts, ciclo, ativos):
-    """Grava o PULSO de vida do daemon ({ts, ciclo, ativos}) de forma atômica (tmp+replace).
-    É a prova EXTERNA (fora da memória do processo) de que o loop está VIVO e avançando — o
-    que o VIGIA EXTERNO (P6, scripts/vigia_externo.sh) lê para decidir se a Athena travou."""
+# Fatia máxima da espera ENTRE ciclos sem regravar o pulso. Bem abaixo do limiar de 900s do
+# vigia externo: com MAESTRO_INTERVALO_S alto (>900) o loop seria morto DORMINDO. No
+# intervalo de produção (120s) é uma fatia só — o sono não muda.
+_PULSO_FATIA_SONO_S = 300.0
+
+
+def _escrever_pulso(path, *, ts, ciclo, ativos, fase=None, curso=None):
+    """Grava o PULSO de vida do daemon de forma atômica (tmp+replace). É a prova EXTERNA
+    (fora da memória do processo) de que o loop está VIVO e avançando — o que o VIGIA
+    EXTERNO (P6, scripts/vigia_externo.sh) lê para decidir se a Athena travou.
+
+    Contrato original {ts, ciclo, ativos} INTACTO (o vigia lê `ts`). fix-livelock-loop soma
+    INSTRUMENTAÇÃO: `pid` (qual encarnação escreveu — um pulso de outro pid é órfão de uma
+    encarnação anterior), `fase` (boot|inicio|gate|autopsia|passada|sistema|fim|dormindo) e
+    `curso` (o alvo da fase). Quando o pulso PARA, ele diz ONDE o loop parou."""
     import json
+    dados = {"ts": ts, "ciclo": ciclo, "ativos": list(ativos), "pid": os.getpid()}
+    if fase is not None:
+        dados["fase"] = fase
+    if curso is not None:
+        dados["curso"] = curso
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
-        json.dump({"ts": ts, "ciclo": ciclo, "ativos": list(ativos)}, f)
+        json.dump(dados, f)
     os.replace(tmp, path)
 
 
@@ -1406,10 +1452,11 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
                 reaper_fn=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
-    que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). A cada
-    ciclo grava o PULSO e chama o BATIMENTO — ambos BEST-EFFORT (observabilidade nunca mata
-    o loop). SISTEMAS gerados (F4-d) entram como alvos supervisionados no passo (5) do
-    ciclo — `estado_sistemas` persiste entre ciclos, igual ao `estado` dos cursos."""
+    que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). O PULSO
+    é gravado no BOOT, em cada fase/curso do ciclo, no fim do ciclo e a cada fatia da espera
+    (fix-livelock-loop); o BATIMENTO roda a cada ciclo — ambos BEST-EFFORT (observabilidade
+    nunca mata o loop). SISTEMAS gerados (F4-d) entram como alvos supervisionados no passo
+    (5) do ciclo — `estado_sistemas` persiste entre ciclos, igual ao `estado` dos cursos."""
     estado = {}
     voo = {}
     estado_sistemas = {}
@@ -1425,6 +1472,31 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     ultimo_erro = None
     ultimo_batimento = 0.0
     t0 = time.time()
+    # PULSO DE PROGRESSO (fix-livelock-loop). Antes: UM pulso por ciclo, gravado só DEPOIS
+    # do ciclo inteiro — nada no boot, nada durante. Evidência: em 07/08 11:32→11:52 o vigia
+    # matou 4 loops recém-nascidos seguidos, cada um preso no 1º curso do 1º ciclo (Notion
+    # estourando 120s) com o pulso ainda da encarnação ANTERIOR; o 10/09 16:29 matou um loop
+    # de ~20s de vida por um pulso de 6 dias. Agora o pulso é regravado no BOOT, em cada fase
+    # e ANTES DE CADA CURSO. `ativos` só é recalculado nos pulsos CHEIOS (boot/fim de ciclo)
+    # — as batidas de progresso reusam o último snapshot: ZERO chamada nova ao executor no
+    # meio do ciclo. Tudo best-effort (observabilidade nunca derruba o loop).
+    ultimos_ativos = []
+
+    def _pulsar(ciclo, fase, curso=None, *, cheio=False):
+        nonlocal ultimos_ativos
+        if not pulso_path:
+            return
+        try:
+            if cheio:
+                ultimos_ativos = [c.url for c in cursos if _safe_ativo(executor, c.url)]
+            _escrever_pulso(pulso_path, ts=time.time(), ciclo=ciclo, ativos=ultimos_ativos,
+                            fase=fase, curso=curso)
+        except Exception:
+            pass
+
+    # 1º ATO da encarnação: pulsar — ANTES do reaper e do 1º ciclo. O pulso órfão de uma
+    # encarnação anterior (morta/pré-reboot) deixa de valer AGORA, não ao fim do 1º ciclo.
+    _pulsar(0, "boot", cheio=True)
     # HIGIENE (1) — REAPER NO BOOT DA LANE: ANTES do 1º ciclo, devolve a `pendente` as
     # aulas in-flight async órfãs (transcrevendo*/capturando_nao_video) de uma encarnação
     # ANTERIOR cujo processo NÃO está mais vivo (crash/redeploy). Sem isso elas ficam presas
@@ -1438,6 +1510,10 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     i = 0
     while max_iters is None or i < max_iters:
         i += 1
+
+        def _bater(fase, curso=None, _ciclo=i):
+            _pulsar(_ciclo, fase, curso)
+
         try:
             ciclo_local(cursos, executor, progresso_fn, voz, voo, estado,
                         agora=time.time(), plataformas_suportadas=plataformas_suportadas,
@@ -1450,7 +1526,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         estado_sistemas=estado_sistemas, sistema_lock_dir=sistema_lock_dir,
                         sistema_autopsia_dir=sistema_autopsia_dir,
                         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
-                        pendencia_fn=pendencia_fn)
+                        pendencia_fn=pendencia_fn, pulsar=_bater)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -1468,13 +1544,9 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                            assinatura, tipo="escalada", reversivel=True,
                            escalada=True, fonte="fail-closed", origem="athena-local/rodar")
                 ultimo_erro = assinatura
-        # PULSO (P6 backstop lê isto) — best-effort, gravado MESMO num ciclo que estourou.
-        if pulso_path:
-            try:
-                ativos = [c.url for c in cursos if _safe_ativo(executor, c.url)]
-                _escrever_pulso(pulso_path, ts=time.time(), ciclo=i, ativos=ativos)
-            except Exception:
-                pass
+        # PULSO CHEIO de fim de ciclo (P6 backstop lê isto) — best-effort, gravado MESMO
+        # num ciclo que estourou. Recalcula `ativos` (o snapshot das batidas seguintes).
+        _pulsar(i, "fim", cheio=True)
         # BATIMENTO (P2) — pulso de vida no Telegram (mudo: só loga). Best-effort.
         def _resumo():
             if resumo_fn is not None:
@@ -1486,7 +1558,16 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 voz, _resumo, time.time(), ultimo_batimento, batimento_intervalo)
         except Exception:
             pass
-        await sleep(intervalo_s)
+        # ESPERA entre ciclos, FATIADA: nenhuma fatia passa de _PULSO_FATIA_SONO_S sem
+        # regravar o pulso. Com o intervalo de produção (120s) é UMA chamada, idêntica.
+        restante = float(intervalo_s)
+        while True:
+            fatia = min(restante, _PULSO_FATIA_SONO_S)
+            await sleep(fatia)
+            restante -= fatia
+            if restante <= 0:
+                break
+            _pulsar(i, "dormindo")
     return i
 
 

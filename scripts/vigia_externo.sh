@@ -45,6 +45,23 @@
 #   VG_ENV_FILE        (/Users/guilhermerodrigues/teste/aula/.env)  # token do Telegram
 #   VG_KILL_GRACE_S    (10)                          # espera antes de escalar p/ SIGKILL
 #   VG_DRY_RUN         (0)                            # 1 = decide+loga, não mata/alerta
+#   VG_WAKETIME        ("")    # epoch do último wake; vazio = lê `sysctl kern.waketime`
+#   VG_GRACA_SONO_S    (=VG_STALL_S)  # carência após o Mac ACORDAR
+#   VG_GRACA_NASCENTE_S (=VG_STALL_S) # carência de um loop RECÉM-NASCIDO
+#
+# FALSO LIVELOCK (fix-livelock-loop, evidência em vigia_externo.log x wtmp x pmset):
+# 123 de 130 KILLs vieram logo DEPOIS de o próprio vigia ficar 21min..7,5d sem rodar —
+# o Mac estava DORMINDO (tampa fechada, bateria; o caffeinate -is não segura sono de tampa
+# e o -s só vale na tomada) ou DESLIGADO/sem login (LaunchAgent só roda com sessão). O
+# pulso envelhece no RELÓGIO DE PAREDE enquanto o loop está CONGELADO pelo SO (o
+# time.monotonic do loop não anda dormindo). Bouncear aí não destrava nada — só zera o
+# estado em memória (backoff do disjuntor, latches) e manda alerta enganoso. E um loop
+# RECÉM-NASCIDO herda o pulso da encarnação ANTERIOR: 07/08 11:32-11:52 matou 4 loops
+# novos seguidos, presos no 1º curso do 1º ciclo; 10/09 16:29 matou um de ~20s de vida.
+# Por isso, com pulso velho, o vigia ESPERA (não mata) em dois casos:
+#   SONO     — o Mac acordou há <= VG_GRACA_SONO_S (kern.waketime): o loop mal teve CPU.
+#   NASCENTE — o loop mais novo tem <= VG_GRACA_NASCENTE_S de vida: o pulso é órfão.
+# Um livelock REAL (Mac acordado há >15min, loop com >15min, pulso >15min) segue KILL.
 # ==============================================================================
 set -u
 
@@ -59,6 +76,9 @@ VG_STALL_S="${VG_STALL_S:-900}"
 VG_ENV_FILE="${VG_ENV_FILE:-/Users/guilhermerodrigues/teste/aula/.env}"
 VG_KILL_GRACE_S="${VG_KILL_GRACE_S:-10}"
 VG_DRY_RUN="${VG_DRY_RUN:-0}"
+VG_WAKETIME="${VG_WAKETIME:-}"
+# VG_GRACA_SONO_S / VG_GRACA_NASCENTE_S: sem default aqui de propósito — vigia_decidir
+# resolve para o limiar EM USO (VG_STALL_S) quando não setadas.
 
 # ------------------------------------------------------------------ log --------
 _log() {
@@ -111,22 +131,111 @@ PY
     echo $(( agora - fresco ))
 }
 
+# ------------------------------------------------- o Mac acabou de ACORDAR? -----
+# `sysctl -n kern.waketime` => "{ sec = 1789071287, usec = 206221 } Thu Sep 10 ...".
+# Ecoa o epoch (s) ou vazio se ilegível. (O 1º "sec = " é o do campo sec; "usec" vem depois.)
+_parse_waketime() {
+    local s="$1"
+    case "$s" in
+        *"sec = "*) s="${s#*sec = }"; s="${s%%,*}" ;;
+        *) echo ""; return ;;
+    esac
+    case "$s" in ''|*[!0-9]*) echo "" ;; *) echo "$s" ;; esac
+}
+
+# Segundos desde o último WAKE do Mac, ou -1 se desconhecido (sem sysctl, 0, futuro, lixo).
+# VG_WAKETIME sobrepõe (teste). Leitura pura: não toca nada.
+desde_acordar_s() {
+    local w agora
+    if [ -n "$VG_WAKETIME" ]; then w="$VG_WAKETIME"
+    else w="$(_parse_waketime "$(sysctl -n kern.waketime 2>/dev/null)")"; fi
+    case "$w" in ''|*[!0-9]*) echo -1; return ;; esac
+    [ "$w" -le 0 ] && { echo -1; return; }
+    agora="$(date +%s)"
+    [ "$w" -gt "$agora" ] && { echo -1; return; }
+    echo $(( agora - w ))
+}
+
+# ------------------------------------------------ idade do processo de LOOP -----
+# `ps -o etime=` => "[[dd-]hh:]mm:ss" -> segundos; -1 se ilegível. 10# evita octal ("08").
+_etime_para_s() {
+    local e d=0 h=0 m=0 s=0 v
+    e="$(printf '%s' "$1" | tr -d '[:space:]')"
+    case "$e" in *-*) d="${e%%-*}"; e="${e#*-}" ;; esac
+    local IFS=:
+    # shellcheck disable=SC2086
+    set -- $e
+    case $# in
+        2) m="$1"; s="$2" ;;
+        3) h="$1"; m="$2"; s="$3" ;;
+        *) echo -1; return ;;
+    esac
+    for v in "$d" "$h" "$m" "$s"; do
+        case "$v" in ''|*[!0-9]*) echo -1; return ;; esac
+    done
+    echo $(( 10#$d*86400 + 10#$h*3600 + 10#$m*60 + 10#$s ))
+}
+
+# Idade (s) do processo de loop MAIS NOVO (a encarnação que o launchd acabou de subir),
+# ou -1 se nenhum achado. Mais novo = conservador: se QUALQUER loop é recém-nascido, o
+# pulso velho pode ser órfão da encarnação anterior.
+idade_loop_s() {
+    local pid s menor=-1
+    for pid in $(_pids_do_loop); do
+        s="$(_etime_para_s "$(ps -o etime= -p "$pid" 2>/dev/null)")"
+        [ "$s" -lt 0 ] && continue
+        if [ "$menor" -lt 0 ] || [ "$s" -lt "$menor" ]; then menor="$s"; fi
+    done
+    echo "$menor"
+}
+
+# Contexto do pulso p/ o LOG ("fase=passada curso=... ciclo=7 pid=123"): diz ONDE o loop
+# parou. Best-effort (vazio se ilegível / pulso antigo sem os campos).
+pulso_contexto() {
+    [ -f "$VG_PULSO" ] || { echo ""; return; }
+    python3 - "$VG_PULSO" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    print(""); raise SystemExit
+print(" ".join("%s=%s" % (k, d[k]) for k in ("fase", "curso", "ciclo", "pid")
+               if d.get(k) is not None))
+PY
+}
+
 # ============================================================ DECISÃO (PURA) ===
 # Sem I/O. Lê 3 fatos do ambiente e ecoa EXATAMENTE UM token de ação. Testável em
 # tabela, impossível de mentir.
 #   VG_DAEMON_LOADED : 1|0
 #   VG_PULSO_AGE     : segundos (>=0) ou -1 (ausente)
 #   VG_STALL_S       : limiar
+#   VG_DESDE_ACORDAR : s desde o último wake do Mac  (-1/ausente = desconhecido)
+#   VG_LOOP_IDADE    : s de vida do loop mais novo   (-1/ausente = desconhecido)
 # Tokens:
-#   KILL         -> carregado + pulso presente + VELHO  (livelock provado)
+#   KILL         -> carregado + pulso VELHO + Mac acordado há > graça + loop com > graça
+#                   (livelock provado)
 #   HEALTHY      -> carregado + pulso presente + fresco
+#   SONO         -> pulso velho, mas o Mac ACORDOU há <= graça: loop estava congelado
+#                   pelo SO, não travado. NÃO mata.
+#   NASCENTE     -> pulso velho, mas o loop atual nasceu há <= graça: o pulso é da
+#                   encarnação ANTERIOR. NÃO mata.
 #   DOWN_ALERT   -> NÃO carregado (dono desligou; só alerta, nunca ressuscita)
 #   NO_HEARTBEAT -> carregado + pulso AUSENTE (sem prova; não mata)
+# Fatos desconhecidos (-1) => exatamente a decisão ANTIGA (retrocompat).
 vigia_decidir() {
     local loaded="${VG_DAEMON_LOADED:?}" age="${VG_PULSO_AGE:?}" stall="${VG_STALL_S:-900}"
+    local acordou="${VG_DESDE_ACORDAR:--1}" loop_idade="${VG_LOOP_IDADE:--1}"
+    local g_sono="${VG_GRACA_SONO_S:-$stall}" g_nasc="${VG_GRACA_NASCENTE_S:-$stall}"
     if [ "$loaded" != "1" ]; then echo "DOWN_ALERT"; return; fi
     if [ "$age" -lt 0 ]; then echo "NO_HEARTBEAT"; return; fi
-    if [ "$age" -gt "$stall" ]; then echo "KILL"; else echo "HEALTHY"; fi
+    if [ "$age" -le "$stall" ]; then echo "HEALTHY"; return; fi
+    if [ "$acordou" -ge 0 ] && [ "$acordou" -le "$g_sono" ]; then echo "SONO"; return; fi
+    if [ "$loop_idade" -ge 0 ] && [ "$loop_idade" -le "$g_nasc" ]; then
+        echo "NASCENTE"; return
+    fi
+    echo "KILL"
 }
 
 # ============================================================== SIDE EFFECTS ===
@@ -216,18 +325,27 @@ _bounce_loop() {
 
 # ==================================================================== MAIN =====
 main() {
-    local loaded age decisao
+    local loaded age decisao acordou loop_idade
     loaded="$(daemon_carregado)"
     age="$(pulso_idade_s)"
+    acordou="$(desde_acordar_s)"
+    loop_idade="$(idade_loop_s)"
 
-    decisao="$(VG_DAEMON_LOADED="$loaded" VG_PULSO_AGE="$age" VG_STALL_S="$VG_STALL_S" vigia_decidir)"
+    decisao="$(VG_DAEMON_LOADED="$loaded" VG_PULSO_AGE="$age" VG_STALL_S="$VG_STALL_S" \
+        VG_DESDE_ACORDAR="$acordou" VG_LOOP_IDADE="$loop_idade" vigia_decidir)"
 
     case "$decisao" in
         HEALTHY)
             _log "OK — daemon carregado, pulso fresco (${age}s <= ${VG_STALL_S}s). Quieto."
             ;;
+        SONO)
+            _log "SONO — pulso velho (${age}s) mas o Mac ACORDOU há ${acordou}s: o loop estava CONGELADO pelo SO (Mac dormindo), não travado. NÃO mato; espero ele pulsar. Último pulso: [$(pulso_contexto)]"
+            ;;
+        NASCENTE)
+            _log "NASCENTE — pulso velho (${age}s) mas o loop atual tem só ${loop_idade}s de vida: o pulso é ÓRFÃO da encarnação anterior. NÃO mato; espero o 1º pulso dele. Último pulso: [$(pulso_contexto)]"
+            ;;
         KILL)
-            _log "LIVELOCK — daemon CARREGADO mas pulso VELHO (${age}s > ${VG_STALL_S}s). Bounce do loop."
+            _log "LIVELOCK — daemon CARREGADO mas pulso VELHO (${age}s > ${VG_STALL_S}s; Mac acordado há ${acordou}s; loop com ${loop_idade}s de vida). Bounce do loop. Parou em: [$(pulso_contexto)]"
             if [ "$VG_DRY_RUN" = "1" ]; then
                 _log "[DRY_RUN] pularia bounce+alerta"
             else

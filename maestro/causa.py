@@ -11,6 +11,9 @@ FLUXO (2 camadas, determinístico-primeiro):
        - exit 2/3 (Session{Lost,Dead}/NavDead) -> escalar_reseed  (veredito do motor)
        - exit 4 (CircuitBreaker/excesso falhas) -> escalar_humano  (causa DESCONHECIDA)
        - SIGKILL/OOM/timeout                  -> relancar        (transitório de recurso/SO)
+       - net::ERR_<conectividade>, exit != 0  -> aguardar_backoff (rede caiu/mudou, Mac dormiu)
+       - net::ERR_ABORTED, exit != 0          -> escalar_humano  (causa NOMEADA: sonda/reseed
+                                                                  de sessão OU navegação)
        - transitório reconhecido / exit 0     -> aguardar_backoff (rede/5xx/saída limpa)
   2. DESCONHECIDA (não bate em nenhuma assinatura): consulta o SEAM `llm`.
        - produção: `claude -p` headless com a autópsia (ver `seam_claude_p`), cuja saída
@@ -136,29 +139,70 @@ _RE_OOM = re.compile(
 _RE_TIMEOUT = re.compile(r"(time(d)?\s*out|timeouterror|timeout)", re.I)
 
 # Transitório de rede/servidor -> aguardar backoff (espera e o loop reavalia).
-# Inclui os net-errors de CONECTIVIDADE do Chromium (host não resolveu, conexão
-# recusada/resetada, internet caiu, timeout de rede): são transitórios de rede — o
-# host/DNS/link falhou ANTES de a navegação lógica acontecer. NÃO confundir com
-# net::ERR_ABORTED, que é a navegação abortada DEPOIS de conectar (bug do adaptador,
-# tratado à parte em _RE_NAV_ABORTED). Sem esta linha, um ERR_NAME_NOT_RESOLVED caía
-# na causa DESCONHECIDA e escalava humano à toa em vez de só reesperar a rede.
 _RE_TRANSITORIO = re.compile(
     r"(connection\s+reset|connectionreseterror|connection\s+refused|"
     r"temporarily\s+unavailable|try\s+again|\b50[0234]\b|service\s+unavailable|"
-    r"bad\s+gateway|gateway\s+timeout|econnreset|network\s+is\s+unreachable|"
-    r"net::err_(connection_[a-z_]+|name_not_resolved|internet_disconnected|"
-    r"timed_out|address_unreachable|network_changed|socket_not_connected))", re.I)
+    r"bad\s+gateway|gateway\s+timeout|econnreset|network\s+is\s+unreachable)", re.I)
 
-# NAVEGAÇÃO abortada pelo Chromium (net::ERR_ABORTED no page.goto). É uma assinatura
-# CLARA — e NÃO é nenhuma das três coisas que o daemon sabe tratar sozinho: não é
-# sessão morta (a sessão pode estar viva; o /carrega respondeu), não é credencial de
-# API, não é rede caída (o host resolveu e conectou). É a NAVEGAÇÃO do adaptador que
-# abortou: rota/token inválido, redirect inesperado, ou um download servido no lugar
-# de uma página. Foi o incidente Stoa 27/07 — enumerate.open_course abortou em
-# /carrega/<token> (exit 1, traceback Playwright) e a autópsia, sem assinatura, caiu
-# no cego "causa desconhecida e nenhum LLM disponível". Classificar aqui, de forma
-# determinística, dá ao dono a causa NOMEADA (bug de navegação) sem depender do LLM.
+# net-errors de CONECTIVIDADE do Chromium -> aguardar backoff (transitório de rede):
+# host não resolveu, conexão recusada/resetada, internet caiu, timeout de rede, a REDE
+# DO SO MUDOU (ERR_NETWORK_CHANGED: Wi-Fi trocou/VPN) ou o SO SUSPENDEU o I/O de rede
+# (ERR_NETWORK_IO_SUSPENDED: o Mac DORMIU no meio do page.goto — autópsias Stoa 22/07
+# 10:54 e 25/07 07:59, ambas escaladas como "causa desconhecida"). O host/DNS/link/SO
+# falhou ANTES de a navegação lógica acontecer. NÃO confundir com net::ERR_ABORTED
+# (_RE_NAV_ABORTED). Checado ANTES do ERR_ABORTED de propósito: quando a rede cai/muda,
+# as navegações em voo morrem junto e o asyncio despeja ruído "net::ERR_ABORTED; maybe
+# frame was detached?" na mesma cauda — a causa-raiz é a rede, não o adaptador.
+_RE_NET_CONECTIVIDADE = re.compile(
+    r"net::err_(connection_[a-z_]+|name_not_resolved|internet_disconnected|"
+    r"timed_out|address_unreachable|network_changed|network_io_suspended|"
+    r"socket_not_connected)", re.I)
+
+# NAVEGAÇÃO abortada pelo Chromium (net::ERR_ABORTED no page.goto). Assinatura CLARA,
+# decidida SEM LLM (incidente Stoa 27/07: enumerate.open_course abortou em
+# /carrega/<token>, exit 1, e a autópsia caiu no cego "causa desconhecida e nenhum LLM
+# disponível"). NÃO é credencial de API nem rede caída (o host resolveu e conectou) —
+# mas também NÃO se pode afirmar que a sessão está VIVA: o abort acontece DENTRO da
+# sonda/reseed de sessão (ensure_session -> probe_session/reseed_session; casos reais
+# Stoa 19/08 22:09 em reseed_session e Kajabi 13/08 e 18/08 em probe_session), e aí a
+# sessão é a primeira suspeita. Por isso o MOTIVO depende de ONDE abortou (ver
+# _funcao_de_sessao_no_abort). A AÇÃO é escalar_humano nos dois casos — NUNCA
+# escalar_reseed (irredutível: latcharia o curso sem prova de sessão morta).
+# SÓ vale para exit != 0: o asyncio imprime "Future exception was never retrieved ...
+# net::ERR_ABORTED; maybe frame was detached?" até num run que termina LIMPO (ruído de
+# navegação em segundo plano cancelada no fechamento da página — visto na cauda real
+# de 22/07 19:30). Esse ruído não pode quebrar a saída limpa (athena_local).
 _RE_NAV_ABORTED = re.compile(r"net::err_aborted", re.I)
+
+# Funções dos motores (motor/<plataforma>/session.py) que SONDAM ou RESSEMEIAM a sessão.
+# `do_reseed` é o apelido local do reseed_session em ensure_session (Stoa).
+_FUNCS_SESSAO = frozenset({"ensure_session", "probe_session", "reseed_session",
+                           "do_reseed"})
+# Um quadro de traceback Python: `  File "<path>", line N, in <funcao>`.
+_RE_FRAME = re.compile(r'^\s*File "[^"]*", line \d+, in (\w+)')
+
+
+def _funcao_de_sessao_no_abort(err):
+    """Nome da função de SESSÃO (_FUNCS_SESSAO) por onde passa o traceback que TERMINA
+    numa linha com net::ERR_ABORTED — ou None. Sobe a partir da linha do erro pelos
+    quadros do MESMO traceback (linhas `File ...`, código e `^^^` indentados) e para no
+    primeiro limite do bloco (cabeçalho "Traceback", linha de log, outra exceção). Assim
+    um ERR_ABORTED de RUÍDO do asyncio ("future: <Future ... ERR_ABORTED ...>", sem
+    quadros) nunca herda os quadros de um traceback vizinho. Devolve a função mais
+    INTERNA encontrada (probe_session/reseed_session antes de ensure_session)."""
+    linhas = err.splitlines()
+    for i, linha in enumerate(linhas):
+        if not _RE_NAV_ABORTED.search(linha):
+            continue
+        for anterior in reversed(linhas[:i]):
+            m = _RE_FRAME.match(anterior)
+            if m:
+                if m.group(1) in _FUNCS_SESSAO:
+                    return m.group(1)
+                continue
+            if not anterior.startswith((" ", "\t")):
+                break                    # fim do bloco deste traceback
+    return None
 
 # exit codes de SIGKILL: -9 (Popen) e 137 (128+9, via shell).
 _EXIT_SIGKILL = {-9, 137}
@@ -291,19 +335,34 @@ def _deterministico(obito, tracker_dir=None):
     if _RE_TIMEOUT.search(err):
         return "relancar", "assinatura de timeout no stderr"
 
-    # 6) NAVEGAÇÃO abortada (net::ERR_ABORTED): assinatura CLARA de bug de navegação
-    #    do adaptador — NÃO é sessão morta, credencial nem rede caída. Determinístico
-    #    aqui mata a autópsia cega "causa desconhecida e nenhum LLM disponível" (o
-    #    incidente Stoa 27/07). A AÇÃO é escalar_humano (um dev corrige a rota/
-    #    navegação), mas com a causa NOMEADA — o dono sabe onde olhar sem depender do
-    #    LLM. Vem DEPOIS de sessão/token/exit-code/OOM (se o filho também denunciou
-    #    sessão morta ou OOM, aquilo é a causa-raiz), e ANTES do transitório/exit-0.
-    if _RE_NAV_ABORTED.search(err):
-        return "escalar_humano", (
-            "bug de navegação (net::ERR_ABORTED): page.goto abortou ao abrir a "
-            "página — NÃO é sessão morta; dev corrige a navegação do adaptador")
+    # 6) net-errors de CONECTIVIDADE do Chromium (DNS/conexão/link/rede do SO mudou/Mac
+    #    dormiu) numa MORTE (exit != 0): transitório de rede -> backoff. Antes do
+    #    ERR_ABORTED (a rede caída arrasta navegações em voo; ver _RE_NET_CONECTIVIDADE).
+    #    Com exit 0 cai no 8) — saída limpa, o motivo de sempre.
+    if code != 0 and _RE_NET_CONECTIVIDADE.search(err):
+        return "aguardar_backoff", (
+            "net-error de conectividade do Chromium no stderr (rede caiu/mudou ou o "
+            "Mac dormiu): transitório de rede")
 
-    # 7) TRANSITÓRIO de rede/servidor, ou saída LIMPA (a completude é do loop/Notion).
+    # 7) NAVEGAÇÃO abortada (net::ERR_ABORTED) numa MORTE (exit != 0 — com exit 0 é o
+    #    ruído do asyncio num run limpo, e a saída limpa vence no 8). Determinístico
+    #    aqui mata a autópsia cega "causa desconhecida e nenhum LLM disponível" (Stoa
+    #    27/07). A AÇÃO é escalar_humano, com a causa NOMEADA: se o traceback do abort
+    #    passa pela sonda/reseed de sessão, a SESSÃO é a 1ª suspeita (NÃO se afirma que
+    #    está viva); senão, bug de navegação do adaptador. Vem DEPOIS de sessão/token/
+    #    exit-code/OOM/conectividade (aquilo, se presente, é a causa-raiz).
+    if code != 0 and _RE_NAV_ABORTED.search(err):
+        fn_sessao = _funcao_de_sessao_no_abort(err)
+        if fn_sessao:
+            return "escalar_humano", (
+                "navegação abortada DURANTE a sonda/reseed de sessão (net::ERR_ABORTED "
+                "em %s) — verifique a sessão antes de mexer no adaptador" % fn_sessao)
+        return "escalar_humano", (
+            "bug de navegação (net::ERR_ABORTED): page.goto abortou ao abrir a página "
+            "(rota/token inválido, redirect inesperado ou download no lugar da "
+            "página) — dev verifica a navegação do adaptador")
+
+    # 8) TRANSITÓRIO de rede/servidor, ou saída LIMPA (a completude é do loop/Notion).
     if code == 0:
         return "aguardar_backoff", "saída limpa (exit 0) — completude é do owner/Notion"
     if _RE_TRANSITORIO.search(err):

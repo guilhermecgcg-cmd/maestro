@@ -219,6 +219,12 @@ def test_err_aborted_e_bug_de_navegacao_nao_desconhecida():
     assert "navegação" in d.motivo.lower(), d       # causa NOMEADA
     assert "ERR_ABORTED" in d.motivo, d
     assert "desconhecida" not in d.motivo.lower(), d
+    # Texto NEUTRO quanto à sessão: o abort do /carrega não passou pela sonda de
+    # sessão, então não se manda verificar a sessão — mas também NÃO se afirma
+    # categoricamente que ela está viva (o motivo antigo afirmava, e era falso nos
+    # aborts DENTRO da sonda/reseed — ver os testes abaixo).
+    assert "sonda/reseed" not in d.motivo, d
+    assert "NÃO é sessão morta" not in d.motivo, d
 
 
 def test_err_aborted_dispensa_o_llm():
@@ -234,11 +240,242 @@ def test_err_aborted_dispensa_o_llm():
     assert chamado == [], "o LLM foi consultado para uma assinatura determinística"
 
 
-def test_err_aborted_nao_e_confundido_com_sessao_nem_token():
-    # A navegação abortada NÃO pode virar reseed (bench permanente do curso) nem
-    # troca de token (também irredutível). É bug de código -> humano.
-    d = causa.classificar(_obito(exit_code=1, stderr=_STDERR_STOA_ERR_ABORTED))
-    assert d.acao not in ("escalar_reseed", "escalar_token"), d
+# Caudas de stderr REAIS (copiadas de ~/.athena-local/autopsias — só o texto; os
+# arquivos vivos NÃO são lidos pelo teste). O abort acontece DENTRO da sonda/reseed de
+# sessão: a autópsia não pode dizer "NÃO é sessão morta" — a sessão é a 1ª suspeita.
+# 19/08 22:09 stoa-principal (exit 1): ensure_session -> do_reseed -> reseed_session
+# abortou em connect.stoa.com.br/login/.
+_STDERR_STOA_RESEED_ERR_ABORTED = (
+    'Traceback (most recent call last):\n'
+    '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+    '  File "<frozen runpy>", line 88, in _run_code\n'
+    '  File "/Users/guilhermerodrigues/teste/aula-2b/.claude/worktrees/adaptador-stoa/motor/stoa/__main__.py", line 4, in <module>\n'
+    '    main()\n'
+    '  File "/Users/guilhermerodrigues/teste/aula-2b/.claude/worktrees/adaptador-stoa/motor/stoa/cli.py", line 237, in main\n'
+    '    rc = asyncio.run(_amain(argv))\n'
+    '         ^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/asyncio/runners.py", line 190, in run\n'
+    '    return runner.run(main)\n'
+    '           ^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/asyncio/runners.py", line 118, in run\n'
+    '    return self._loop.run_until_complete(task)\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete\n'
+    '    return future.result()\n'
+    '           ^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula-2b/.claude/worktrees/adaptador-stoa/motor/stoa/cli.py", line 174, in _amain\n'
+    '    await ensure_session(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula-2b/.claude/worktrees/adaptador-stoa/motor/stoa/session.py", line 403, in ensure_session\n'
+    '    if not await do_reseed():\n'
+    '           ^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula-2b/.claude/worktrees/adaptador-stoa/motor/stoa/session.py", line 292, in reseed_session\n'
+    '    await page.goto(login_url or home_url, wait_until="domcontentloaded")\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/async_api/_generated.py", line 9764, in goto\n'
+    '    await self._impl_obj.goto(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_page.py", line 560, in goto\n'
+    '    return await self._main_frame.goto(**locals_to_params(locals()))\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_frame.py", line 156, in goto\n'
+    '    await self._channel.send(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 69, in send\n'
+    '    return await self._connection.wrap_api_call(\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 563, in wrap_api_call\n'
+    '    raise rewrite_error(error, f"{parsed_st[\'apiName\']}: {error}") from None\n'
+    'playwright._impl._errors.Error: Page.goto: net::ERR_ABORTED; maybe frame was detached?\n'
+    'Call log:\n'
+    '  - navigating to "https://connect.stoa.com.br/login/", waiting until "domcontentloaded"'
+)
+
+# 13/08 00:40 kajabi-principal (exit 1): ensure_session -> check -> probe_session
+# abortou em /library. A autópsia de 18/08 10:54 tem a cauda BYTE-IDÊNTICA (conferido).
+_STDERR_KAJABI_PROBE_ERR_ABORTED = (
+    'Traceback (most recent call last):\n'
+    '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+    '  File "<frozen runpy>", line 88, in _run_code\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/__main__.py", line 4, in <module>\n'
+    '    main()\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/cli.py", line 196, in main\n'
+    '    rc = asyncio.run(_amain(argv))\n'
+    '         ^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/asyncio/runners.py", line 190, in run\n'
+    '    return runner.run(main)\n'
+    '           ^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/asyncio/runners.py", line 118, in run\n'
+    '    return self._loop.run_until_complete(task)\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete\n'
+    '    return future.result()\n'
+    '           ^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/cli.py", line 147, in _amain\n'
+    '    await ensure_session(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/session.py", line 178, in ensure_session\n'
+    '    if await check():\n'
+    '       ^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/session.py", line 102, in probe_session\n'
+    '    await page.goto(library_url(home_url), wait_until="domcontentloaded")\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/async_api/_generated.py", line 9764, in goto\n'
+    '    await self._impl_obj.goto(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_page.py", line 560, in goto\n'
+    '    return await self._main_frame.goto(**locals_to_params(locals()))\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_frame.py", line 156, in goto\n'
+    '    await self._channel.send(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 69, in send\n'
+    '    return await self._connection.wrap_api_call(\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 563, in wrap_api_call\n'
+    '    raise rewrite_error(error, f"{parsed_st[\'apiName\']}: {error}") from None\n'
+    'playwright._impl._errors.Error: Page.goto: net::ERR_ABORTED; maybe frame was detached?\n'
+    'Call log:\n'
+    '  - navigating to "https://nepq-training.mykajabi.com/library", waiting until "domcontentloaded"'
+)
+
+# 22/07 19:30 hotmart-principal: RUÍDO do asyncio ("Future exception was never
+# retrieved") — navegações em SEGUNDO PLANO canceladas quando a página fechou. Não é a
+# exceção que encerrou o processo (ninguém a aguardou): aparece até num run que termina
+# LIMPO. Trecho real da cauda (3 linhas httpx benignas + os 2 blocos de ruído).
+_RUIDO_ASYNCIO_ERR_ABORTED = (
+    '2026-07-22 19:28:36,177 INFO httpx: HTTP Request: GET https://api.notion.com/v1/databases/d39ec1652ad64a999c3b4db7641abba3 "HTTP/1.1 200 OK"\n'
+    '2026-07-22 19:28:36,516 INFO httpx: HTTP Request: POST https://api.notion.com/v1/data_sources/49c13155-b7bb-406e-a35e-6be85bac081a/query "HTTP/1.1 200 OK"\n'
+    '2026-07-22 19:28:37,073 INFO httpx: HTTP Request: PATCH https://api.notion.com/v1/blocks/3a5978a1-669c-819a-81ec-f0f1b71a851f/children "HTTP/1.1 200 OK"\n'
+    '2026-07-22 19:29:08,441 ERROR asyncio: Future exception was never retrieved\n'
+    'future: <Future finished exception=Error(\'net::ERR_ABORTED; maybe frame was detached?\\nCall log:\\n  - navigating to "https://hotmart.com/pt-BR/club/ciro-gestor/products/5431484/content/o4Eg8Jwd7z", waiting until "domcontentloaded"\\n\')>\n'
+    'playwright._impl._errors.Error: net::ERR_ABORTED; maybe frame was detached?\n'
+    'Call log:\n'
+    '  - navigating to "https://hotmart.com/pt-BR/club/ciro-gestor/products/5431484/content/o4Eg8Jwd7z", waiting until "domcontentloaded"\n'
+    '\n'
+    '2026-07-22 19:29:08,441 ERROR asyncio: Future exception was never retrieved\n'
+    'future: <Future finished exception=Error(\'net::ERR_ABORTED; maybe frame was detached?\\nCall log:\\n  - navigating to "https://hotmart.com/pt-BR/club/ciro-gestor/products/5431484/content/RON9Nmwd7P", waiting until "domcontentloaded"\\n\')>\n'
+    'playwright._impl._errors.Error: net::ERR_ABORTED; maybe frame was detached?\n'
+    'Call log:\n'
+    '  - navigating to "https://hotmart.com/pt-BR/club/ciro-gestor/products/5431484/content/RON9Nmwd7P", waiting until "domcontentloaded"'
+)
+
+# 25/07 07:59 stoa-principal (exit 1): o Mac DORMIU no meio do page.goto. Trecho real
+# (a partir do quadro _content_at). Escalou ao vivo como "causa desconhecida".
+_STDERR_STOA_IO_SUSPENDED = (
+    '  File "/Users/guilhermerodrigues/teste/aula-2b/.claude/worktrees/adaptador-stoa/motor/stoa/enumerate.py", line 254, in _content_at\n'
+    '    await page.goto(url, wait_until="domcontentloaded")\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/async_api/_generated.py", line 9764, in goto\n'
+    '    await self._impl_obj.goto(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_page.py", line 560, in goto\n'
+    '    return await self._main_frame.goto(**locals_to_params(locals()))\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_frame.py", line 156, in goto\n'
+    '    await self._channel.send(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 69, in send\n'
+    '    return await self._connection.wrap_api_call(\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 563, in wrap_api_call\n'
+    '    raise rewrite_error(error, f"{parsed_st[\'apiName\']}: {error}") from None\n'
+    'playwright._impl._errors.Error: Page.goto: net::ERR_NETWORK_IO_SUSPENDED at https://educacao.stoa.com.br/carrega/QVlRHZlbopUYxoFWXpmRpFmVwNXVxw2UWFjSyNmRkFGZF9GeZFjW0ImVNpnWHh3UVJzZ4ZFWOdnYGlVP\n'
+    'Call log:\n'
+    '  - navigating to "https://educacao.stoa.com.br/carrega/QVlRHZlbopUYxoFWXpmRpFmVwNXVxw2UWFjSyNmRkFGZF9GeZFjW0ImVNpnWHh3UVJzZ4ZFWOdnYGlVP", waiting until "domcontentloaded"'
+)
+
+# 30/07 06:44 memberkit-mastertalkers (exit 1): a rede do SO MUDOU durante a SONDA de
+# sessão (probe_session). Trecho real (a partir do quadro _amain).
+_STDERR_MEMBERKIT_NETWORK_CHANGED = (
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/memberkit/cli.py", line 147, in _amain\n'
+    '    await ensure_session(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/memberkit/session.py", line 155, in ensure_session\n'
+    '    if await check():\n'
+    '       ^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/memberkit/session.py", line 80, in probe_session\n'
+    '    await page.goto(home_url, wait_until="domcontentloaded")\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/async_api/_generated.py", line 9764, in goto\n'
+    '    await self._impl_obj.goto(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_page.py", line 560, in goto\n'
+    '    return await self._main_frame.goto(**locals_to_params(locals()))\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_frame.py", line 156, in goto\n'
+    '    await self._channel.send(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 69, in send\n'
+    '    return await self._connection.wrap_api_call(\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 563, in wrap_api_call\n'
+    '    raise rewrite_error(error, f"{parsed_st[\'apiName\']}: {error}") from None\n'
+    'playwright._impl._errors.Error: Page.goto: net::ERR_NETWORK_CHANGED at https://master-talkers.memberkit.com.br/\n'
+    'Call log:\n'
+    '  - navigating to "https://master-talkers.memberkit.com.br/", waiting until "domcontentloaded"'
+)
+
+
+@pytest.mark.parametrize("stderr,funcao", [
+    (_STDERR_STOA_RESEED_ERR_ABORTED, "reseed_session"),      # Stoa 19/08
+    (_STDERR_KAJABI_PROBE_ERR_ABORTED, "probe_session"),      # Kajabi 13/08 (== 18/08)
+])
+def test_err_aborted_dentro_da_sonda_de_sessao_manda_verificar_a_sessao(stderr, funcao):
+    # DENTES (casos reais): o abort aconteceu DENTRO de ensure_session. O motivo
+    # antigo afirmava "NÃO é sessão morta" — FALSO aqui: a sessão é a 1ª suspeita.
+    # A AÇÃO segue escalar_humano (NUNCA reseed: sem prova de sessão morta, latchar o
+    # curso seria o falso "Sessão expirou" permanente).
+    d = causa.classificar(_obito(exit_code=1, stderr=stderr))
+    assert d.acao == "escalar_humano", d
+    assert d.fonte == "deterministico", d
+    assert "DURANTE a sonda/reseed de sessão" in d.motivo, d
+    assert "verifique a sessão antes de mexer no adaptador" in d.motivo, d
+    assert funcao in d.motivo, d                   # ONDE abortou (a função mais interna)
+    assert "ERR_ABORTED" in d.motivo, d
+    assert "NÃO é sessão morta" not in d.motivo, d
+
+
+def test_ruido_asyncio_nao_herda_quadros_de_sessao_de_traceback_vizinho():
+    # A busca da função de sessão sobe SÓ pelo traceback que TERMINA no ERR_ABORTED.
+    # Um traceback VIZINHO que passou por ensure_session e morreu de OUTRA coisa não
+    # pode "emprestar" seus quadros ao ruído do asyncio (que não tem quadro nenhum).
+    vizinho = ('Traceback (most recent call last):\n'
+               '  File "/x/motor/kajabi/session.py", line 178, in ensure_session\n'
+               '    if await check():\n'
+               "KeyError: 'library'\n")
+    assert causa._funcao_de_sessao_no_abort(vizinho + _RUIDO_ASYNCIO_ERR_ABORTED) is None
+    assert causa._funcao_de_sessao_no_abort(_STDERR_STOA_ERR_ABORTED) is None   # /carrega
+    assert causa._funcao_de_sessao_no_abort(
+        _STDERR_STOA_RESEED_ERR_ABORTED) == "reseed_session"
+
+
+def test_exit0_com_ruido_asyncio_err_aborted_e_saida_limpa():
+    # DENTES [BLOQUEANTE da revisão]: o bloco ERR_ABORTED rodava ANTES do `code == 0`.
+    # Um run que sai LIMPO mas cujo asyncio despejou o ruído "Future exception was
+    # never retrieved ... net::ERR_ABORTED" (cauda real 22/07) virava escalar_humano —
+    # e o athena_local só reconhece saída limpa com exit 0 E aguardar_backoff: o run
+    # limpo virava MORTE (alerta essencial + backoff + cooldown perdido).
+    d = causa.classificar(_obito(exit_code=0, stderr=_RUIDO_ASYNCIO_ERR_ABORTED))
+    assert d.acao == "aguardar_backoff", d
+    assert d.fonte == "deterministico", d
+    assert "saída limpa" in d.motivo, d
+
+
+def test_exit_nao_zero_com_so_o_ruido_ainda_nomeia_a_navegacao():
+    # Contraprova: numa MORTE (exit != 0) o mesmo ruído segue decidido SEM LLM, com
+    # causa nomeada neutra (não há quadro de sessão no ruído).
+    d = causa.classificar(_obito(exit_code=1, stderr=_RUIDO_ASYNCIO_ERR_ABORTED))
+    assert d.acao == "escalar_humano" and d.fonte == "deterministico", d
+    assert "navegação" in d.motivo and "sonda/reseed" not in d.motivo, d
+
+
+@pytest.mark.parametrize("stderr", [
+    _STDERR_STOA_ERR_ABORTED,                   # /carrega (27/07)
+    _STDERR_STOA_RESEED_ERR_ABORTED,            # reseed_session (19/08) — navega pro /login/
+    _STDERR_KAJABI_PROBE_ERR_ABORTED,           # probe_session (13/08 e 18/08)
+])
+@pytest.mark.parametrize("acao_confusa", ["escalar_reseed", "escalar_token"])
+def test_err_aborted_nao_e_confundido_com_sessao_nem_token(stderr, acao_confusa):
+    # DENTES (reescrito — o antigo passava SEM o bloco ERR_ABORTED, porque o fail-closed
+    # já dava escalar_humano). Com o diagnóstico por LLM LIGADO (ATHENA_CAUSA_LLM=1), um
+    # LLM que lê "navigating to .../login/" e propõe reseed (IRREDUTÍVEL: latch do curso)
+    # ou token NÃO pode decidir: a assinatura determinística vence e o seam nem é tocado.
+    chamado = []
+
+    def llm_confuso(prompt):
+        chamado.append(prompt)
+        return '{"acao": "%s"}' % acao_confusa
+
+    d = causa.classificar(_obito(exit_code=1, stderr=stderr), llm=llm_confuso)
+    assert d.acao == "escalar_humano", d
+    assert d.fonte == "deterministico", d
+    assert chamado == [], "o LLM foi consultado para uma assinatura determinística"
 
 
 @pytest.mark.parametrize("stderr", [
@@ -246,12 +483,26 @@ def test_err_aborted_nao_e_confundido_com_sessao_nem_token():
     "net::ERR_CONNECTION_REFUSED",                             # conexão recusada
     "net::ERR_INTERNET_DISCONNECTED at https://x",            # link caiu
     "net::ERR_TIMED_OUT",                                     # timeout de rede
+    "Page.goto: net::ERR_NETWORK_IO_SUSPENDED at https://x",  # Mac dormiu
+    "Page.goto: net::ERR_NETWORK_CHANGED at https://x/",      # rede do SO mudou
+    _STDERR_STOA_IO_SUSPENDED,                                # real: Stoa 25/07
+    _STDERR_MEMBERKIT_NETWORK_CHANGED,                        # real: Memberkit 30/07 (na sonda)
 ])
 def test_neterror_de_conectividade_e_transitorio_nao_desconhecida(stderr):
-    # Os net-errors de CONECTIVIDADE (host/DNS/link) são transitórios de rede —
-    # aguardar_backoff, não o cego "desconhecida". Distinto do ERR_ABORTED, que é
-    # bug de navegação depois de conectar.
+    # Os net-errors de CONECTIVIDADE (host/DNS/link/rede do SO/Mac dormindo) são
+    # transitórios de rede — aguardar_backoff, não o cego "desconhecida". Distinto do
+    # ERR_ABORTED. ERR_NETWORK_IO_SUSPENDED escalava humano ao vivo (22/07 e 25/07).
     d = causa.classificar(_obito(exit_code=1, stderr=stderr))
+    assert d.acao == "aguardar_backoff", d
+    assert d.fonte == "deterministico", d
+
+
+def test_rede_caida_vence_o_ruido_err_aborted_na_mesma_cauda():
+    # Quando a rede cai/muda, as navegações em voo morrem junto e o asyncio despeja o
+    # ruído ERR_ABORTED na MESMA cauda. A causa-raiz é a rede (backoff), não um "bug
+    # de navegação" que chamaria o dono à toa.
+    d = causa.classificar(_obito(
+        exit_code=1, stderr=_RUIDO_ASYNCIO_ERR_ABORTED + "\n" + _STDERR_STOA_IO_SUSPENDED))
     assert d.acao == "aguardar_backoff", d
     assert d.fonte == "deterministico", d
 

@@ -497,6 +497,54 @@ def test_neterror_de_conectividade_e_transitorio_nao_desconhecida(stderr):
     assert d.fonte == "deterministico", d
 
 
+# 22/07 10:22 memberkit-mastertalkers: cauda REAL (trecho final, conferido byte a byte
+# contra ~/.athena-local/autopsias/20260722T102201_422033-memberkit-mastertalkers.json;
+# o teste NÃO lê o arquivo vivo) de um page.goto que estourou 30s — a assinatura mais
+# comum das autópsias (31 ocorrências).
+_STDERR_MEMBERKIT_TIMEOUT_GOTO = (
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/memberkit/enumerate.py", line 201, in _content_at\n'
+    '    await page.goto(url, wait_until="domcontentloaded")\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/async_api/_generated.py", line 9764, in goto\n'
+    '    await self._impl_obj.goto(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_page.py", line 560, in goto\n'
+    '    return await self._main_frame.goto(**locals_to_params(locals()))\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_frame.py", line 156, in goto\n'
+    '    await self._channel.send(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 69, in send\n'
+    '    return await self._connection.wrap_api_call(\n'
+    '           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/.venv/lib/python3.11/site-packages/playwright/_impl/_connection.py", line 563, in wrap_api_call\n'
+    '    raise rewrite_error(error, f"{parsed_st[\'apiName\']}: {error}") from None\n'
+    'playwright._impl._errors.TimeoutError: Page.goto: Timeout 30000ms exceeded.\n'
+    'Call log:\n'
+    '  - navigating to "https://master-talkers.memberkit.com.br/219124-capital-creator-autoritha", waiting until "domcontentloaded"\n'
+)
+
+
+@pytest.mark.parametrize("stderr", [
+    _STDERR_MEMBERKIT_TIMEOUT_GOTO,                       # real: TimeoutError do page.goto
+    "asyncio.TimeoutError: operation timed out",
+    "MemoryError",
+    "Out of memory: Killed process 123",
+], ids=["timeout-goto-real", "asyncio-timeout", "memoryerror", "oom-kill"])
+def test_exit0_com_timeout_ou_oom_na_cauda_e_saida_limpa(stderr):
+    # DENTES (mesma classe do bloqueante 1 da rodada 2): OOM/timeout rodavam ANTES do
+    # teste de exit 0, então um run que saiu LIMPO com um timeout de aula (tratado e
+    # retentado pelo motor) na cauda virava `relancar` — e o athena_local, que só
+    # reconhece saída limpa com exit 0 E aguardar_backoff, contava FALHA no disjuntor.
+    d = causa.classificar(_obito(exit_code=0, stderr=stderr))
+    assert d.acao == "aguardar_backoff", d
+    assert d.fonte == "deterministico", d
+    assert "saída limpa" in d.motivo, d
+
+
+def test_timeout_real_numa_morte_segue_relancar():
+    # Contraprova: numa MORTE (exit != 0) a mesma cauda real segue transitório.
+    d = causa.classificar(_obito(exit_code=1, stderr=_STDERR_MEMBERKIT_TIMEOUT_GOTO))
+    assert d.acao == "relancar" and "timeout" in d.motivo, d
+
+
 def test_rede_caida_vence_o_ruido_err_aborted_na_mesma_cauda():
     # Quando a rede cai/muda, as navegações em voo morrem junto e o asyncio despeja o
     # ruído ERR_ABORTED na MESMA cauda. A causa-raiz é a rede (backoff), não um "bug

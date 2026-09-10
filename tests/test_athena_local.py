@@ -629,3 +629,24 @@ def test_exit0_com_ruido_asyncio_err_aborted_segue_saida_limpa_no_loop():
     assert st.get("_saida_limpa_ciclo") == 1000.0
     assert "_morte_ciclo" not in st
     assert alertas.mortes == []
+
+
+def test_exit0_com_timeout_real_na_cauda_segue_saida_limpa_no_loop():
+    # Ponta a ponta do item 3: exit 0 com "TimeoutError: Page.goto: Timeout 30000ms
+    # exceeded" (cauda REAL) na cauda. Com OOM/timeout antes do `code == 0`, a causa dava
+    # `relancar` e o _aplicar_decisao tratava o run LIMPO como MORTE: _morte_ciclo +
+    # registrar_falha no disjuntor REAL (backoff) e o cooldown de concluído perdido.
+    from maestro import causa, disjuntor
+    from maestro.vigia import Obito
+    from tests.test_causa import _STDERR_MEMBERKIT_TIMEOUT_GOTO
+    obito = Obito(conta="memberkit-mastertalkers", curso=C1, exit_code=0,
+                  stderr_tail=_STDERR_MEMBERKIT_TIMEOUT_GOTO, flaps_na_janela=0)
+    decisao = causa.classificar(obito)
+    st, alertas = {"fase": athena_local.FASE_CAPTURANDO}, _SpyAlertas()
+    athena_local._aplicar_decisao(C1, st, obito, decisao, disjuntor=disjuntor,
+                                  alertas=alertas, agora=1000.0, meta_por_curso={},
+                                  flap_min=99, espinha=_SpyEspinha())
+    assert decisao.acao == "aguardar_backoff", decisao
+    assert st.get("_saida_limpa_ciclo") == 1000.0
+    assert "_morte_ciclo" not in st and "disj_falhas" not in st, st
+    assert alertas.mortes == []

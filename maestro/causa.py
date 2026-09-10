@@ -358,11 +358,17 @@ def _deterministico(obito, tracker_dir=None):
             "enumeração/completude fail-closed do adaptador: %s" % _ultima_linha(err))
 
     # 5) SIGKILL / OOM / timeout -> relançar (transitório de recurso/SO; motor é idempotente).
+    #    OOM/timeout SÓ numa MORTE (exit != 0): exit 0 é saída LIMPA, e a cauda de um run
+    #    limpo carrega timeouts/erros de aula já tratados e retentados pelo motor (ex.:
+    #    "TimeoutError: Page.goto: Timeout 30000ms exceeded" de uma aula que falhou e o
+    #    run seguiu). Sem o gate, o exit 0 virava `relancar` -> o athena_local (que só
+    #    reconhece saída limpa com exit 0 E aguardar_backoff) contava FALHA no disjuntor
+    #    e perdia o cooldown de concluído — mesma classe do ERR_ABORTED abaixo.
     if code in _EXIT_SIGKILL:
         return "relancar", "exit code de SIGKILL (%s)" % code
-    if _RE_OOM.search(err):
+    if code != 0 and _RE_OOM.search(err):
         return "relancar", "assinatura de OOM/falta de recurso no stderr"
-    if _RE_TIMEOUT.search(err):
+    if code != 0 and _RE_TIMEOUT.search(err):
         return "relancar", "assinatura de timeout no stderr"
 
     # 6) net-errors de CONECTIVIDADE do Chromium (DNS/conexão/link/rede do SO mudou/Mac

@@ -179,14 +179,19 @@ _etime_para_s() {
 # Idade (s) do processo de loop MAIS NOVO (a encarnação que o launchd acabou de subir),
 # ou -1 se nenhum achado. Mais novo = conservador: se QUALQUER loop é recém-nascido, o
 # pulso velho pode ser órfão da encarnação anterior.
-idade_loop_s() {
-    local pid s menor=-1
+loop_mais_novo() {  # ecoa "<idade_s> <pid>" do loop mais novo, ou "-1 -"
+    local pid s menor=-1 pid_menor="-"
     for pid in $(_pids_do_loop); do
         s="$(_etime_para_s "$(ps -o etime= -p "$pid" 2>/dev/null)")"
         [ "$s" -lt 0 ] && continue
-        if [ "$menor" -lt 0 ] || [ "$s" -lt "$menor" ]; then menor="$s"; fi
+        if [ "$menor" -lt 0 ] || [ "$s" -lt "$menor" ]; then menor="$s"; pid_menor="$pid"; fi
     done
-    echo "$menor"
+    echo "$menor $pid_menor"
+}
+
+idade_loop_s() {
+    local x; x="$(loop_mais_novo)"
+    echo "${x%% *}"
 }
 
 # Contexto do pulso p/ o LOG ("fase=passada curso=... ciclo=7 pid=123"): diz ONDE o loop
@@ -221,6 +226,10 @@ PY
 #                   pelo SO, não travado. NÃO mata.
 #   NASCENTE     -> pulso velho, mas o loop atual nasceu há <= graça: o pulso é da
 #                   encarnação ANTERIOR. NÃO mata.
+#   CRASHLOOP    -> NASCENTE de novo, mas o loop mais novo é OUTRO pid que o do tick
+#                   anterior e o pulso segue velho: o daemon reinicia sem nunca pulsar.
+#                   NÃO mata (não ajuda) — ESCALA (a graça não pode calar esse modo).
+#   (VG_ESTADO_ANTERIOR / VG_PID_ANTERIOR / VG_LOOP_PID alimentam só o CRASHLOOP.)
 #   DOWN_ALERT   -> NÃO carregado (dono desligou; só alerta, nunca ressuscita)
 #   NO_HEARTBEAT -> carregado + pulso AUSENTE (sem prova; não mata)
 # Fatos desconhecidos (-1) => exatamente a decisão ANTIGA (retrocompat).
@@ -233,6 +242,15 @@ vigia_decidir() {
     if [ "$age" -le "$stall" ]; then echo "HEALTHY"; return; fi
     if [ "$acordou" -ge 0 ] && [ "$acordou" -le "$g_sono" ]; then echo "SONO"; return; fi
     if [ "$loop_idade" -ge 0 ] && [ "$loop_idade" -le "$g_nasc" ]; then
+        local ant="${VG_ESTADO_ANTERIOR:-}" pid_ant="${VG_PID_ANTERIOR:-}"
+        local pid_ag="${VG_LOOP_PID:-}"
+        case "$ant" in
+            NASCENTE|CRASHLOOP)
+                if [ -n "$pid_ant" ] && [ -n "$pid_ag" ] && [ "$pid_ant" != "-" ] \
+                        && [ "$pid_ag" != "-" ] && [ "$pid_ant" != "$pid_ag" ]; then
+                    echo "CRASHLOOP"; return
+                fi ;;
+        esac
         echo "NASCENTE"; return
     fi
     echo "KILL"
@@ -325,14 +343,17 @@ _bounce_loop() {
 
 # ==================================================================== MAIN =====
 main() {
-    local loaded age decisao acordou loop_idade
+    local loaded age decisao acordou loop_idade loop_pid lm anterior="" pid_anterior=""
     loaded="$(daemon_carregado)"
     age="$(pulso_idade_s)"
     acordou="$(desde_acordar_s)"
-    loop_idade="$(idade_loop_s)"
+    lm="$(loop_mais_novo)"; loop_idade="${lm%% *}"; loop_pid="${lm#* }"
+    [ -f "$VG_STATE" ] && anterior="$(cat "$VG_STATE" 2>/dev/null)"
+    [ -f "$VG_STATE.pid" ] && pid_anterior="$(cat "$VG_STATE.pid" 2>/dev/null)"
 
     decisao="$(VG_DAEMON_LOADED="$loaded" VG_PULSO_AGE="$age" VG_STALL_S="$VG_STALL_S" \
-        VG_DESDE_ACORDAR="$acordou" VG_LOOP_IDADE="$loop_idade" vigia_decidir)"
+        VG_DESDE_ACORDAR="$acordou" VG_LOOP_IDADE="$loop_idade" VG_LOOP_PID="$loop_pid" \
+        VG_ESTADO_ANTERIOR="$anterior" VG_PID_ANTERIOR="$pid_anterior" vigia_decidir)"
 
     case "$decisao" in
         HEALTHY)
@@ -342,7 +363,13 @@ main() {
             _log "SONO — pulso velho (${age}s) mas o Mac ACORDOU há ${acordou}s: o loop estava CONGELADO pelo SO (Mac dormindo), não travado. NÃO mato; espero ele pulsar. Último pulso: [$(pulso_contexto)]"
             ;;
         NASCENTE)
-            _log "NASCENTE — pulso velho (${age}s) mas o loop atual tem só ${loop_idade}s de vida: o pulso é ÓRFÃO da encarnação anterior. NÃO mato; espero o 1º pulso dele. Último pulso: [$(pulso_contexto)]"
+            _log "NASCENTE — pulso velho (${age}s) mas o loop atual (PID ${loop_pid}) tem só ${loop_idade}s de vida: o pulso é ÓRFÃO da encarnação anterior. NÃO mato; espero o 1º pulso dele. Último pulso: [$(pulso_contexto)]"
+            ;;
+        CRASHLOOP)
+            _log "CRASH-LOOP? — pulso velho (${age}s) e o loop recém-nascido (${loop_idade}s, PID ${loop_pid}) é OUTRO processo que o do tick anterior (PID ${pid_anterior}): o daemon reinicia sem nunca pulsar. NÃO mato (não ajuda); escalo. Veja ~/.athena-local/loop.err."
+            if [ "$VG_DRY_RUN" != "1" ] && _deve_alertar CRASHLOOP; then
+                telegram_alerta "Athena vigia-externo: daemon ${VG_DAEMON_LABEL} parece em CRASH-LOOP — reinicia (PID ${pid_anterior} -> ${loop_pid}) sem nunca gravar o pulso (${age}s). Não mato; veja ~/.athena-local/loop.err."
+            fi
             ;;
         KILL)
             _log "LIVELOCK — daemon CARREGADO mas pulso VELHO (${age}s > ${VG_STALL_S}s; Mac acordado há ${acordou}s; loop com ${loop_idade}s de vida). Bounce do loop. Parou em: [$(pulso_contexto)]"
@@ -370,6 +397,8 @@ main() {
     # persiste a decisão para o latch anti-flood do próximo tick
     mkdir -p "$(dirname "$VG_STATE")" 2>/dev/null
     printf '%s' "$decisao" > "$VG_STATE" 2>/dev/null
+    # pid do loop mais novo neste tick: base da detecção de CRASHLOOP no próximo tick
+    printf '%s' "$loop_pid" > "$VG_STATE.pid" 2>/dev/null
     echo "$decisao"
 }
 

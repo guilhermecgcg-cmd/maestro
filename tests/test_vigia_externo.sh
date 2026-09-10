@@ -95,6 +95,21 @@ check "graca nascente 0: loop 1s"             KILL \
 check "graca sono 0: acordou ha 1s"           KILL \
     "$(VG_GRACA_SONO_S=0 decidir2 1 5000 1 10800)"
 
+# ---- CRASH-LOOP: a graça NASCENTE não pode calar um daemon que reinicia sem pulsar ----
+# (antes do fix esse modo de falha ao menos virava KILL+alerta a cada 5 min; sem esta
+# regra ele viraria NASCENTE mudo para sempre)
+decidir3() {  # decidir3 <estado_anterior> <pid_anterior> <loop_pid>
+    VG_DAEMON_LOADED=1 VG_PULSO_AGE=5000 VG_DESDE_ACORDAR=-1 VG_LOOP_IDADE=20 \
+        VG_ESTADO_ANTERIOR="$1" VG_PID_ANTERIOR="$2" VG_LOOP_PID="$3" VG_STALL_S=900 \
+        vigia_decidir
+}
+check "nascente de novo, OUTRO pid -> CRASHLOOP"  CRASHLOOP "$(decidir3 NASCENTE 111 222)"
+check "crashloop persiste com outro pid"          CRASHLOOP "$(decidir3 CRASHLOOP 222 333)"
+check "nascente de novo, MESMO pid -> NASCENTE"   NASCENTE  "$(decidir3 NASCENTE 111 111)"
+check "1a nascente (antes HEALTHY) -> NASCENTE"   NASCENTE  "$(decidir3 HEALTHY 111 222)"
+check "pid anterior desconhecido -> NASCENTE"     NASCENTE  "$(decidir3 NASCENTE '-' 222)"
+check "sem estado anterior -> NASCENTE"           NASCENTE  "$(decidir3 '' '' 222)"
+
 # ---- parsers ------------------------------------------------------------------
 check "etime mm:ss"            20      "$(_etime_para_s '00:20')"
 check "etime 4:31"             271     "$(_etime_para_s '04:31')"
@@ -150,6 +165,14 @@ e2e() {  # e2e <graca_nascente> -> decisão
 check "e2e: loop recém-nascido NÃO é morto" NASCENTE "$(e2e 900)"
 if kill -0 "$FAKE" 2>/dev/null; then check "e2e: dublê segue VIVO" ok ok; else check "e2e: dublê segue VIVO" ok MORTO; fi
 grep -q "NASCENTE" "$TMPD/e2e.log" && check "e2e: log honesto NASCENTE" ok ok || check "e2e: log honesto NASCENTE" ok NAO
+# o dublê "crasha" e o launchd sobe OUTRO (novo pid), ainda sem pulso -> CRASHLOOP, sem kill
+kill -9 "$FAKE" 2>/dev/null; wait "$FAKE" 2>/dev/null
+"$PY" -c 'import time,sys; time.sleep(120)' "$MARK" &
+FAKE=$!
+sleep 1.2
+check "e2e: renasceu com OUTRO pid e sem pulso -> CRASHLOOP" CRASHLOOP "$(e2e 900)"
+if kill -0 "$FAKE" 2>/dev/null; then check "e2e: CRASHLOOP não mata" ok ok; else check "e2e: CRASHLOOP não mata" ok MORTO; fi
+grep -q "CRASH-LOOP" "$TMPD/e2e.log" && check "e2e: log honesto CRASH-LOOP" ok ok || check "e2e: log honesto CRASH-LOOP" ok NAO
 check "e2e: sem graça -> KILL (livelock real)" KILL "$(e2e 0)"
 sleep 0.5
 if kill -0 "$FAKE" 2>/dev/null; then check "e2e: dublê MORTO pelo KILL" ok VIVO; kill -9 "$FAKE" 2>/dev/null; else check "e2e: dublê MORTO pelo KILL" ok ok; fi

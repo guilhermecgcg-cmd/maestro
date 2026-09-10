@@ -682,3 +682,70 @@ def test_exit5_com_stderr_de_sessao_morta_ainda_escala_reseed():
     # causa-raiz é a sessão — mesmo com exit 5. O exit-code NÃO mascara o veredito.
     d = causa.classificar(_obito(exit_code=5, stderr="SESSÃO MORTA: refaça o login"))
     assert d.acao == "escalar_reseed", d
+
+
+# --------------------------------------------------------------------------
+# EXIT 6 — completude FAIL-CLOSED / enumerador ausente (contrato novo do motor,
+# commit 2aa84b9: Alpaclass e Nutror, EXIT_ENUMERACAO_INCOMPLETA = 6). Antes caía no
+# fail-closed "causa desconhecida" SÓ porque o LLM está desligado no daemon.
+# --------------------------------------------------------------------------
+# Saída REAL dos CLIs (os `print` de motor/alpaclass/cli.py e motor/nutror/cli.py do
+# 2aa84b9, com o `{e}` = a mensagem da exceção de motor/<plat>/enumerate.py).
+_EXIT6_ALPACLASS = (
+    "2026-09-10 19:20:01,100 INFO motor.alpaclass.enumerate: alpaclass: 1 curso(s) "
+    "acessível(is) em 'meus cursos'\n"
+    "\n"
+    "ENUMERADOR DE AULAS ALPACLASS NÃO IMPLEMENTADO: enumerador de aulas Alpaclass não "
+    "implementado: o curso acessível 'curso-x' existe, mas o shape de "
+    "/learner/courses/<slug> (módulos/aulas) nunca foi observado ao vivo e não há parser "
+    "— NÃO reporto 0 aulas como sucesso. Próximo passo: recon do detalhe do curso numa "
+    "sessão com curso comprado e ligar o parser como `fetch_lessons` default.\n"
+    "Nenhuma aula foi capturada e NADA foi marcado como concluído. Falta o parser do "
+    "detalhe do curso (GET /learner/courses/<slug>) — recon numa sessão com curso "
+    "comprado. Não é a sessão nem a rede.\n"
+)
+_EXIT6_NUTROR = (
+    "\n"
+    "ENUMERAÇÃO NUTROR VAZIA (parse do DOM quebrou): nenhum link de curso (/v3/curso/...) "
+    "no DOM de https://x.nutror.com/ após autenticar — a SPA não hidratou os links ou o "
+    "layout mudou. Confirme no ao-vivo (DevTools > Network logado) se a lista vem via "
+    "JSON e ligue o seam `list_courses_via_api`. NÃO reportando sucesso com catálogo "
+    "vazio.\n"
+    "A sessão está viva mas nenhum curso/aula saiu do DOM — provável mudança de layout "
+    "ou lista via JSON. Confirme no ao-vivo (DevTools > Network logado) e ligue o "
+    "caminho por API antes de retomar.\n"
+)
+
+
+@pytest.mark.parametrize("stderr,ultima", [
+    (_EXIT6_ALPACLASS, "Nenhuma aula foi capturada e NADA foi marcado como concluído. "
+                       "Falta o parser do detalhe do curso (GET /learner/courses/<slug>) "
+                       "— recon numa sessão com curso comprado. Não é a sessão nem a rede."),
+    (_EXIT6_NUTROR, "A sessão está viva mas nenhum curso/aula saiu do DOM — provável "
+                    "mudança de layout ou lista via JSON. Confirme no ao-vivo (DevTools > "
+                    "Network logado) e ligue o caminho por API antes de retomar."),
+], ids=["alpaclass", "nutror"])
+def test_exit6_completude_fail_closed_e_causa_nomeada_sem_llm(stderr, ultima):
+    # DENTES: sem o mapeamento, exit 6 não bate em assinatura nenhuma (nem sessão —
+    # "A sessão está viva"/"Não é a sessão" não DECLARAM morte —, nem token, nem
+    # timeout) e cai no LLM/fail-closed "causa desconhecida".
+    chamado = []
+
+    def llm(prompt):                                # sentinela: NÃO pode ser chamado
+        chamado.append(prompt)
+        return '{"acao": "relancar"}'
+
+    d = causa.classificar(_obito(exit_code=6, stderr=stderr), llm=llm)
+    assert d.acao == "escalar_humano", d
+    assert d.fonte == "deterministico", d
+    assert chamado == [], "o LLM foi consultado para o contrato de exit 6"
+    assert d.motivo == "enumeração/completude fail-closed do adaptador: " + ultima, d
+    assert "desconhecida" not in d.motivo, d
+    assert d.acao != "escalar_reseed" and d.acao != "relancar", d
+
+
+def test_exit6_sem_stderr_ainda_e_nomeado():
+    # tee desligado / cauda vazia: o contrato de exit-code sozinho nomeia a causa.
+    d = causa.classificar(_obito(exit_code=6, stderr=""))
+    assert d.acao == "escalar_humano" and d.fonte == "deterministico", d
+    assert d.motivo == "enumeração/completude fail-closed do adaptador: (stderr vazio)", d

@@ -10,6 +10,9 @@ FLUXO (2 camadas, determinístico-primeiro):
                                                                   num log de sucesso 200)
        - exit 2/3 (Session{Lost,Dead}/NavDead) -> escalar_reseed  (veredito do motor)
        - exit 4 (CircuitBreaker/excesso falhas) -> escalar_humano  (causa DESCONHECIDA)
+       - exit 5 (sonda inconclusiva/infra)    -> relancar        (transitório; bench no loop)
+       - exit 6 (completude fail-closed)      -> escalar_humano  (causa NOMEADA: enumerador
+                                                                  do adaptador; última linha)
        - SIGKILL/OOM/timeout                  -> relancar        (transitório de recurso/SO)
        - net::ERR_<conectividade>, exit != 0  -> aguardar_backoff (rede caiu/mudou, Mac dormiu)
        - net::ERR_ABORTED, exit != 0          -> escalar_humano  (causa NOMEADA: sonda/reseed
@@ -104,9 +107,19 @@ _RE_SESSAO = re.compile(
 #        reseed/relogin por exit 5) — transitório: relança sob o backoff. O
 #        bench anti-flap de exit-5 EM SÉRIE (URL malformada torna a sonda
 #        inconclusiva para sempre) vive no loop (athena_local), não aqui.
+#   6 -> EXIT_ENUMERACAO_INCOMPLETA (Alpaclass e Nutror; motor 2aa84b9): COMPLETUDE
+#        FAIL-CLOSED — a sessão autenticou, mas o adaptador não enumerou aula
+#        nenhuma (enumerador de aulas não implementado, parse do DOM quebrado, conta
+#        sem curso comprado). O motor sai 6 JUSTAMENTE para nunca reportar 'total=0'
+#        com exit 0 (no daemon: saída limpa + cooldown de 6h, calado, pra sempre) nem
+#        o 5 da sonda (relancar/bench). A mensagem do motor diz "Não é a sessão nem a
+#        rede": NÃO é reseed nem transitório — o dev olha o adaptador. Causa NOMEADA,
+#        decidida sem LLM (antes caía no fail-closed "desconhecida").
 _EXIT_SESSAO_MORTA = frozenset({2, 3})
 _EXIT_CIRCUIT_BREAKER = 4
 _EXIT_SONDA_INCONCLUSIVA = 5
+_EXIT_ENUMERACAO_INCOMPLETA = 6
+_LINHA_TRUNCA = 300                  # a última linha do stderr vai pro alerta/JSON
 
 # Credencial de API ruim (401/403/api key inválida). É o que escala TROCA DE TOKEN.
 #
@@ -206,6 +219,15 @@ def _funcao_de_sessao_no_abort(err):
 
 # exit codes de SIGKILL: -9 (Popen) e 137 (128+9, via shell).
 _EXIT_SIGKILL = {-9, 137}
+
+
+def _ultima_linha(err):
+    """Última linha NÃO-vazia do stderr (a mensagem final do motor), truncada para o
+    alerta/JSON. '(stderr vazio)' quando não há nada — o motivo nunca fica oco."""
+    for linha in reversed((err or "").splitlines()):
+        if linha.strip():
+            return linha.strip()[:_LINHA_TRUNCA]
+    return "(stderr vazio)"
 
 
 # --------------------------------------------------------------------------
@@ -326,6 +348,14 @@ def _deterministico(obito, tracker_dir=None):
         return "relancar", (
             "sonda de sessão inconclusiva / erro de infra (exit 5): transitório — "
             "NÃO é sessão morta (sem reseed)")
+
+    # 4b) EXIT 6 = completude FAIL-CLOSED / enumerador ausente (Alpaclass, Nutror): o
+    #     adaptador não enumerou aula nenhuma com a sessão VIVA. Humano/dev olha o
+    #     adaptador — causa NOMEADA com a última linha do motor (a mensagem acionável),
+    #     sem LLM. Depois de sessão/token (se o stderr DECLARA outra coisa, ela vence).
+    if code == _EXIT_ENUMERACAO_INCOMPLETA:
+        return "escalar_humano", (
+            "enumeração/completude fail-closed do adaptador: %s" % _ultima_linha(err))
 
     # 5) SIGKILL / OOM / timeout -> relançar (transitório de recurso/SO; motor é idempotente).
     if code in _EXIT_SIGKILL:

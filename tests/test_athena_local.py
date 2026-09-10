@@ -553,3 +553,79 @@ def test_rodar_chama_reaper_no_boot_antes_do_primeiro_ciclo(monkeypatch):
         reaper_fn=lambda: ordem.append("reaper")))
     assert ordem and ordem[0] == "reaper"                  # DENTE: reaper ANTES do 1º ciclo
     assert "ciclo" in ordem
+
+
+# ==========================================================================
+# ESCALAR_HUMANO: causa NOMEADA vai com o motivo nomeado; o prefixo "causa desconhecida
+# (fail-closed)" só quando ela é de fato desconhecida. E o ruído ERR_ABORTED do asyncio
+# num run LIMPO segue saída limpa (não vira morte). Causa REAL (maestro.causa) +
+# _aplicar_decisao REAL; espiões nos alertas e na espinha.
+# ==========================================================================
+class _SpyAlertas:
+    def __init__(self):
+        self.mortes = []
+
+    def captura_morreu(self, plataforma, motivo, **kw):
+        self.mortes.append((plataforma, motivo, kw))
+
+    def sessao_expirada(self, plataforma, **kw):
+        self.mortes.append((plataforma, "SESSAO", kw))
+
+
+class _SpyEspinha:
+    def __init__(self):
+        self.regs = []
+
+    def registrar_decisao(self, o_que, por_que, **kw):
+        self.regs.append((o_que, por_que, kw))
+
+
+def _aplicar_real(stderr, exit_code):
+    from maestro import causa
+    from maestro.vigia import Obito
+    obito = Obito(conta="kajabi-principal", curso=C1, exit_code=exit_code,
+                  stderr_tail=stderr, flaps_na_janela=1)
+    decisao = causa.classificar(obito)              # llm=None, como no daemon vivo
+    st, alertas, esp = {}, _SpyAlertas(), _SpyEspinha()
+    athena_local._aplicar_decisao(
+        C1, st, obito, decisao, disjuntor=athena_local._DisjuntorTeto(3),
+        alertas=alertas, agora=1000.0, meta_por_curso={}, flap_min=99, espinha=esp)
+    return decisao, st, alertas, esp
+
+
+def test_escalar_humano_com_causa_nomeada_alerta_o_motivo_sem_prefixo_de_desconhecida():
+    from tests.test_causa import _STDERR_KAJABI_PROBE_ERR_ABORTED
+    decisao, st, alertas, esp = _aplicar_real(_STDERR_KAJABI_PROBE_ERR_ABORTED, 1)
+    assert decisao.acao == "escalar_humano" and decisao.fonte == "deterministico"
+    [(_plat, texto, kw)] = alertas.mortes
+    # DENTES: antes vinha "causa desconhecida (fail-closed): navegação abortada DURANTE a
+    # sonda/reseed..." — mandava o dono caçar uma incógnita que a autópsia já nomeou.
+    assert "desconhecida" not in texto, texto
+    assert decisao.motivo in texto and C1 in texto
+    assert kw == {"essencial": True, "chave": ("humano", C1)}     # essencial + dedup intactos
+    [(o_que, por_que, reg)] = esp.regs
+    assert "causa nomeada" in o_que and por_que == decisao.motivo
+    assert reg["trava"] is None and reg["fonte"] == "deterministico"
+    assert st.get("_morte_ciclo") == 1000.0                        # segue sendo MORTE real
+
+
+def test_escalar_humano_com_causa_desconhecida_mantem_o_prefixo_fail_closed():
+    decisao, st, alertas, esp = _aplicar_real("erro totalmente inédito xyzzy 9f3a", 1)
+    assert decisao.acao == "escalar_humano" and decisao.fonte == "fail-closed"
+    [(_plat, texto, _kw)] = alertas.mortes
+    assert texto.startswith("causa desconhecida (fail-closed): "), texto
+    [(o_que, _por_que, reg)] = esp.regs
+    assert "causa desconhecida" in o_que
+    assert reg["trava"] == "desconhecida" and reg["fonte"] == "fail-closed"
+
+
+def test_exit0_com_ruido_asyncio_err_aborted_segue_saida_limpa_no_loop():
+    # Ponta a ponta do BLOQUEANTE 1: causa REAL + regra de saída limpa do _aplicar_decisao
+    # (exit 0 E aguardar_backoff). Com o bloco ERR_ABORTED antes do `code == 0`, este run
+    # LIMPO virava MORTE: alerta essencial "MORREU", _morte_ciclo e backoff.
+    from tests.test_causa import _RUIDO_ASYNCIO_ERR_ABORTED
+    decisao, st, alertas, esp = _aplicar_real(_RUIDO_ASYNCIO_ERR_ABORTED, 0)
+    assert decisao.acao == "aguardar_backoff", decisao
+    assert st.get("_saida_limpa_ciclo") == 1000.0
+    assert "_morte_ciclo" not in st
+    assert alertas.mortes == []

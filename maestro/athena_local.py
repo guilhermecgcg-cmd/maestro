@@ -352,17 +352,34 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
                    escalada=True, trava=None, curso=curso, plataforma=plat,
                    fonte=fonte_causa, origem="athena-local/causa")
     elif acao == "escalar_humano":
-        # ESSENCIAL (fail-closed chama o dono) + dedup por curso na janela: o
-        # mesmo curso re-morrendo da mesma incógnita não metralha o Telegram.
-        alertas.captura_morreu(
-            plat, f"causa desconhecida (fail-closed): {getattr(decisao, 'motivo', '')}",
-            essencial=True, chave=("humano", curso))
-        # E3: causa desconhecida fail-closed → chama o dono.
-        _registrar(espinha, f"escalei {curso} (causa desconhecida)",
-                   motivo_causa or "fail-closed: causa desconhecida",
-                   reversivel=True, escalada=True, trava="desconhecida",
-                   curso=curso, plataforma=plat, fonte="fail-closed",
-                   origem="athena-local/causa")
+        # ESSENCIAL (chama o dono) + dedup por curso na janela: o mesmo curso
+        # re-morrendo da mesma causa não metralha o Telegram.
+        # Causa NOMEADA (assinatura determinística: exit-4 com os erros do tracker,
+        # net::ERR_ABORTED na navegação ou na sonda/reseed de sessão...) vai com o
+        # MOTIVO nomeado — prefixá-la de "causa desconhecida" mandava o dono procurar
+        # uma incógnita que a autópsia JÁ tinha nomeado. O prefixo "causa desconhecida
+        # (fail-closed)" fica SÓ quando ela é de fato desconhecida (fail-closed: sem LLM,
+        # LLM falhou/fora do conjunto; ou o LLM que respondeu "escalar_humano").
+        nomeada = (getattr(decisao, "fonte", None) == "deterministico"
+                   and bool(motivo_causa))
+        if nomeada:
+            alertas.captura_morreu(plat, f"{motivo_causa} (curso {curso})",
+                                   essencial=True, chave=("humano", curso))
+            # E3': causa NOMEADA que exige humano → chama o dono com o motivo.
+            _registrar(espinha, f"escalei {curso} (causa nomeada)", motivo_causa,
+                       reversivel=True, escalada=True, trava=None,
+                       curso=curso, plataforma=plat, fonte=fonte_causa,
+                       origem="athena-local/causa")
+        else:
+            alertas.captura_morreu(
+                plat, f"causa desconhecida (fail-closed): {motivo_causa}",
+                essencial=True, chave=("humano", curso))
+            # E3: causa desconhecida fail-closed → chama o dono.
+            _registrar(espinha, f"escalei {curso} (causa desconhecida)",
+                       motivo_causa or "fail-closed: causa desconhecida",
+                       reversivel=True, escalada=True, trava="desconhecida",
+                       curso=curso, plataforma=plat, fonte="fail-closed",
+                       origem="athena-local/causa")
     else:
         # E4: morte transitória (relancar/aguardar_backoff/None) → recozer e
         # re-tentar sob o gate do disjuntor (decisão reversível, não escalada).

@@ -1769,3 +1769,27 @@ def test_frases_novas_da_alpaclass_chegam_ao_status_e_nao_sao_frase_de_morte(tmp
     conta, = _status(tmp_path)["contas"]
     assert conta["resultado"] == "inconclusiva" and conta["detalhe"] == detalhe
     assert conta["status"] != "aguardando-humano"
+
+
+def test_backoff_com_contador_enorme_nao_estoura_o_float(tmp_path):
+    """Meses de inconclusivos/mortes seguidos: 2**(n-1) acima de 2**1023 não cabe num float e
+    o `_aplicar` estouraria (OverflowError) a cada zelo — o espaçamento sumiria."""
+    for resultado, code, campo in (("inconclusiva", 5, "inconclusivas_seguidas"),
+                                   ("morta", 3, "mortes_seguidas")):
+        d = tmp_path / resultado
+        d.mkdir()
+        cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+        ex, z = _exec(d, cursos), _zel(d, cursos)
+        _ocioso(ex, "kiwify-principal", T0 - DIA)
+        st = z.estado["kiwify:kiwify-principal"]
+        st[campo] = 5000
+        if resultado == "morta":
+            st["status"] = "aguardando-humano"
+            st["_t"]["ident_na_morte"] = 1
+            _carimbar(ex, "kiwify-principal", T0 - 60)
+        _passo(z, ex, T0)
+        ex.sp.terminar(0, code, resultado)
+        _passo(z, ex, T0 + 60)
+        st = z.estado["kiwify:kiwify-principal"]
+        assert st[campo] == 5001, (resultado, st[campo])      # o _aplicar foi até o fim
+        assert st["_t"]["proximo_ts"] == T0 + 60 + st["_t"]["intervalo_s"], resultado

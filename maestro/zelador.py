@@ -740,8 +740,9 @@ class Zelador:
             t["morte_ts"] = agora
             t["ident_na_morte"] = self._identidade(u, executor)  # a de DEPOIS do zelo
             # espaçamento das RE-SONDAS por mudança do arquivo (o carimbo humano passa na frente)
-            t["proximo_ts"] = agora + min(cfg.confirmacao_s * 2 ** max(0, st["mortes_seguidas"] - 1),
-                                          float(t["intervalo_s"]))
+            t["proximo_ts"] = agora + min(
+                cfg.confirmacao_s * 2 ** min(max(0, st["mortes_seguidas"] - 1), 20),
+                float(t["intervalo_s"]))
             if novo:
                 _registrar(espinha, f"sessão de {u.chave} morta — aguardando login humano",
                            "morte PROVADA pela sonda da plataforma (zelador); paro de zelar "
@@ -762,7 +763,9 @@ class Zelador:
             return
 
         n = st["inconclusivas_seguidas"] = int(st.get("inconclusivas_seguidas") or 0) + 1
-        t["proximo_ts"] = agora + min(cfg.backoff_base_s * 2 ** (n - 1), float(t["intervalo_s"]))
+        # expoente limitado: 2**1024 não cabe num float (OverflowError derrubaria o _aplicar)
+        t["proximo_ts"] = agora + min(cfg.backoff_base_s * 2 ** min(n - 1, 20),
+                                      float(t["intervalo_s"]))
 
     def _classificar_relogio(self, st, exp):
         """DURO = o relógio NÃO avançou entre duas provas de vida (o uso não o renova: vai

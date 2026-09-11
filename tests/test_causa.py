@@ -980,3 +980,51 @@ def test_lock_depois_do_boot_sem_cauda_segue_fail_closed():
     d = causa.classificar(_orfa("", antes_do_boot=False))
     assert d.acao == "escalar_humano" and d.fonte == "fail-closed", d
     assert d.sem_falha is False, d
+
+
+# --------------------------------------------------------------------------
+# NEGAÇÃO de sessão morta não é declaração (achado ao fiar o .err nas mortes só-de-lock)
+# --------------------------------------------------------------------------
+# Linha REAL do motor Hotmart na retentativa da sonda (autópsia 21/07 15:34 — 13 autópsias
+# têm a linha). "não sessão morta" casava "sessão mort" na _RE_SESSAO -> escalar_reseed
+# (IRREDUTÍVEL) num run que seguiu são.
+_LINHA_RETENTATIVA_SONDA = (
+    "2026-07-21 15:32:51,223 INFO motor.hotmart.session: sonda: /v1/navigation não "
+    "respondeu em 30000ms (tentativa 1/2) — pode ser lentidão, não sessão morta; retentando")
+_CAUDA_LIMPA_COM_RETENTATIVA = (
+    "2026-07-21 15:32:21,139 INFO motor.hotmart.session: sessão: injetados 166 cookies (state)\n"
+    + _LINHA_RETENTATIVA_SONDA + "\n"
+    "2026-07-21 15:32:55,002 INFO motor.hotmart.session: sessão viva (state)\n"
+    "Stats: total=0 ok=0 audio=0 falhou=0\n")
+
+
+@pytest.mark.parametrize("code,acao", [
+    (0, "aguardar_backoff"),        # run são, exit 0: saída limpa (antes: reseed + latch)
+    (None, "aguardar_backoff"),     # a mesma cauda numa órfã: saída limpa órfã
+], ids=["exit0", "orfa"])
+def test_negacao_nao_sessao_morta_do_log_da_sonda_nao_e_reseed(code, acao):
+    d = causa.classificar(_obito(exit_code=code, stderr=_CAUDA_LIMPA_COM_RETENTATIVA))
+    assert d.acao == acao, d
+    assert d.acao != "escalar_reseed", d
+
+
+@pytest.mark.parametrize("negada", [
+    _LINHA_RETENTATIVA_SONDA,
+    "isto NÃO é sessão morta",
+    "a sessão não expirou, só está lenta",
+])
+def test_negacoes_de_sessao_morta_nao_declaram_a_morte(negada):
+    d = causa.classificar(_obito(exit_code=1, stderr=negada + "\nerro inédito xyzzy"))
+    assert d.acao != "escalar_reseed", d
+
+
+def test_sessao_morta_real_com_a_linha_da_retentativa_segue_reseed():
+    # Contraprova (anti-ban): a cauda REAL de 21/07 15:34 tem a retentativa E a morte de
+    # verdade ("sessão morta (state)", "SESSÃO MORTA — LOGIN MANUAL NECESSÁRIO") — segue
+    # escalar_reseed, com qualquer exit.
+    cauda = (_LINHA_RETENTATIVA_SONDA + "\n"
+             "2026-07-21 15:33:21,302 INFO motor.hotmart.session: sessão morta (state)\n"
+             "2026-07-21 15:34:21,572 WARNING motor.hotmart.session: SESSÃO MORTA — LOGIN "
+             "MANUAL NECESSÁRIO\n")
+    for code in (0, 1, None):
+        assert causa.classificar(_obito(exit_code=code, stderr=cauda)).acao == "escalar_reseed"

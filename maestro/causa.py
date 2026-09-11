@@ -96,6 +96,20 @@ _RE_SESSAO = re.compile(
     r"sess[aã]o(\s+\w+)?\s+(expir|mort|morr|perdida|inv[aá]lida|caiu)|"
     r"(re)?fa[çc]a\s+o\s+login|redirecionad\w*\s+pro\s+login|reautentic)", re.I)
 
+# NEGAÇÃO explícita de morte de sessão, removida da cauda ANTES de procurar a declaração.
+# O motor Hotmart loga na RETENTATIVA da sonda: "sonda: /v1/navigation não respondeu em
+# 30000ms (tentativa 1/2) — pode ser lentidão, não sessão morta; retentando" (real — 13
+# autópsias têm a linha). A _RE_SESSAO casava "sessão mort" DENTRO dessa negação ->
+# escalar_reseed (IRREDUTÍVEL: latch do curso + "Sessão expirou") num run que seguiu SÃO,
+# até com exit 0. Agora que a morte só-de-lock lê o .err, a mesma linha chegaria às caudas
+# das órfãs — daí o fix aqui. A morte REAL segue com os sinais dela ("sessão morta
+# (state)", "SESSÃO MORTA — LOGIN MANUAL NECESSÁRIO", exit 2/3), que não são negados.
+_RE_SESSAO_NEGADA = re.compile(
+    r"\bn[aã]o\s+(?:[eé]\s+)?(?:a\s+)?sess[aã]o(?:\s+\w+)?\s+"
+    r"(?:expir|mort|morr|perdida|inv[aá]lida|caiu)\w*|"
+    r"\bsess[aã]o\s+n[aã]o\s+(?:\w+\s+)?(?:expir|mort|morr|perdida|inv[aá]lida|caiu)\w*",
+    re.I)
+
 # CONTRATO DE EXIT-CODE dos CLIs do motor (uniforme em TODAS as plataformas —
 # motor/cli.py e motor/<plataforma>/cli.py fazem `raise SystemExit(N)`). O daemon
 # spawna `python -m <modulo>` DIRETO (sem shell), então `proc.returncode` chega
@@ -386,8 +400,9 @@ def _deterministico(obito, tracker_dir=None):
     #    Vem antes de tudo — inclusive antes do exit-code — porque se o filho foi
     #    morto (SIGKILL) mas denunciou sessão expirada, a causa-raiz é a sessão
     #    (relançar sem reseed reproduziria a morte). Só frases de morte casam aqui;
-    #    "sessão viva"/"pode ser a sessão" NÃO (ver _RE_SESSAO).
-    if _RE_SESSAO.search(err):
+    #    "sessão viva"/"pode ser a sessão" NÃO (ver _RE_SESSAO), nem a NEGAÇÃO "não
+    #    sessão morta" do log de retentativa da sonda (ver _RE_SESSAO_NEGADA).
+    if _RE_SESSAO.search(_RE_SESSAO_NEGADA.sub(" ", err)):
         return "escalar_reseed", "assinatura de sessão morta no stderr"
 
     # 2) TOKEN de API (GROQ/401/403/api key): credencial ruim, troca de chave.

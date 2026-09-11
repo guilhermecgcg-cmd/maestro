@@ -1952,11 +1952,18 @@ def progresso_local_fn(motor_python, motor_dir, total_por_curso, *, run=None):
 # motor/greenn/cli.py). `greenn.com.br` é o painel do PRODUTOR (adm.greenn.com.br), não
 # o club: com ele no default, nenhuma URL de curso Greenn passava o gate (casa por
 # sufixo) e uma URL do painel passaria. Por isso o sufixo é `greenn.club`.
+# CADEMÍ (rodada 9): cada tenant é DOMÍNIO PRÓPRIO sem sufixo comum (CNAME para
+# core.cademi.com.br) — entram os 3 hosts EXATOS (o gate aceita host igual; subdomínio
+# deles também casa, prefixo/sufixo parecido não). ENTREGA DIGITAL: `<tenant>.
+# entregadigital.app.br`. Nenhum dispara sem entrada no YAML; e o launch.sh vivo fixa a
+# env PLATAFORMAS_SUPORTADAS (sem estes 4) — ligar = acrescentá-los lá também.
 # Env PLATAFORMAS_SUPORTADAS sobrepõe (ex.: para pausar uma plataforma sem tocar código).
 PLATAFORMAS_SUPORTADAS_PADRAO = (
     "hotmart.com", "memberkit.com.br", "stoa.com.br", "mykajabi.com",
     "kiwify.com.br", "nutror.com", "alpaclass.com", "hub.la", "greenn.club",
-    "membros.segueadi.com")
+    "membros.segueadi.com",
+    "membros.alfaresearch.com.br", "cursos.codigoviral.com.br",
+    "aulas.ramonpereira.com.br", "entregadigital.app.br")
 
 
 def carregar_cursos(path) -> list:
@@ -1991,7 +1998,9 @@ def _reaper_de_boot(cursos, executor, motor_dir_do_curso):
     APAGA o lock de PID morto — a única evidência da morte da encarnação anterior (a
     autópsia sumia). A resposta do gate anti-ban é IDÊNTICA (vivo/intenção -> intocável;
     morto -> reapável); só o efeito colateral some. O lock morto é limpo depois da
-    autópsia, pelo pulso cheio de fim de ciclo / pela passada. Best-effort por curso."""
+    autópsia, pelo pulso cheio de fim de ciclo / pela passada. Best-effort por curso.
+    A `plataforma` do YAML vai junto: Cademí/Entrega Digital não são reapadas (o motor
+    retoma o próprio in-flight; e o course_id delas não é o `/products/` do Hotmart)."""
     def _vivo(url):
         return executor.curso_ativo(url, limpar=False)
 
@@ -1999,10 +2008,24 @@ def _reaper_de_boot(cursos, executor, motor_dir_do_curso):
         for c in cursos:
             try:
                 captura.reap_orphans_local(c.url, motor_dir_do_curso(c.url),
-                                           curso_ativo=_vivo)
+                                           curso_ativo=_vivo, plataforma=c.plataforma)
             except Exception:
                 pass
     return reaper_fn
+
+
+def _pendencia_de_producao(cursos, motor_dir_do_curso):
+    """O `pendencia_fn` de PRODUÇÃO (main -> rodar): pendência capturável por curso
+    (None = desconhecido -> fail-open), lida no tracker do motor DAQUELE curso e no
+    ESCOPO da plataforma do YAML — Cademí/Entrega Digital somam o tenant inteiro pelo
+    course_id namespaced (`captura._escopo_tracker`); sem a plataforma, o leitor só
+    conhecia o `/products/<id>` do Hotmart (None para elas, ou o curso Hotmart errado)."""
+    plat_por_curso = {c.url: c.plataforma for c in cursos}
+
+    def pendencia_fn(url):
+        return captura.pendencia_capturavel_local(
+            url, motor_dir_do_curso(url), plataforma=plat_por_curso.get(url))
+    return pendencia_fn
 
 
 def _motor_dirs_por_plataforma() -> dict:
@@ -2085,9 +2108,9 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     def _motor_dir_do_curso(url):
         return executor._motor_dir_de(_plat_por_curso.get(url, "hotmart"))
 
-    # HIGIENE (2): pendência capturável por curso (None = desconhecido -> fail-open).
-    def pendencia_fn(url):
-        return captura.pendencia_capturavel_local(url, _motor_dir_do_curso(url))
+    # HIGIENE (2): pendência capturável por curso (None = desconhecido -> fail-open), no
+    # escopo da plataforma do YAML (Cademí/Entrega Digital: o tenant inteiro).
+    pendencia_fn = _pendencia_de_producao(cursos, _motor_dir_do_curso)
 
     # HIGIENE (1): reaper de órfãos async no BOOT da lane — só toca curso SEM captura viva
     # (gate anti-ban dentro de `reap_orphans_local`). Best-effort por curso.

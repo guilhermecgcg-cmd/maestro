@@ -33,8 +33,10 @@ import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from maestro import observador
+from maestro.adaptador_pipeline import plataforma_de_url, plataforma_suportada
 from maestro.adaptadores import conhecimento
 from maestro.playbook import Acao
 from maestro.sentinela import Problema
@@ -477,7 +479,20 @@ class PlataformaSpec:
         TENANT em plataformas white-label — Curseduca: CURSEDUCA_TENANT_UUID). Injetado
         DEPOIS do `spec.env`, então o tenant POR-CURSO (YAML) vence o default fixado no
         spec — é o caminho multi-tenant sem tocar código. '' => não injeta nada
-        (todas as plataformas exceto curseduca; aditivo, vivas intactas)."""
+        (todas as plataformas exceto curseduca; aditivo, vivas intactas).
+      - `sessao_por_tenant`: True => a sessão é CREDENCIAL DE UM TENANT e o daemon
+        NUNCA deixa o motor cair na de outro (inviolável "nunca duas contas/tenants
+        misturando credencial"). `_montar` recusa (fail-closed, sem spawn): curso SEM
+        `session_path` (o default do motor pode ser um arquivo único para todos os
+        tenants — Entrega Digital: `.entregadigital-session.json`) e `session_path`
+        que outro curso do YAML usa com OUTRA conta ou OUTRO host. False (as vivas) =>
+        nada muda.
+      - `hosts`: hosts (exatos ou sufixo, a mesma regra do gate de domínio) que SÓ esta
+        plataforma captura. Um curso num desses hosts com OUTRA `plataforma` no YAML
+        (ex.: a linha `plataforma:` esquecida => o carregador assume "hotmart" e
+        rodaria o motor Hotmart no perfil `.chrome-profile` VIVO) é recusado em
+        `_montar`. É checagem cruzada, não gate: host fora da lista não é barrado
+        aqui (quem barra é `PLATAFORMAS_SUPORTADAS`). '' (as vivas) => nada muda."""
     modulo: str
     passes: tuple = ("base",)
     headless: bool = False
@@ -486,6 +501,8 @@ class PlataformaSpec:
     env: tuple = ()
     session_env: str = ""
     tenant_env: str = ""
+    sessao_por_tenant: bool = False
+    hosts: tuple = ()
 
 
 # plataforma -> como invocar o motor. Fora deste mapa => fail-closed (o motor só sabe
@@ -578,6 +595,30 @@ _PLATAFORMAS = {
         "motor.curseduca", headless=True, url_env="CURSEDUCA_URL",
         session_env="CURSEDUCA_SESSION_PATH", tenant_env="CURSEDUCA_TENANT_UUID",
         env=(("CURSEDUCA_TENANT_UUID", "4037b710-50c5-11ed-b97b-16058182e383"),)),
+    # ---- CADEMÍ e ENTREGA DIGITAL (rodada 9) — REGISTRADAS, DESLIGADAS ------------
+    # Nada dispara sem uma entrada no YAML E o host no gate de domínio (a env
+    # PLATAFORMAS_SUPORTADAS do launch.sh vivo é explícita). Mesmo padrão dos adaptadores
+    # de 22/07: passe ÚNICO ("base" — os CLIs não têm flag de passe), HEADLESS (no motor:
+    # `allow_reseed=False` => sessão morta sai 3, nunca login automático), channel=chrome,
+    # perfil DEDICADO por conta via `_perfil_de_conta` (sem CHROME_USER_DATA_DIR aqui — o
+    # default do CLI da Entrega Digital é o `.chrome-profile` do Hotmart VIVO; o daemon
+    # sempre força o da conta). `url_env`/`session_env` = os nomes que os CLIs leem
+    # (motor/cademi/cli.py: CADEMI_URL, CADEMI_SESSION_PATH; motor/entregadigital/cli.py:
+    # ENTREGADIGITAL_URL, ENTREGADIGITAL_SESSION_PATH). `sessao_por_tenant`: a sessão do
+    # YAML é obrigatória e exclusiva do (conta, host). `hosts`: a checagem cruzada
+    # host -> plataforma. Cademí: os 3 tenants de domínio próprio NÃO têm sufixo comum
+    # (a plataforma vem do `plataforma:` do YAML; aqui só o cruzamento dos conhecidos).
+    # Tracker: `pendencia_capturavel_local(..., plataforma=)` lê os course_id
+    # `cademi:<host>:<id>` / `entregadigital:<tenant>:product:<pid>` do tenant inteiro.
+    "cademi": PlataformaSpec(
+        "motor.cademi", headless=True, url_env="CADEMI_URL",
+        session_env="CADEMI_SESSION_PATH", sessao_por_tenant=True,
+        hosts=("membros.alfaresearch.com.br", "cursos.codigoviral.com.br",
+               "aulas.ramonpereira.com.br")),
+    "entregadigital": PlataformaSpec(
+        "motor.entregadigital", headless=True, url_env="ENTREGADIGITAL_URL",
+        session_env="ENTREGADIGITAL_SESSION_PATH", sessao_por_tenant=True,
+        hosts=("entregadigital.app.br",)),
 }
 
 
@@ -760,10 +801,18 @@ _ASYNC_INFLIGHT = ("transcrevendo", "transcrevendo_embed", "capturando_nao_video
                    "transcrevendo_youtube")
 
 
-def reap_orphans_local(curso_url, motor_dir, *, curso_ativo) -> int:
+def reap_orphans_local(curso_url, motor_dir, *, curso_ativo, plataforma=None) -> int:
     """REAPER de órfãos ASSÍNCRONOS no BOOT da lane. Uma aula in-flight async
     (transcrevendo*/capturando_nao_video) cujo PROCESSO de captura NÃO está vivo volta a
     `pendente` (re-selecionável). Devolve quantas resetou.
+
+    PLATAFORMAS POR TENANT (`_ESCOPO_TENANT`: Cademí, Entrega Digital) => NO-OP (0), de
+    propósito: (a) o passe ÚNICO delas já re-seleciona o próprio in-flight
+    (`transcrevendo`/`capturando_nao_video` estão no pool do motor — motor/cademi/
+    pipeline.py::_CADEMI_PENDING, motor/entregadigital/pipeline.py::_ED_*_PENDING), então
+    não há órfã a resgatar; (b) o course_id delas NÃO é o `/products/<id>` do Hotmart —
+    uma URL da Entrega Digital com `/products/123` resetaria aulas do curso Hotmart 123
+    (outra conta, possivelmente VIVA). `plataforma=None` => comportamento de sempre.
 
     DENTES / INVIOLÁVEIS:
       - `curso_ativo(curso_url)` True (captura VIVA) => NO-OP (retorna 0). NUNCA toca uma
@@ -778,6 +827,8 @@ def reap_orphans_local(curso_url, motor_dir, *, curso_ativo) -> int:
         boot da lane por causa de higiene)."""
     if curso_ativo(curso_url):
         return 0                                            # captura VIVA: intocável
+    if plataforma in _ESCOPO_TENANT:
+        return 0                                            # o motor retoma o próprio in-flight
     course_id = _course_id_de_url(curso_url)
     if not course_id:
         return 0
@@ -829,18 +880,135 @@ _TERMINAIS_DONE = frozenset({
 # mais o veria). Elas somam de volta ao capturável em `pendencia_capturavel_local`.
 
 
-def pendencia_capturavel_local(curso_url, motor_dir):
+# --- ESCOPO DE TRACKER DAS PLATAFORMAS POR TENANT (Cademí, Entrega Digital) ----------
+# No daemon, o "curso" delas é o TENANT inteiro: a URL do YAML é a raiz do tenant e UM
+# run do motor enumera todos os cursos/produtos dele. O tracker chaveia cada curso por um
+# course_id NAMESPACED — NUNCA pelo `/products/<id>` do Hotmart (`_course_id_de_url`): a
+# SPA da Entrega Digital tem rota `products/<id>`, e ler `course_id='<id>'` contaria (ou,
+# no reaper, mexeria em) aulas de um curso Hotmart de mesmo número. A leitura é por
+# PREFIXO (o tenant inteiro), terminado em ':' para `cademi:a.com.br:` não casar
+# `cademi:a.com.br.b:`; comparação EXATA (`substr`), não LIKE (que ignora caixa e trata
+# '_' como curinga). ESPELHOS — a fonte-verdade vive no motor; mudou lá, muda aqui
+# (mesmo contrato de `_PENDING_EXCLUDED`):
+#   - Cademí: motor/cademi/enumerate.py::tenant_of (host INTEIRO, minúsculo, "www."
+#     mantido) + make_course_id => `cademi:<host>:<id>`;
+#   - Entrega Digital: motor/entregadigital/api.py::tenant_of + enumerate.make_course_id
+#     => `entregadigital:<tenant>:product:<pid>`, <tenant> = a 1ª label em
+#     `<tenant>.entregadigital.app.br` (o único formato que o gate e `hosts` aceitam
+#     hoje); num domínio próprio, o host inteiro (regra da rodada 9 do motor — a 1ª
+#     label sozinha, `membros`, colidiria entre clientes).
+_ED_SAAS = "entregadigital.app.br"
+
+
+def _host_do_tenant(curso_url):
+    try:
+        return (urlparse(str(curso_url or "")).hostname or "").strip().lower()
+    except ValueError:                                     # URL malformada: sem escopo
+        return ""
+
+
+def _prefixo_cademi(curso_url):
+    host = _host_do_tenant(curso_url)
+    return f"cademi:{host}:" if host else None
+
+
+def _prefixo_entregadigital(curso_url):
+    host = _host_do_tenant(curso_url)
+    tenant = host.split(".")[0] if host.endswith("." + _ED_SAAS) else host
+    return f"entregadigital:{tenant}:product:" if tenant else None
+
+
+_ESCOPO_TENANT = {"cademi": _prefixo_cademi, "entregadigital": _prefixo_entregadigital}
+
+# Terminais EXTRAS por plataforma de tenant (os pipelines dos dois motores: o passe
+# re-seleciona só pendente/transcrevendo[/capturando_nao_video]; `sem_audio` — aula sem
+# player capturável — é TERMINAL lá, nenhum passe a retoma). Somados a `_TERMINAIS_DONE`.
+# Estado desconhecido continua CAPTURÁVEL (viés a não-pronto, como no Hotmart).
+_TERMINAIS_EXTRA_TENANT = {"cademi": frozenset({"sem_audio"}),
+                           "entregadigital": frozenset({"sem_audio"})}
+
+# EXCEÇÃO ao terminal `sem_audio` no Cademí (irmã do resgate YouTube): o run do motor
+# chama `tracker.requeue_sem_audio_legacy` por curso (motor/cademi/pipeline.py), que volta
+# a `pendente` as `sem_audio` com a assinatura LEGADA (motor/tracker.py::
+# SEM_AUDIO_LEGACY_SIG). Contá-las como terminais deixaria o tenant 'pronto' e o resgate
+# nunca rodaria (o curso 'pronto' não é mais disparado). Espelho da assinatura:
+_SEM_AUDIO_LEGACY_SIG = ("nenhum player Panda capturável", "nenhum player Wistia capturável")
+_SQL_SEM_AUDIO_LEGADO_TENANT = (
+    "SELECT COUNT(*) FROM lessons WHERE substr(course_id, 1, ?) = ? "
+    "AND status='sem_audio' AND (" + " OR ".join(
+        "error LIKE ?" for _ in _SEM_AUDIO_LEGACY_SIG) + ")")
+_RESGATE_SEM_AUDIO_TENANT = frozenset({"cademi"})
+
+# CURSO CONHECIDO SEM AULA NENHUMA no tenant: o run do Cademí faz `upsert_course` de todo
+# curso enumerado (motor/orchestrator.py::run_course) mesmo quando a sidebar não deu aula
+# (o 302 do /modulo/ caiu numa página de erro — achado C3). Esse curso não tem linha em
+# `lessons`, então a soma do tenant o ignoraria e o tenant pareceria 'pronto' com um
+# curso INTEIRO por capturar. Presença de um desses => DESCONHECIDO (None), nunca 0.
+_SQL_CURSO_SEM_AULA_TENANT = (
+    "SELECT COUNT(*) FROM courses c WHERE substr(c.course_id, 1, ?) = ? AND NOT EXISTS "
+    "(SELECT 1 FROM lessons l WHERE l.course_id = c.course_id)")
+
+
+@dataclass(frozen=True)
+class _EscopoTracker:
+    """ONDE a leitura do tracker procura as aulas de UM curso do daemon. `where`/`params`
+    filtram `lessons`; `terminais` = o que NÃO é trabalho; `resgate_sql`/`resgate_params`
+    somam de volta um subconjunto terminal que o motor ainda retoma; `prefixo` só existe
+    no escopo de tenant (liga a checagem de curso sem aula). Todo SQL aqui é LITERAL do
+    código — a URL entra só como parâmetro."""
+    where: str
+    params: tuple
+    terminais: frozenset
+    resgate_sql: str = ""
+    resgate_params: tuple = ()
+    prefixo: str = ""
+
+
+def _escopo_tracker(curso_url, plataforma=None):
+    """Escopo da leitura de pendência do curso. Plataforma de tenant (`_ESCOPO_TENANT`)
+    => prefixo do tenant, SEM cair no `/products/` do Hotmart (URL sem host => None).
+    Qualquer outra (inclusive None, o chamador antigo) => o course_id `/products/<id>`
+    de sempre, com o resgate YouTube — o MESMO SQL e os MESMOS parâmetros de antes."""
+    prefixo_fn = _ESCOPO_TENANT.get(plataforma)
+    if prefixo_fn is not None:
+        prefixo = prefixo_fn(curso_url)
+        if not prefixo:
+            return None
+        faixa = (len(prefixo), prefixo)
+        resgate_sql, resgate_params = "", ()
+        if plataforma in _RESGATE_SEM_AUDIO_TENANT:
+            resgate_sql = _SQL_SEM_AUDIO_LEGADO_TENANT
+            resgate_params = faixa + tuple(f"%{s}%" for s in _SEM_AUDIO_LEGACY_SIG)
+        return _EscopoTracker(
+            "substr(course_id, 1, ?) = ?", faixa,
+            _TERMINAIS_DONE | _TERMINAIS_EXTRA_TENANT.get(plataforma, frozenset()),
+            resgate_sql, resgate_params, prefixo)
+    course_id = _course_id_de_url(curso_url)
+    if not course_id:
+        return None
+    return _EscopoTracker("course_id=?", (course_id,), _TERMINAIS_DONE,
+                          _SQL_YOUTUBE_RESGATE, (course_id,))
+
+
+def pendencia_capturavel_local(curso_url, motor_dir, plataforma=None):
     """Nº de aulas com trabalho de captura AINDA pendente no tracker local (status NÃO
     em `_TERMINAIS_DONE`, MAIS as `nao_video_erro` de resgate YouTube — ver a exceção
     acima). 0 => "essencialmente pronto" (só restam terminais).
+
+    `plataforma` (opcional; o main() passa a do YAML) escolhe o ESCOPO (`_escopo_tracker`):
+    Cademí/Entrega Digital somam o TENANT inteiro pelo prefixo do course_id, com os
+    terminais do motor delas (`sem_audio` incluso; no Cademí as `sem_audio` legadas
+    voltam como capturáveis); as demais, o `/products/<id>` de sempre.
 
     Devolve **None** (DESCONHECIDO => fail-open, o chamador NÃO conclui) quando: db
     ausente, course_id não resolve, erro de SQL, **ou o curso não tem NENHUMA linha** no
     tracker (nunca semeado localmente). Este último caso é CRÍTICO: 0-linhas != pronto —
     tratá-lo como 0-pendente marcaria um curso NUNCA capturado como concluído e o
-    STARVARIA. Só um curso COM linhas e SEM capturável é 'pronto'."""
-    course_id = _course_id_de_url(curso_url)
-    if not course_id:
+    STARVARIA. Só um curso COM linhas e SEM capturável é 'pronto'. No escopo de tenant,
+    idem para um curso do tenant conhecido em `courses` e SEM aula (`_SQL_CURSO_SEM_AULA_
+    TENANT`): o tenant não é 'pronto' com um curso inteiro por capturar."""
+    escopo = _escopo_tracker(curso_url, plataforma)
+    if escopo is None:
         return None
     db_path = os.path.join(motor_dir, "tracker.db")
     if not os.path.exists(db_path):
@@ -850,19 +1018,22 @@ def pendencia_capturavel_local(curso_url, motor_dir):
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
         con.execute("PRAGMA busy_timeout=5000")
         linhas = con.execute(
-            "SELECT status, COUNT(*) FROM lessons WHERE course_id=? GROUP BY status",
-            (course_id,)).fetchall()
+            f"SELECT status, COUNT(*) FROM lessons WHERE {escopo.where} GROUP BY status",
+            escopo.params).fetchall()
         # BLOQUEANTE-1 do review: resgate YouTube conta como CAPTURÁVEL (não terminal).
-        resgate_youtube = con.execute(
-            _SQL_YOUTUBE_RESGATE, (course_id,)).fetchone()[0]
+        # (no Cademí, o resgate das `sem_audio` legadas — mesma razão.)
+        resgate = (con.execute(escopo.resgate_sql, escopo.resgate_params).fetchone()[0]
+                   if escopo.resgate_sql else 0)
+        sem_aula = (con.execute(_SQL_CURSO_SEM_AULA_TENANT, escopo.params).fetchone()[0]
+                    if escopo.prefixo else 0)
     except sqlite3.Error:
         return None
     finally:
         if con is not None:
             con.close()
-    if not linhas:
+    if not linhas or sem_aula:
         return None                                        # nunca semeado: NÃO é 'pronto'
-    return sum(n for (s, n) in linhas if s not in _TERMINAIS_DONE) + resgate_youtube
+    return sum(n for (s, n) in linhas if s not in escopo.terminais) + resgate
 
 
 def _passe_ativavel(passe, plataforma="hotmart"):
@@ -1006,6 +1177,13 @@ def _perfil_de_conta(conta) -> str:
     perfis distintos => nunca colidem no ProcessSingleton do Chrome (a causa do flap)."""
     slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(conta)) or "conta"
     return ".chrome-profile-" + slug
+
+
+def _caminho_normalizado(cwd, caminho) -> str:
+    """`caminho` como o MOTOR o abre (relativo => relativo ao seu cwd), normalizado só
+    por STRING (normpath): NENHUM acesso ao sistema de arquivos — é usado para comparar
+    arquivos de sessão, que o daemon nunca abre nem sonda."""
+    return os.path.normpath(os.path.join(str(cwd), str(caminho)))
 
 
 def _limpar_singleton_orfao(profile_dir):  # pragma: no cover — I/O de arquivo real
@@ -1455,6 +1633,56 @@ class LocalExecutor:
                 return passes[idx]
         return candidatos[0]                               # inalcançável (candidatos ⊆ passes)
 
+    def _checar_host_e_credencial(self, meta, spec):
+        """Última linha de defesa do host e da credencial (LEVANTA RuntimeError => nada é
+        spawnado nem travado; a passada escala). Duas regras, ambas só para os specs que
+        as declaram (as plataformas vivas não declaram => nada muda para elas):
+
+          1. HOST -> PLATAFORMA: o host do curso está em `hosts` de OUTRA plataforma =>
+             recusa. O caso real: uma entrada Cademí/Entrega Digital sem a linha
+             `plataforma:` vira "hotmart" no carregador e rodaria o motor Hotmart no
+             `.chrome-profile` VIVO, na conta errada.
+          2. CREDENCIAL DO TENANT (`sessao_por_tenant`): sem `session_path` => recusa (o
+             default do motor pode ser um arquivo ÚNICO para todos os tenants); com um
+             `session_path` que outro curso do YAML usa com OUTRA conta ou OUTRO host =>
+             recusa (dois tenants/contas no mesmo storage_state misturam credencial e um
+             sobrescreve a renovação do outro). Caminhos comparados só por STRING
+             (normpath relativo ao cwd do motor de cada curso) — o arquivo de sessão NUNCA
+             é aberto nem sondado aqui.
+        As mensagens passam a URL/caminho pelo `rotulo_seguro`: texto do daemon nunca casa
+        as âncoras de morte do classificador."""
+        from maestro.rotulo import rotulo_seguro
+        for plat, outro in _PLATAFORMAS.items():
+            if (plat != meta.plataforma and outro.hosts
+                    and plataforma_suportada(meta.url, outro.hosts)):
+                raise RuntimeError(
+                    f"host de {plat} com plataforma {meta.plataforma!r} no YAML — "
+                    f"fail-closed, não disparo {rotulo_seguro(meta.url, maximo=90)} "
+                    f"(corrija a linha plataforma: da conta {meta.conta!r})")
+        if not spec.sessao_por_tenant:
+            return
+        sess = str(getattr(meta, "session_path", "") or "")
+        if not sess:
+            raise RuntimeError(
+                f"{meta.plataforma} exige session_path do tenant no YAML (conta "
+                f"{meta.conta!r}) — sem ele o motor usaria o arquivo padrão, que não é do "
+                f"tenant: fail-closed, não disparo {rotulo_seguro(meta.url, maximo=90)}")
+        host = plataforma_de_url(meta.url)
+        alvo = _caminho_normalizado(self._motor_dir_de(meta.plataforma), sess)
+        for outro in self._meta.values():
+            outra_sess = str(getattr(outro, "session_path", "") or "")
+            if outro is meta or not outra_sess:
+                continue
+            if _caminho_normalizado(self._motor_dir_de(outro.plataforma),
+                                    outra_sess) != alvo:
+                continue
+            if outro.conta != meta.conta or plataforma_de_url(outro.url) != host:
+                raise RuntimeError(
+                    f"session_path da conta {meta.conta!r} também serve a conta "
+                    f"{outro.conta!r} ({rotulo_seguro(plataforma_de_url(outro.url), maximo=60)})"
+                    f" — credencial de um tenant não vale para outro: fail-closed, não "
+                    f"disparo {rotulo_seguro(meta.url, maximo=90)}")
+
     def _montar(self, meta, passe="base"):
         spec = _PLATAFORMAS.get(meta.plataforma)
         if spec is None:
@@ -1464,6 +1692,7 @@ class LocalExecutor:
             raise RuntimeError(
                 f"plataforma {meta.plataforma!r} sem módulo de motor conhecido — "
                 f"fail-closed, não capturo {meta.url}")
+        self._checar_host_e_credencial(meta, spec)        # fail-closed ANTES de montar env
         motor_dir = self._motor_dir_de(meta.plataforma)
         cmd = [self._motor_python, "-m", spec.modulo, meta.url]
         # FLAG DO PASSE escolhido (`_escolher_passe`): base=sem flag; audio=--audio;

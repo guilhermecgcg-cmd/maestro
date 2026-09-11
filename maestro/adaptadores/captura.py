@@ -1184,6 +1184,17 @@ class LocalExecutor:
                     "stderr_tail": d.get("stderr_tail")}
                 for c, d in obitos.items()}
 
+    def aguardando_autopsia(self, curso_url) -> bool:
+        """A CONTA deste curso tem um óbito já colhido (`_reap`) e ainda NÃO drenado pela
+        autópsia? Por CONTA — a unidade do anti-ban e do .err. O loop NÃO age sobre essa
+        morte antes da autópsia classificá-la (incidente 10/09: o reap no meio da passada
+        caía no fallback, que contava a falha e RE-DISPARAVA a conta — e a autópsia do
+        ciclo seguinte contava a MESMA morte de novo, depois de o re-disparo já ter
+        acontecido, inclusive sobre uma sessão morta). `drenar_obitos` libera."""
+        self._reap()
+        meta = self._meta.get(curso_url)
+        return meta is not None and str(meta.conta) in self._obitos
+
     def curso_ativo(self, curso_url, *, limpar=True) -> bool:
         """O curso tem captura VIVA agora? `limpar=False` responde IGUAL mas sem apagar
         lock de PID morto (ver `_ler_lock`) — é o que o boot da lane usa antes da 1ª

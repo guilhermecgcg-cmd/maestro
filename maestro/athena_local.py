@@ -210,6 +210,19 @@ def _safe_ativo(executor, curso_url) -> bool:
         return False
 
 
+def _aguardando_autopsia(executor, curso_url) -> bool:
+    """A conta do curso tem óbito colhido e ainda não autopsiado? Fail-open: executor sem
+    a sonda (dublês antigos / FilaExecutor) ou sonda que levanta => False (comportamento de
+    sempre — o fallback da passada segue cobrindo a morte)."""
+    sonda = getattr(executor, "aguardando_autopsia", None)
+    if not callable(sonda):
+        return False
+    try:
+        return bool(sonda(curso_url))
+    except Exception:
+        return False
+
+
 def _plataforma_de(curso_url, meta_por_curso) -> str:
     """Rótulo de plataforma para os alertas typados. Prefere a `plataforma` do CursoLocal;
     cai na inferência por URL; por fim, a própria URL (nunca vazio)."""
@@ -545,6 +558,9 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
          recozimento (backoff volta ao degrau zero).
       4. COMPLETO no Notion (no_notion >= total, total>0) -> anti-dup por COMPLETUDE.
       5. processo AINDA ativo -> quieto (None): captura em andamento (anti-ban/disjuntor).
+      5b. a CONTA tem óbito colhido e ainda não autopsiado (reap no meio da passada) ->
+         quieto (None): a autópsia do próximo ciclo classifica e decide (sem dupla
+         contagem, sem re-disparo antes da causa).
       6. FALLBACK de morte: estava CAPTURANDO, não está mais ativo, e a autópsia do ciclo
          NÃO tratou -> conta uma falha (backoff) e volta a NOVO (never-stop).
       7. `disjuntor.pode_tentar` FECHADO (teto/backoff/irredutível) -> escala UMA vez (latch).
@@ -606,6 +622,16 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return acao
         if executor.curso_ativo(curso):
             return None                                    # capturando: quieto
+        # MORTE AINDA NÃO AUTOPSIADA (incidente 10/09): o reap roda em QUALQUER consulta ao
+        # executor — aqui mesmo, no curso_ativo acima, DEPOIS da autópsia deste ciclo e de
+        # uma leitura do Notion de até 120s. A conta tem então um óbito que a causa ainda
+        # não classificou; quem decide é a autópsia do PRÓXIMO ciclo (1 falha, a causa
+        # certa: sessão morta trava, saída limpa arma cooldown). Agir agora era o FALLBACK
+        # contar a falha E a autópsia contar de novo (dupla contagem), e re-disparar a conta
+        # ANTES da causa (numa sessão morta: mais uma sonda na superfície de ban). Espera UM
+        # ciclo — não é falha, não escala, não conta tentativa.
+        if _aguardando_autopsia(executor, curso):
+            return None
         # PENDÊNCIA CAPTURÁVEL (tracker), lida UMA vez por passada e ANTES da máquina de
         # cooldown: serve (a) de BASELINE no arme do cooldown de saída-limpa e (b) de
         # gatilho never-stop DENTRO da janela (pendência NOVA limpa o cooldown na hora —

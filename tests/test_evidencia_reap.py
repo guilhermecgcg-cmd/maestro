@@ -215,7 +215,12 @@ class _Alertas:
         return [m for m in self.mortes if m[1].get("essencial")]
 
 
-def test_ciclo_morte_colhida_na_passada_e_relancada_antes_da_autopsia(tmp_path):
+def test_ciclo_morte_colhida_na_passada_e_relancada_antes_da_autopsia(tmp_path, monkeypatch):
+    # ISOLA o item 1: a passada de hoje também ESPERA a autópsia quando a conta tem óbito
+    # pendente (tests/test_passada_aguarda_autopsia.py) — defesa em profundidade. Aqui ela
+    # é desligada para reproduzir o loop do incidente, em que a conta ERA relançada antes
+    # da autópsia: mesmo assim a evidência tem de sobreviver (dente só do item 1).
+    monkeypatch.setattr(athena_local, "_aguardando_autopsia", lambda ex, curso: False)
     sp = _SpawnTee([_RUN_MORREU_DE_TIMEOUT, _RUN_SEGUINTE])
     cursos = [captura.CursoLocal(C1, "hotmart-principal", "hotmart", total_esperado=18),
               captura.CursoLocal(C2, "hotmart-principal", "hotmart", total_esperado=18)]

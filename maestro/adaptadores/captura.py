@@ -386,10 +386,21 @@ class MaquinaSobrecarregada(ContaOcupada):
     NÃO é falha (incidente 10/09: disparar num Mac sufocado só fabricava mortes): não conta
     disjuntor, flap nem tentativa. Herda de `ContaOcupada` de propósito — quem só conhece o
     "aguarda a vez" já a trata como espera benigna (fail-safe); o loop doméstico a captura
-    ANTES para registrar a decisão e o aviso agregado. `motivo` = o texto do portão."""
+    ANTES para registrar a decisão e o aviso agregado. `motivo` = o texto do portão.
+    `escalonamento` False = sobrecarga de verdade (conta no episódio do aviso agregado)."""
+    escalonamento = False
+
     def __init__(self, motivo):
         super().__init__(motivo)
         self.motivo = motivo
+
+
+class DisparoEscalonado(MaquinaSobrecarregada):
+    """Disparo ADIADO pela RAMPA da saída da sobrecarga (`maestro.carga`): a máquina já
+    aliviou, mas o teto de disparos novos por ciclo (ATHENA_CARGA_DISPAROS_POR_CICLO) foi
+    atingido — o sensor ainda não reflete os motores recém-lançados. Mesmo tratamento do
+    adiamento (não é falha), mas NÃO prolonga o episódio de sobrecarga do aviso."""
+    escalonamento = True
 
 
 class AguardaAutopsia(ContaOcupada):
@@ -1264,8 +1275,9 @@ class LocalExecutor:
         return len(capturas_vivas(self._lock_dir, pid_vivo=self._pid_vivo))
 
     def _veto_de_carga(self):
-        """Motivo do adiamento pelo portão de carga, ou None. Fail-open: um portão/contagem
-        que LEVANTA não pode parar a captura (volta ao comportamento sem portão)."""
+        """(motivo, escalonamento) do adiamento pelo portão de carga, ou None. Fail-open:
+        um portão/contagem que LEVANTA não pode parar a captura (volta ao comportamento sem
+        portão). Portão só com `avaliar` (sem `decidir`) = motivo de sobrecarga comum."""
         if self._portao_carga is None:
             return None
         try:
@@ -1273,9 +1285,38 @@ class LocalExecutor:
         except Exception:
             ativos = 0
         try:
-            return self._portao_carga.avaliar(ativos)
+            decidir = getattr(self._portao_carga, "decidir", None)
+            if callable(decidir):
+                veto = decidir(ativos)
+                if veto is None:
+                    return None
+                return (str(getattr(veto, "motivo", veto)),
+                        bool(getattr(veto, "escalonamento", False)))
+            motivo = self._portao_carga.avaliar(ativos)
+            return (str(motivo), False) if motivo else None
         except Exception:
             return None
+
+    def _avisar_portao(self, metodo):
+        """Chama um gancho do portão de carga (novo_ciclo / registrar_disparo /
+        retomar_sobrecarga) sem NUNCA derrubar o chamador (observabilidade/rampa não param
+        a captura)."""
+        fn = getattr(self._portao_carga, metodo, None)
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception:
+            pass
+
+    def novo_ciclo(self):
+        """Fronteira de ciclo do loop -> janela da rampa do portão de carga."""
+        self._avisar_portao("novo_ciclo")
+
+    def retomar_sobrecarga(self):
+        """O loop reiniciou dentro de um episódio de sobrecarga persistido -> o portão nasce
+        em sobrecarga (histerese atravessa o reinício)."""
+        self._avisar_portao("retomar_sobrecarga")
 
     def _obito_pendente(self, conta):
         """O óbito colhido e ainda NÃO drenado da conta (dict), ou None. É a verdade que
@@ -1315,9 +1356,15 @@ class LocalExecutor:
         # teto de motores => ADIA, antes de escolher o passe (não avança o rodízio), gravar
         # lock ou spawnar. Vem DEPOIS da idempotência e do anti-ban: se a conta já está
         # ocupada, a causa de não disparar é ELA — o log do adiamento não mente.
+        # ESCALONAMENTO (rampa da saída da sobrecarga): o portão já não está sobrecarregado,
+        # mas o teto de disparos NOVOS por ciclo foi atingido -> DisparoEscalonado (também
+        # adiamento, não falha; o loop não o conta como sobrecarga no episódio do aviso).
         veto = self._veto_de_carga()
         if veto:
-            raise MaquinaSobrecarregada(veto)
+            motivo, escalonamento = veto
+            if escalonamento:
+                raise DisparoEscalonado(motivo)
+            raise MaquinaSobrecarregada(motivo)
         # ESCOLHA DO PASSE (por demanda, com rodízio anti-fome). Feita AQUI, DEPOIS do guard
         # anti-ban e ANTES do único spawn: muda só o ARGV do processo — jamais a QUANTIDADE
         # (1 spawn). Não pode disparar 2 passes na mesma conta: o passe N+1 só é escolhido
@@ -1361,6 +1408,8 @@ class LocalExecutor:
         # captura — é o que um executor nascido pós-restart lerá (via `_pid_vivo`) para
         # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
+        # um motor SUBIU: conta na janela da rampa do portão (só pesa na saída da sobrecarga)
+        self._avisar_portao("registrar_disparo")
         return f"local_iniciada:{curso_url}:passe={passe}"
 
     def _escolher_passe(self, meta):

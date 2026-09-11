@@ -48,6 +48,7 @@ PENDENTE / o que ficou por LIGAR (honesto):
 """
 import asyncio
 import json
+import logging
 import os
 import time
 
@@ -56,6 +57,8 @@ from maestro.adaptadores import captura
 from maestro.playbook import Acao
 from maestro.sentinela import Problema
 from maestro.vigia import _FLAP_MIN as _FLAP_MIN_PADRAO
+
+log = logging.getLogger("athena.local")
 
 # Fase por-curso (reusa as do adaptador de captura — mesmo vocabulário de máquina de
 # estados; só as fases NOVO/CAPTURANDO/CONCLUIDO importam no doméstico).
@@ -117,6 +120,14 @@ _COOLDOWN_SEM_PENDENCIA_S = float(os.getenv("ATHENA_COOLDOWN_SEM_PENDENCIA_S", "
 # (1 ping por janela de dedup do Alertas) + 1 escalada na espinha por episódio. 0 = nunca
 # escala (só-log sempre). Default 1h.
 _CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
+
+# EPISÓDIO DE SOBRECARGA EM DISCO (achado r6): o `desde` do episódio vai para um arquivo
+# pequeno (ATHENA_CARGA_EPISODIO_PATH, default ~/.athena-local/carga_episodio.json) e o
+# `rodar` o retoma no boot — reinícios curtos (vigia externo, launchd) não zeram mais o
+# relógio do aviso ESSENCIAL. LACUNA: se a última observação de adiamento ficou mais longe
+# que isto do boot, o loop esteve fora tempo demais para chamar de "o mesmo episódio" —
+# recomeça do zero (honesto). Default 30 min (o vigia externo mata após 900 s sem pulso).
+_CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "1800"))
 
 
 # ---------------------------------------------------------------------------
@@ -758,10 +769,13 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             # registrar_falha, tentativa, fase CAPTURANDO nem escalada por curso. Decisão
             # registrada na ENTRADA do episódio (latch: uma sobrecarga de horas não vira uma
             # linha por ciclo por curso); o aviso AGREGADO do ciclo é do `ciclo_local`.
+            # `DisparoEscalonado` (a RAMPA da saída da sobrecarga) cai aqui também: mesmo
+            # tratamento; o 3º campo diz ao aviso agregado que NÃO é sobrecarga (a máquina
+            # já aliviou — não prolonga o episódio nem o escala).
             motivo = str(getattr(e, "motivo", "") or e)
             st["_adiado_ciclo"] = agora
             if adiados is not None:
-                adiados.append((curso, motivo))
+                adiados.append((curso, motivo, bool(getattr(e, "escalonamento", False))))
             if not st.get("adiado_carga_avisado"):
                 st["adiado_carga_avisado"] = True
                 _registrar(esp, f"adiei {curso}: {motivo}",
@@ -1396,29 +1410,116 @@ def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, aler
     return Acao(f"[{slug}] run disparado: {conf}", True, False)
 
 
+def _escalonado(item) -> bool:
+    """Um item de `adiados` veio da RAMPA da saída da sobrecarga (não é sobrecarga)?
+    Aceita o formato antigo (curso, motivo) — sem o 3º campo = sobrecarga."""
+    return len(item) > 2 and bool(item[2])
+
+
+def _carregar_episodio_carga(path, *, agora, lacuna_s=None) -> dict:
+    """Episódio de sobrecarga PERSISTIDO por uma encarnação anterior do loop, ou {}.
+
+    Achado r6: o `desde` só em memória fazia um reinício (vigia externo, launchd) zerar o
+    relógio — com reinícios mais curtos que ATHENA_CARGA_ALERTA_S o aviso ESSENCIAL nunca
+    saía ("0 aulas" sem alerta). Descarta (e apaga) o arquivo ilegível ou VELHO: se a
+    última observação de adiamento (`ultimo`) está a mais de `lacuna_s` do agora, o loop
+    ficou fora do ar tempo demais para afirmar que é o MESMO episódio — começar do zero é
+    honesto (senão o aviso diria "adiando há 10 h" sobre horas que ninguém observou)."""
+    if not path:
+        return {}
+    lacuna_s = _CARGA_EPISODIO_LACUNA_S if lacuna_s is None else lacuna_s
+    try:
+        with open(path) as f:
+            dados = json.load(f)
+        desde = float(dados["desde"])
+        ultimo = float(dados.get("ultimo", desde))
+        escalado = bool(dados.get("escalado", False))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        log.warning("episódio de sobrecarga persistido ilegível em %s — descartado", path)
+        _apagar_episodio_carga(path)
+        return {}
+    valido = (desde <= agora + 300.0 and desde <= ultimo <= agora + 300.0
+              and (lacuna_s <= 0 or agora - ultimo <= lacuna_s))
+    if not valido:
+        _apagar_episodio_carga(path)
+        return {}
+    return {"desde": desde, "ultimo": ultimo, "escalado": escalado}
+
+
+def _gravar_episodio_carga(path, estado_carga) -> None:
+    """Grava {desde, ultimo, escalado} (troca atômica). Best-effort: falha vira WARNING no
+    loop.err (a captura segue; só a sobrevivência ao reinício fica comprometida)."""
+    if not path:
+        return
+    try:
+        pasta = os.path.dirname(path)
+        if pasta:
+            os.makedirs(pasta, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"desde": estado_carga.get("desde"),
+                       "ultimo": estado_carga.get("ultimo", estado_carga.get("desde")),
+                       "escalado": bool(estado_carga.get("escalado"))}, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("não gravei o episódio de sobrecarga em %s (%s: %s) — um reinício "
+                    "zeraria o relógio do aviso", path, type(e).__name__, str(e)[:120])
+
+
+def _apagar_episodio_carga(path) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("não apaguei o episódio de sobrecarga em %s (%s)", path,
+                    type(e).__name__)
+
+
 def _avisar_adiamentos(adiados, *, alertas, espinha, agora, estado_carga,
-                       limiar_s=None):
+                       limiar_s=None, episodio_path=None):
     """Aviso AGREGADO do portão de carga, no MÁXIMO 1 por ciclo (nunca 1 por curso).
 
-    `adiados` = [(curso, motivo)] deste ciclo. Ciclo sem adiamento FECHA o episódio. Com
-    adiamento: `alertas.maquina_sobrecarregada` SÓ-LOG enquanto o episódio é curto; se ele
-    PERSISTE por `limiar_s` (ATHENA_CARGA_ALERTA_S), vira ESSENCIAL (a chave única deixa
+    `adiados` = [(curso, motivo, escalonamento)] deste ciclo. Ciclo sem adiamento POR
+    SOBRECARGA fecha o episódio — inclusive o ciclo só de RAMPA (escalonamento: a máquina
+    já aliviou; o aviso de persistência não pode dizer "sobrecarregada há 1 h" sobre ele).
+    Com sobrecarga: `alertas.maquina_sobrecarregada` SÓ-LOG enquanto o episódio é curto; se
+    ele PERSISTE por `limiar_s` (ATHENA_CARGA_ALERTA_S), vira ESSENCIAL (a chave única deixa
     o dedup do Alertas em 1 ping por janela) + UMA escalada na espinha por episódio — o
     dono tem de saber que nada está sendo capturado (nunca "0 aulas" em silêncio).
-    `estado_carga` (dict cross-ciclo do `rodar`) guarda {desde, escalado}. Best-effort."""
+    `estado_carga` (dict cross-ciclo do `rodar`) guarda {desde, ultimo, escalado}; com
+    `episodio_path` o episódio vai também para DISCO (abre/atualiza/fecha), e o `rodar` o
+    retoma no boot — o relógio do aviso atravessa reinícios. Best-effort."""
     limiar_s = _CARGA_ALERTA_S if limiar_s is None else limiar_s
-    if not adiados:
+    sobrecarga = [a for a in adiados if not _escalonado(a)]
+    escalonados = [a for a in adiados if _escalonado(a)]
+    aviso = getattr(alertas, "maquina_sobrecarregada", None)
+    if not sobrecarga:
+        if "desde" in estado_carga or "escalado" in estado_carga:
+            _apagar_episodio_carga(episodio_path)
         estado_carga.pop("desde", None)
+        estado_carga.pop("ultimo", None)
         estado_carga.pop("escalado", None)
+        if escalonados and callable(aviso):
+            try:                                            # rampa: só-log, sempre
+                aviso(f"{len(escalonados)} disparo(s) escalonado(s) neste ciclo — "
+                      f"{escalonados[-1][1]}", essencial=False,
+                      chave=("portao_carga", "escalonamento"))
+            except Exception:
+                pass
         return
     desde = estado_carga.setdefault("desde", agora)
+    estado_carga["ultimo"] = agora
     duracao = max(agora - desde, 0.0)
     persistente = limiar_s > 0 and duracao >= limiar_s
-    motivo = adiados[-1][1]
+    motivo = sobrecarga[-1][1]
     texto = f"{len(adiados)} disparo(s) adiado(s) neste ciclo — {motivo}"
     if duracao > 0:
         texto += f" (adiando há {int(duracao // 60)} min)"
-    aviso = getattr(alertas, "maquina_sobrecarregada", None)
     if callable(aviso):
         try:
             aviso(texto, essencial=persistente, chave=("portao_carga",))
@@ -1431,6 +1532,9 @@ def _avisar_adiamentos(adiados, *, alertas, espinha, agora, estado_carga,
                    f"{motivo}. Nada novo é capturado enquanto durar; retomo sozinho quando "
                    f"a carga baixar", tipo="escalada", reversivel=True, escalada=True,
                    fonte="guard", origem="athena-local/portao-carga")
+    # DISCO: a cada ciclo de sobrecarga (abre, `ultimo` e `escalado`) — um JSON minúsculo
+    # a cada ~2 min, só enquanto a sobrecarga dura.
+    _gravar_episodio_carga(episodio_path, estado_carga)
 
 
 def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
@@ -1441,7 +1545,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
                 sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                pulsar=None, boot_ts=None, estado_carga=None):
+                pulsar=None, boot_ts=None, estado_carga=None, carga_episodio_path=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -1460,7 +1564,9 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
 
     `estado_carga` (dict cross-ciclo, criado 1x pelo `rodar`): episódio de sobrecarga do
     PORTÃO DE CARGA (ver `_avisar_adiamentos`). None => um dict local (sem escalada por
-    persistência entre chamadas avulsas)."""
+    persistência entre chamadas avulsas). `carga_episodio_path`: o mesmo episódio em DISCO
+    (sobrevive a reinício; None = só memória). Antes das passadas o ciclo avisa o executor
+    (`novo_ciclo`) — é a fronteira da janela do ESCALONAMENTO do portão de carga."""
     def _bater(fase, curso=None):
         if pulsar is None:
             return
@@ -1524,8 +1630,16 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                      agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min,
                      llm=llm, espinha=espinha, boot_ts=boot_ts)
 
-    # (4) passada LOCAL + owner.
-    adiados = []                                           # portão de carga: (curso, motivo)
+    # (4) passada LOCAL + owner. FRONTEIRA DE CICLO do portão de carga: a janela do
+    # ESCALONAMENTO (no máx N disparos novos por ciclo na saída da sobrecarga) vira AQUI,
+    # antes do 1º disparo do ciclo. Best-effort (dublês/executores sem o gancho: no-op).
+    _novo = getattr(executor, "novo_ciclo", None)
+    if callable(_novo):
+        try:
+            _novo()
+        except Exception:
+            pass
+    adiados = []                              # portão de carga: (curso, motivo, escalonamento)
     passada_do_curso = _passada_local_fn(executor, progresso_cached, voz, estado,
                                          projeto_nome=projeto_nome, disjuntor=disjuntor,
                                          agora=agora, espinha=espinha,
@@ -1556,7 +1670,8 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     resultado_captura = orquestrador.orquestrar_captura(cursos_ok, passada, notion_fn,
                                                         voz, voo, agora=agora)
     _avisar_adiamentos(adiados, alertas=alertas, espinha=espinha, agora=agora,
-                       estado_carga=estado_carga if estado_carga is not None else {})
+                       estado_carga=estado_carga if estado_carga is not None else {},
+                       episodio_path=carga_episodio_path)
 
     # (5) SISTEMAS GERADOS (F4-d): supervisão ao lado da captura. A captura acima NÃO
     # muda em nada; sem sistemas registrados (default) este passo é um no-op — o
@@ -1621,17 +1736,22 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 llm=None, espinha=None, sistemas=None, sistema_executor=None,
                 causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                reaper_fn=None, boot_ts=None):
+                reaper_fn=None, boot_ts=None, carga_episodio_path=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). O PULSO
     é gravado no BOOT, em cada fase/curso do ciclo, no fim do ciclo e a cada fatia da espera
     (fix-livelock-loop); o BATIMENTO roda a cada ciclo — ambos BEST-EFFORT (observabilidade
     nunca mata o loop). SISTEMAS gerados (F4-d) entram como alvos supervisionados no passo
-    (5) do ciclo — `estado_sistemas` persiste entre ciclos, igual ao `estado` dos cursos."""
+    (5) do ciclo — `estado_sistemas` persiste entre ciclos, igual ao `estado` dos cursos.
+
+    `carga_episodio_path` (achado r6): o episódio de sobrecarga do portão de carga em DISCO.
+    No boot, um episódio ainda aberto (e não velho — ver `_carregar_episodio_carga`) é
+    RETOMADO: o relógio do aviso ESSENCIAL continua de onde parou e o portão nasce em
+    sobrecarga (`executor.retomar_sobrecarga`: a histerese atravessa o reinício)."""
     estado = {}
     voo = {}
     estado_sistemas = {}
-    estado_carga = {}                                      # episódio do portão de carga
+    estado_carga = {}                  # episódio do portão de carga (retomado após o pulso)
     controle = controle or _ControleNulo()
     disjuntor = disjuntor or _DisjuntorTeto(max_tentativas)
     vigia = vigia or _VigiaNulo()
@@ -1674,6 +1794,22 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     # varredura de autópsia (vigia.autopsia(lock_dir), fase "autopsia" do 1º ciclo) ainda
     # não rodou: apagá-lo aqui era perder a autópsia (achado da revisão do livelock).
     _pulsar(0, "boot")
+    # EPISÓDIO DE SOBRECARGA de uma encarnação anterior (achado r6), logo DEPOIS do pulso de
+    # boot: o relógio do aviso ESSENCIAL continua, e o portão nasce em sobrecarga (a
+    # histerese atravessa o reinício — senão a 1ª leitura entre os dois limites liberava
+    # todas as contas livres de uma vez). Best-effort: nunca impede o loop de subir.
+    try:
+        estado_carga.update(_carregar_episodio_carga(carga_episodio_path,
+                                                     agora=time.time()))
+    except Exception:
+        pass
+    if "desde" in estado_carga:
+        _retomar = getattr(executor, "retomar_sobrecarga", None)
+        if callable(_retomar):
+            try:
+                _retomar()
+            except Exception:
+                pass
     # HIGIENE (1) — REAPER NO BOOT DA LANE: ANTES do 1º ciclo, devolve a `pendente` as
     # aulas in-flight async órfãs (transcrevendo*/capturando_nao_video) de uma encarnação
     # ANTERIOR cujo processo NÃO está mais vivo (crash/redeploy). Sem isso elas ficam presas
@@ -1706,7 +1842,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         sistema_autopsia_dir=sistema_autopsia_dir,
                         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
                         pendencia_fn=pendencia_fn, pulsar=_bater, boot_ts=boot_ts,
-                        estado_carga=estado_carga)
+                        estado_carga=estado_carga, carga_episodio_path=carga_episodio_path)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -1912,7 +2048,9 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     lock_dir = os.getenv("ATHENA_LOCK_DIR") or None
     groq_key = _ler_groq_key(motor_dir) or None
     # PORTÃO DE CARGA (incidente 10/09): ATHENA_CARGA_MAX (default 1,5×núcleos),
-    # ATHENA_MEM_LIVRE_MIN_PCT (default 10), ATHENA_MAX_MOTORES (default 0 = sem teto).
+    # ATHENA_MEM_LIVRE_MIN_PCT (default 10), ATHENA_MAX_MOTORES (default 0 = sem teto);
+    # histerese ATHENA_CARGA_LIBERA (default 0,8×máx) / ATHENA_MEM_LIVRE_LIBERA_PCT
+    # (default mín+5) e escalonamento ATHENA_CARGA_DISPAROS_POR_CICLO (default 2).
     portao_carga = carga_mod.PortaoCarga.do_ambiente()
     decisoes_mod.registrar_decisao(
         "portão de carga ligado", portao_carga.descrever(), reversivel=True,
@@ -1952,6 +2090,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     controle_path = os.getenv("ATHENA_CONTROLE_PATH", os.path.join(base, "controle.yaml"))
     autopsia_dir = os.getenv("ATHENA_AUTOPSIA_DIR", os.path.join(base, "autopsias"))
     pulso_path = os.getenv("ATHENA_PULSO_PATH", os.path.join(base, "pulso.json"))
+    carga_episodio_path = os.getenv("ATHENA_CARGA_EPISODIO_PATH",
+                                    os.path.join(base, "carga_episodio.json"))
     lock_dir_efetivo = lock_dir or os.path.join(base, "locks")
     batimento_intervalo = float(os.getenv("ATHENA_BATIMENTO_S", "1800"))
     # DIAGNÓSTICO por LLM da causa-raiz DESCONHECIDA: OFF por padrão (fail-closed ->
@@ -2001,7 +2141,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         causa_sistema=causa_sistema_mod, sistema_lock_dir=sistema_lock_dir,
         sistema_autopsia_dir=sistema_autopsia_dir,
         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
-        pendencia_fn=pendencia_fn, reaper_fn=reaper_fn))
+        pendencia_fn=pendencia_fn, reaper_fn=reaper_fn,
+        carga_episodio_path=carga_episodio_path))
 
 
 if __name__ == "__main__":  # pragma: no cover

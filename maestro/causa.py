@@ -15,8 +15,8 @@ FLUXO (2 camadas, determinístico-primeiro):
                                                                   do adaptador; última linha)
        - SIGKILL/OOM/timeout                  -> relancar        (transitório de recurso/SO)
        - net::ERR_<conectividade>, exit != 0  -> aguardar_backoff (rede caiu/mudou, Mac dormiu)
-       - net::ERR_ABORTED, exit != 0          -> escalar_humano  (causa NOMEADA: sonda/reseed
-                                                                  de sessão OU navegação)
+       - net::ERR_ABORTED como exceção        -> escalar_humano  (causa NOMEADA: sonda/reseed
+         TERMINAL do traceback, exit != 0                         de sessão OU navegação)
        - transitório reconhecido / exit 0     -> aguardar_backoff (rede/5xx/saída limpa)
   2. DESCONHECIDA (não bate em nenhuma assinatura): consulta o SEAM `llm`.
        - produção: `claude -p` headless com a autópsia (ver `seam_claude_p`), cuja saída
@@ -185,36 +185,75 @@ _RE_NET_CONECTIVIDADE = re.compile(
 # net::ERR_ABORTED; maybe frame was detached?" até num run que termina LIMPO (ruído de
 # navegação em segundo plano cancelada no fechamento da página — visto na cauda real
 # de 22/07 19:30). Esse ruído não pode quebrar a saída limpa (athena_local).
+# E SÓ quando o ERR_ABORTED é a exceção TERMINAL do traceback (ver _traceback_terminal):
+# um processo que morreu de OUTRA exceção (ex.: KeyError: 'duration') com o ruído do
+# asyncio na mesma cauda NÃO pode ganhar o texto "bug de navegação" — o ruído é, por
+# definição, uma exceção que ninguém aguardou: não foi ela que derrubou o processo.
 _RE_NAV_ABORTED = re.compile(r"net::err_aborted", re.I)
 
 # Funções dos motores (motor/<plataforma>/session.py) que SONDAM ou RESSEMEIAM a sessão.
 # `do_reseed` é o apelido local do reseed_session em ensure_session (Stoa).
 _FUNCS_SESSAO = frozenset({"ensure_session", "probe_session", "reseed_session",
                            "do_reseed"})
-# Um quadro de traceback Python: `  File "<path>", line N, in <funcao>`.
-_RE_FRAME = re.compile(r'^\s*File "[^"]*", line \d+, in (\w+)')
+# Um quadro de traceback Python: `  File "<path>", line N, in <funcao>` (`<module>`
+# incluso — por isso `\S+`, não `\w+`).
+_RE_FRAME = re.compile(r'^\s*File "[^"]*", line \d+, in (\S+)')
+
+
+def _traceback_terminal(err):
+    """(linha da exceção, [funções dos quadros, de fora p/ dentro]) do ÚLTIMO traceback
+    Python da cauda — ou None se a cauda não tem traceback.
+
+    Um traceback = uma sequência de QUADROS (`File "...", line N, in f`, com as linhas
+    indentadas de código/`^^^` de cada um) encerrada pela 1ª linha NÃO-indentada: a
+    exceção que ele levantou. A âncora são os quadros, não o cabeçalho "Traceback (most
+    recent call last):", que a janela da cauda (40 linhas) costuma cortar. Exceções
+    encadeadas ("During handling of the above exception...") produzem vários
+    tracebacks: vale o ÚLTIMO — o que de fato derrubou o processo. O ruído do asyncio
+    ("Future exception was never retrieved" + `future: <...>` + a exceção) NÃO tem
+    quadros: não é traceback, logo nunca é a exceção terminal."""
+    ultimo = None
+    quadros = None                      # None = fora de um traceback
+    for linha in (err or "").splitlines():
+        m = _RE_FRAME.match(linha)
+        if m:
+            if quadros is None:
+                quadros = []
+            quadros.append(m.group(1))
+            continue
+        if quadros is None:
+            continue
+        if linha.startswith((" ", "\t")):
+            continue                    # código / ^^^ / repr do quadro em curso
+        if not linha.strip():
+            quadros = None              # traceback cortado sem exceção: descarta
+            continue
+        ultimo = (linha, quadros)       # a exceção que ENCERROU este traceback
+        quadros = None
+    return ultimo
+
+
+def _abort_terminal(err):
+    """O traceback terminal SE a exceção dele é net::ERR_ABORTED; senão None."""
+    tb = _traceback_terminal(err)
+    if tb is not None and _RE_NAV_ABORTED.search(tb[0]):
+        return tb
+    return None
 
 
 def _funcao_de_sessao_no_abort(err):
-    """Nome da função de SESSÃO (_FUNCS_SESSAO) por onde passa o traceback que TERMINA
-    numa linha com net::ERR_ABORTED — ou None. Sobe a partir da linha do erro pelos
-    quadros do MESMO traceback (linhas `File ...`, código e `^^^` indentados) e para no
-    primeiro limite do bloco (cabeçalho "Traceback", linha de log, outra exceção). Assim
-    um ERR_ABORTED de RUÍDO do asyncio ("future: <Future ... ERR_ABORTED ...>", sem
-    quadros) nunca herda os quadros de um traceback vizinho. Devolve a função mais
-    INTERNA encontrada (probe_session/reseed_session antes de ensure_session)."""
-    linhas = err.splitlines()
-    for i, linha in enumerate(linhas):
-        if not _RE_NAV_ABORTED.search(linha):
-            continue
-        for anterior in reversed(linhas[:i]):
-            m = _RE_FRAME.match(anterior)
-            if m:
-                if m.group(1) in _FUNCS_SESSAO:
-                    return m.group(1)
-                continue
-            if not anterior.startswith((" ", "\t")):
-                break                    # fim do bloco deste traceback
+    """Nome da função de SESSÃO (_FUNCS_SESSAO) por onde passa o traceback TERMINAL da
+    cauda, quando ele termina em net::ERR_ABORTED — ou None. Só os quadros DESSE
+    traceback contam: um ERR_ABORTED de RUÍDO do asyncio (sem quadros) nunca herda os
+    quadros de um traceback vizinho, e um traceback que passou pela sessão mas morreu de
+    OUTRA exceção não é abort. Devolve a função mais INTERNA (probe_session/
+    reseed_session antes de ensure_session)."""
+    tb = _abort_terminal(err)
+    if tb is None:
+        return None
+    for fn in reversed(tb[1]):
+        if fn in _FUNCS_SESSAO:
+            return fn
     return None
 
 # exit codes de SIGKILL: -9 (Popen) e 137 (128+9, via shell).
@@ -381,13 +420,15 @@ def _deterministico(obito, tracker_dir=None):
             "Mac dormiu): transitório de rede")
 
     # 7) NAVEGAÇÃO abortada (net::ERR_ABORTED) numa MORTE (exit != 0 — com exit 0 é o
-    #    ruído do asyncio num run limpo, e a saída limpa vence no 8). Determinístico
-    #    aqui mata a autópsia cega "causa desconhecida e nenhum LLM disponível" (Stoa
-    #    27/07). A AÇÃO é escalar_humano, com a causa NOMEADA: se o traceback do abort
-    #    passa pela sonda/reseed de sessão, a SESSÃO é a 1ª suspeita (NÃO se afirma que
-    #    está viva); senão, bug de navegação do adaptador. Vem DEPOIS de sessão/token/
-    #    exit-code/OOM/conectividade (aquilo, se presente, é a causa-raiz).
-    if code != 0 and _RE_NAV_ABORTED.search(err):
+    #    ruído do asyncio num run limpo, e a saída limpa vence no 8) e SÓ quando ele é a
+    #    exceção TERMINAL do traceback (morreu de outra exceção + ruído ERR_ABORTED na
+    #    cauda => não é abort; segue adiante, sem o nome). Determinístico aqui mata a
+    #    autópsia cega "causa desconhecida e nenhum LLM disponível" (Stoa 27/07). A AÇÃO
+    #    é escalar_humano, com a causa NOMEADA: se o traceback do abort passa pela
+    #    sonda/reseed de sessão, a SESSÃO é a 1ª suspeita (NÃO se afirma que está viva);
+    #    senão, bug de navegação do adaptador. Vem DEPOIS de sessão/token/exit-code/OOM/
+    #    conectividade (aquilo, se presente, é a causa-raiz).
+    if code != 0 and _abort_terminal(err) is not None:
         fn_sessao = _funcao_de_sessao_no_abort(err)
         if fn_sessao:
             return "escalar_humano", (

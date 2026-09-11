@@ -447,12 +447,80 @@ def test_exit0_com_ruido_asyncio_err_aborted_e_saida_limpa():
     assert "saída limpa" in d.motivo, d
 
 
-def test_exit_nao_zero_com_so_o_ruido_ainda_nomeia_a_navegacao():
-    # Contraprova: numa MORTE (exit != 0) o mesmo ruído segue decidido SEM LLM, com
-    # causa nomeada neutra (não há quadro de sessão no ruído).
+def test_exit_nao_zero_com_so_o_ruido_nao_ganha_o_nome_de_navegacao():
+    # REESCRITO (item 4 da rodada 3). O teste antigo exigia que exit 1 + SÓ o ruído do
+    # asyncio fosse nomeado "bug de navegação" — mas o ruído é uma exceção que NINGUÉM
+    # aguardou ("Future exception was never retrieved"): por construção não foi ela que
+    # derrubou o processo, e a cauda não tem traceback algum que termine no abort. Nomear
+    # era afirmar uma causa sem prova (o teste exigia o bug). Sem exceção terminal
+    # conhecida, a causa é honestamente DESCONHECIDA -> LLM / fail-closed.
     d = causa.classificar(_obito(exit_code=1, stderr=_RUIDO_ASYNCIO_ERR_ABORTED))
+    assert d.acao == "escalar_humano", d                 # fail-closed segue chamando o dono
+    assert d.fonte == "fail-closed", d
+    assert "navegação" not in d.motivo and "ERR_ABORTED" not in d.motivo, d
+
+
+# Um traceback que TERMINA em OUTRA exceção (o que de fato matou o processo). Estrutura
+# real de um crash do motor (runpy -> cli.main -> asyncio.run -> _amain ...).
+_TRACEBACK_KEYERROR_DURATION = (
+    'Traceback (most recent call last):\n'
+    '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+    '  File "<frozen runpy>", line 88, in _run_code\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/__main__.py", line 4, in <module>\n'
+    '    main()\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/cli.py", line 196, in main\n'
+    '    rc = asyncio.run(_amain(argv))\n'
+    '         ^^^^^^^^^^^^^^^^^^^^^^^^^\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/cli.py", line 166, in _amain\n'
+    '    stats = await run_kajabi_course(\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/kajabi/pipeline.py", line 212, in _duracao\n'
+    '    return int(meta["duration"])\n'
+    '               ~~~~^^^^^^^^^^^^\n'
+    "KeyError: 'duration'\n"
+)
+
+
+@pytest.mark.parametrize("cauda", [
+    _RUIDO_ASYNCIO_ERR_ABORTED + "\n" + _TRACEBACK_KEYERROR_DURATION,   # ruído, depois o crash
+    _TRACEBACK_KEYERROR_DURATION + _RUIDO_ASYNCIO_ERR_ABORTED,          # crash, depois o ruído (GC)
+    (_STDERR_STOA_ERR_ABORTED                                            # abort ENCADEADO: o
+     + "\nDuring handling of the above exception, another exception occurred:\n\n"
+     + _TRACEBACK_KEYERROR_DURATION),                                    # terminal é o KeyError
+], ids=["ruido-antes", "ruido-depois", "encadeado"])
+def test_err_aborted_que_nao_e_a_excecao_terminal_nao_vira_bug_de_navegacao(cauda):
+    # DENTES (item 4): exit 1 com traceback terminando em KeyError: 'duration' + ruído
+    # do asyncio com ERR_ABORTED na cauda. O bloco antigo casava ERR_ABORTED em QUALQUER
+    # linha e mandava o dono caçar um "bug de navegação" que não matou nada. Aqui a causa
+    # é desconhecida (sem LLM no daemon => fail-closed), e com LLM ligado o seam É
+    # consultado (não há assinatura determinística que o dispense).
+    d = causa.classificar(_obito(exit_code=1, stderr=cauda))
+    assert d.fonte == "fail-closed", d
+    assert "navegação" not in d.motivo and "ERR_ABORTED" not in d.motivo, d
+    chamado = []
+    d2 = causa.classificar(_obito(exit_code=1, stderr=cauda),
+                           llm=lambda p: chamado.append(p) or '{"acao": "escalar_humano"}')
+    assert chamado and d2.fonte == "llm", d2
+
+
+def test_err_aborted_terminal_com_ruido_depois_segue_nomeado():
+    # Contraprova: o abort É a exceção terminal (Stoa /carrega 27/07) e o ruído do asyncio
+    # vem DEPOIS (GC no fechamento) — ruído não é traceback, então não rouba o posto.
+    d = causa.classificar(_obito(exit_code=1,
+                                 stderr=_STDERR_STOA_ERR_ABORTED + _RUIDO_ASYNCIO_ERR_ABORTED))
     assert d.acao == "escalar_humano" and d.fonte == "deterministico", d
-    assert "navegação" in d.motivo and "sonda/reseed" not in d.motivo, d
+    assert "bug de navegação (net::ERR_ABORTED)" in d.motivo, d
+
+
+def test_traceback_terminal_acha_a_excecao_mesmo_sem_cabecalho():
+    # A janela da cauda (40 linhas) corta o cabeçalho "Traceback (most recent call
+    # last):" dos tracebacks longos do Playwright (as caudas reais de 27/07 e 25/07
+    # começam no meio dos quadros): a âncora são os QUADROS.
+    exc, quadros = causa._traceback_terminal(_STDERR_STOA_ERR_ABORTED)
+    assert exc.startswith("playwright._impl._errors.Error: Page.goto: net::ERR_ABORTED")
+    assert quadros == ["open_course", "_content_at"]
+    exc, quadros = causa._traceback_terminal(_TRACEBACK_KEYERROR_DURATION)
+    assert exc == "KeyError: 'duration'" and quadros[2] == "<module>"
+    assert causa._traceback_terminal(_RUIDO_ASYNCIO_ERR_ABORTED) is None
 
 
 @pytest.mark.parametrize("stderr", [

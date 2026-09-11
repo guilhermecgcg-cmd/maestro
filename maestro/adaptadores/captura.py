@@ -392,6 +392,16 @@ class MaquinaSobrecarregada(ContaOcupada):
         self.motivo = motivo
 
 
+class AguardaAutopsia(ContaOcupada):
+    """Disparo RECUSADO porque a CONTA tem um óbito colhido (`_reap`) e ainda NÃO drenado
+    pela autópsia do ciclo (achado r6: a espera só existia na passada; um motor que morria
+    ENTRE o `_aguardando_autopsia` da passada e o `_reap` do `disparar` — a janela inclui a
+    leitura de pendência do tracker e o disjuntor — deixava outro curso da MESMA conta
+    disparar antes da causa, inclusive sobre uma sessão morta). `disparar` é o ponto único
+    por onde todo disparo passa; o `drenar_obitos` do próximo ciclo libera. Herda de
+    `ContaOcupada`: quem só conhece o "aguarda a vez" já trata como espera (não é falha)."""
+
+
 @dataclass(frozen=True)
 class CursoLocal:
     """Um curso desejado no modelo DOMÉSTICO. `conta` é a chave de serialização
@@ -1212,7 +1222,7 @@ class LocalExecutor:
         acontecido, inclusive sobre uma sessão morta). `drenar_obitos` libera."""
         self._reap()
         meta = self._meta.get(curso_url)
-        return meta is not None and str(meta.conta) in self._obitos
+        return meta is not None and self._obito_pendente(meta.conta) is not None
 
     def curso_ativo(self, curso_url, *, limpar=True) -> bool:
         """O curso tem captura VIVA agora? `limpar=False` responde IGUAL mas sem apagar
@@ -1267,6 +1277,11 @@ class LocalExecutor:
         except Exception:
             return None
 
+    def _obito_pendente(self, conta):
+        """O óbito colhido e ainda NÃO drenado da conta (dict), ou None. É a verdade que
+        `aguardando_autopsia` (a passada) e `disparar` (o ponto único) consultam."""
+        return self._obitos.get(str(conta))
+
     def disparar(self, curso_url):
         self._reap()
         meta = self._meta.get(curso_url)
@@ -1275,6 +1290,18 @@ class LocalExecutor:
             # montar o comando — jamais disparar às cegas.
             raise RuntimeError(
                 f"curso {curso_url} sem metadados locais (conta/plataforma) — não disparo")
+        # ÓBITO AINDA NÃO AUTOPSIADO (achado r6): logo depois do `_reap`, que acabou de colher
+        # qualquer filho morto — inclusive um que morreu DEPOIS do `_aguardando_autopsia` da
+        # passada (janela: pendência do tracker com busy_timeout + disjuntor). A conta NÃO
+        # dispara antes de a autópsia classificar a morte (numa sessão morta seria mais uma
+        # sonda na superfície de ban). Vem ANTES do portão de carga: a causa de não disparar
+        # é esta, e o log não mente. O `drenar_obitos` do próximo ciclo libera (espera 1).
+        obito = self._obito_pendente(meta.conta)
+        if obito is not None:
+            raise AguardaAutopsia(
+                f"conta {meta.conta!r}: óbito de {obito.get('course_url')} (exit "
+                f"{obito.get('exit_code')}) colhido e ainda não autopsiado — não disparo "
+                f"{curso_url} antes da causa (espera o próximo ciclo)")
         # GUARD DURÁVEL: a verdade está no disco (sobrevive a restart), não no _procs.
         lock = self._ler_lock(meta.conta)
         if lock is not None:

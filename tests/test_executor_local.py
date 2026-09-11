@@ -554,12 +554,13 @@ def test_lock_de_pid_morto_criado_na_janela_fica_intacto_como_evidencia(tmp_path
 
     ex, lock_dir, singleton = _hotmart_com_perfil(
         tmp_path, sp, _pend_com_corrida(reseed_pega_e_morre), pid_vivo=sp.mundo.vivo)
-    with pytest.raises(captura.ContaOcupada):
+    with pytest.raises(captura.ContaOcupada) as info:
         ex.disparar(C1)
     assert sp.calls == []
     with open(pego["path"]) as f:
         assert json.load(f) == pego["dados"]               # evidência preservada
     assert singleton.exists()
+    assert "reseed:hotmart" in str(info.value) and str(MORTO) in str(info.value)
 
 
 def test_spawn_falho_nao_apaga_lock_que_deixou_de_ser_nosso(tmp_path):

@@ -1195,6 +1195,17 @@ class LocalExecutor:
             except OSError:
                 pass
 
+    def _conteudo_do_lock(self, conta) -> dict:
+        """O conteúdo do lock da conta, SÓ LEITURA e sem julgar vida (para a mensagem de
+        quem venceu a corrida — inclusive um lock de PID morto, que fica como evidência).
+        {} se ausente/ilegível."""
+        try:
+            with open(self._lock_path(conta)) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def _lock_e(self, conta, dados) -> bool:
         """O lock da conta tem EXATAMENTE este conteúdo (é o nosso)?"""
         try:
@@ -1442,7 +1453,7 @@ class LocalExecutor:
         intencao = {"pid": None, "course_url": curso_url, "conta": str(meta.conta),
                     "ts": time.time()}
         if not self._criar_lock_exclusivo(meta.conta, intencao):
-            atual = self._ler_lock(meta.conta, limpar=False) or {}
+            atual = self._conteudo_do_lock(meta.conta)
             raise ContaOcupada(
                 f"conta {meta.conta!r} foi ocupada durante o disparo de {curso_url} (lock de "
                 f"{atual.get('course_url') or 'dono desconhecido'}, PID {atual.get('pid')}) "

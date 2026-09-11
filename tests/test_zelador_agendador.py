@@ -1750,3 +1750,22 @@ def test_vigia_persistido_ignora_o_zelo_desta_encarnacao(tmp_path):
     assert ex.vigiar_zelos_orfaos(T0 + 700) == []             # além do teto, com prova
     assert sinais == []
     assert _lock(ex, "kiwify-principal") == antes
+
+
+@pytest.mark.parametrize("detalhe", ["renovacao do app nao recusada", "sem sonda de 3 estados"])
+def test_frases_novas_da_alpaclass_chegam_ao_status_e_nao_sao_frase_de_morte(tmp_path, detalhe):
+    """As frases fixas do motor/zelador.py da Alpaclass (rodada 10) passam pela lista branca do
+    status (senão viravam 'detalhe descartado' e o operador não saberia POR QUE o zelo foi
+    inconclusivo) e não casam a assinatura de morte/credencial do daemon."""
+    from maestro import causa
+    assert not causa._RE_SESSAO.search(detalhe) and not causa._RE_TOKEN.search(detalhe)
+    ALPA = "https://fsp.alpaclass.com/"
+    cursos = [_c(ALPA, "alpaclass-principal", "alpaclass")]
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "alpaclass-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    ex.sp.terminar(0, 5, "inconclusiva", detalhe=detalhe)
+    _passo(z, ex, T0 + 60)
+    conta, = _status(tmp_path)["contas"]
+    assert conta["resultado"] == "inconclusiva" and conta["detalhe"] == detalhe
+    assert conta["status"] != "aguardando-humano"

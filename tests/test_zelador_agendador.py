@@ -1556,3 +1556,15 @@ def test_o_lock_do_proprio_zelo_nao_conta_como_atividade_de_captura(tmp_path):
     _passo(z, ex, T0 + 180)
     ex.disparar(KIW)                                           # a captura, ao contrário, conta
     assert ex.captura_viva("kiwify-principal") is True
+
+
+def test_curso_benchado_nunca_e_sondado_nem_como_ultimo_recurso(tmp_path):
+    """Defesa em profundidade: o bench de exit-5 marca a URL que o motor não abre. Mesmo
+    que o estado também diga "latch de reseed", a sonda não a usa."""
+    cursos = [_c(HOT, "hotmart-principal", "hotmart")]
+    estado = {HOT: {"irredutivel": True, "benched_exit5": True,
+                    "ultima_causa": "escalar_reseed"}}
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hotmart-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado)
+    assert ex.sp.zelos() == []

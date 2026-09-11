@@ -146,8 +146,9 @@ _DETALHES_FIXOS = frozenset({
     "sonda da plataforma provou", "interrompido", "Error",
     "watchdog", "sem linha do zelador", "detalhe descartado", "teto de tempo",
     "morte sem prova positiva",
-    # motor/zelador.py da Alpaclass (rodada 10): renovar como o app antes de sondar
-    "sem sonda de 3 estados", "renovacao do app nao recusada",
+    # motor/zelador.py da Alpaclass (rodada 11): o zelo é o ensure_session do motor, que renova
+    # como o app; uma Alpaclass sem essa interface não é zelada (inconclusivo, sem navegador)
+    "sem renovacao do app na sessao",
 })
 _RE_EXCECAO = re.compile(r"[A-Z][A-Za-z0-9]{0,47}(Error|Exception|Timeout|Interrupt|Exit)")
 

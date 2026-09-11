@@ -1788,11 +1788,13 @@ def test_vigia_persistido_ignora_o_zelo_desta_encarnacao(tmp_path):
     assert _lock(ex, "kiwify-principal") == antes
 
 
-@pytest.mark.parametrize("detalhe", ["renovacao do app nao recusada", "sem sonda de 3 estados"])
+@pytest.mark.parametrize("detalhe", ["sem renovacao do app na sessao"])
 def test_frases_novas_da_alpaclass_chegam_ao_status_e_nao_sao_frase_de_morte(tmp_path, detalhe):
-    """As frases fixas do motor/zelador.py da Alpaclass (rodada 10) passam pela lista branca do
-    status (senão viravam 'detalhe descartado' e o operador não saberia POR QUE o zelo foi
-    inconclusivo) e não casam a assinatura de morte/credencial do daemon."""
+    """A frase fixa do motor/zelador.py da Alpaclass (rodada 11: a Alpaclass sem a renovação do
+    app dentro do ensure_session não é zelada) passa pela lista branca do status (senão virava
+    'detalhe descartado' e o operador não saberia POR QUE o zelo foi inconclusivo) e não casa
+    a assinatura de morte/credencial do daemon. As da rodada 10 saíram com a renovação própria
+    do zelador (o motor não as emite mais)."""
     from maestro import causa
     assert not causa._RE_SESSAO.search(detalhe) and not causa._RE_TOKEN.search(detalhe)
     ALPA = "https://fsp.alpaclass.com/"

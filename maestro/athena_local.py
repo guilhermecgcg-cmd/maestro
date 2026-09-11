@@ -1989,6 +1989,20 @@ def carregar_cursos(path) -> list:
     return out
 
 
+def _pendencia_de_producao(cursos, motor_dir_do_curso):
+    """O `pendencia_fn` de PRODUÇÃO (main -> rodar): pendência capturável por curso
+    (None = desconhecido -> fail-open), lida no tracker do motor DAQUELE curso e no
+    ESCOPO da plataforma do YAML — Cademí/Entrega Digital somam o tenant inteiro pelo
+    course_id namespaced (`captura._escopo_tracker`); sem a plataforma, o leitor só
+    conhecia o `/products/<id>` do Hotmart (None para elas, ou o curso Hotmart errado)."""
+    plat_por_curso = {c.url: c.plataforma for c in cursos}
+
+    def pendencia_fn(url):
+        return captura.pendencia_capturavel_local(
+            url, motor_dir_do_curso(url), plataforma=plat_por_curso.get(url))
+    return pendencia_fn
+
+
 def _reaper_de_boot(cursos, executor, motor_dir_do_curso):
     """O `reaper_fn` de PRODUÇÃO (main -> rodar): devolve a `pendente` as aulas in-flight
     async órfãs de cada curso SEM captura viva (`captura.reap_orphans_local`).
@@ -2012,20 +2026,6 @@ def _reaper_de_boot(cursos, executor, motor_dir_do_curso):
             except Exception:
                 pass
     return reaper_fn
-
-
-def _pendencia_de_producao(cursos, motor_dir_do_curso):
-    """O `pendencia_fn` de PRODUÇÃO (main -> rodar): pendência capturável por curso
-    (None = desconhecido -> fail-open), lida no tracker do motor DAQUELE curso e no
-    ESCOPO da plataforma do YAML — Cademí/Entrega Digital somam o tenant inteiro pelo
-    course_id namespaced (`captura._escopo_tracker`); sem a plataforma, o leitor só
-    conhecia o `/products/<id>` do Hotmart (None para elas, ou o curso Hotmart errado)."""
-    plat_por_curso = {c.url: c.plataforma for c in cursos}
-
-    def pendencia_fn(url):
-        return captura.pendencia_capturavel_local(
-            url, motor_dir_do_curso(url), plataforma=plat_por_curso.get(url))
-    return pendencia_fn
 
 
 def _motor_dirs_por_plataforma() -> dict:

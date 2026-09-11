@@ -98,17 +98,20 @@ _RESULTADOS_5 = frozenset({R_SEM_PERFIL, R_SEM_SESSAO, R_OCUPADO})
 # Bearer em 25 s". Até virarem tri-estado, a 1ª morte é só suspeita.
 PROVA_FRACA = frozenset({"stoa", "alpaclass", "hubla"})
 
-# Plataformas cujo motor tem a SONDA TRI-ESTADO do zelo (`sonda_zelador` do módulo de sessão:
-# rede/5xx/429 = inconclusivo; só a tela/código de login = morta). Nelas uma morte só conta
-# com `prova: positiva` na linha ZELADOR — um motor ou uma árvore da Stoa ANTIGOS (sem a
-# sonda) que digam "morta" podem estar lendo uma queda de internet: INCONCLUSIVO.
+# Plataformas cuja morte no zelo só vale com PROVA POSITIVA de login (`prova: positiva` na
+# linha ZELADOR): na Stoa, a `sonda_zelador` tri-estado (tela/flag de login NUM HOST DA
+# STOA; rede/4xx/5xx/outro host = inconclusivo); na Alpaclass, a renovação do token pelo
+# app RECUSADA + a sonda de 3 estados (r5) recusando todo Bearer com 401/USR_04. Um motor
+# ou uma árvore da Stoa ANTIGOS que digam "morta" sem esse campo podem estar lendo uma
+# queda de internet (ou, na Alpaclass, o JWT de ~6 min vencido): INCONCLUSIVO.
 SONDA_TRI_ESTADO = frozenset({"stoa", "alpaclass"})
 PROVA_POSITIVA = "positiva"
 
 # Arquivo de sessão DEFAULT do CLI de cada plataforma (relativo ao cwd do motor dela) —
 # ESPELHO de motor/profiles.py::PLATAFORMAS[*].state_default. Só vale onde o daemon NÃO
-# injeta o session_path (hotmart/stoa/kajabi, ou conta sem session_path no YAML). É a
-# marca do M4: o reseed regrava ESTE arquivo.
+# injeta o session_path (hotmart/stoa/kajabi, ou conta sem session_path no YAML). É o
+# arquivo cuja IDENTIDADE (conteúdo) re-sonda uma conta aguardando-humano: o reseed regrava
+# ESTE arquivo.
 _SESSAO_PADRAO = {
     "hotmart": ".hotmart-session.json", "memberkit": ".memberkit-session.json",
     "stoa": ".stoa-session.json", "kajabi": ".kajabi-session.json",

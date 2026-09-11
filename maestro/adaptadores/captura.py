@@ -912,10 +912,34 @@ def _prefixo_cademi(curso_url):
     return f"cademi:{host}:" if host else None
 
 
-def _prefixo_entregadigital(curso_url):
+def _tenant_entregadigital(curso_url):
     host = _host_do_tenant(curso_url)
-    tenant = host.split(".")[0] if host.endswith("." + _ED_SAAS) else host
+    return host.split(".")[0] if host.endswith("." + _ED_SAAS) else host
+
+
+def _prefixo_entregadigital(curso_url):
+    tenant = _tenant_entregadigital(curso_url)
     return f"entregadigital:{tenant}:product:" if tenant else None
+
+
+# ORIGEM NO NOTION (a URL da aula — chave de dedup e base da contagem-verdade do progresso
+# do daemon, que casa por PREFIXO de Origem). Na Entrega Digital a Origem é o share_url
+# `https://<tenant>.appmagic.link/products/<pid>/lessons/<lid>` (ESPELHO de motor/
+# entregadigital/enumerate.py::lesson_share_url + SHARE_HOST), que NÃO mora sob a URL do
+# YAML (`https://<tenant>.entregadigital.app.br/`): contando pelo prefixo do YAML, o
+# progresso daria 0 PARA SEMPRE (nenhum avanço visto, "0 aulas" calado). No Cademí a
+# Origem é `<base do tenant>/area/conteudo/aula/<id>` — já casa a URL do YAML.
+_ED_SHARE_HOST = "appmagic.link"
+
+
+def prefixo_origem_notion(curso_url, plataforma=None):
+    """Prefixo de 'Origem' para contar as aulas deste curso no Notion quando ele NÃO é o
+    da URL do YAML (`_prefixo_de_curso`); None => vale o de sempre. Hoje só a Entrega
+    Digital (termina em '/': `luanacarolina.appmagic.link/` não casa `luanacarolina2.…`)."""
+    if plataforma == "entregadigital":
+        tenant = _tenant_entregadigital(curso_url)
+        return f"https://{tenant}.{_ED_SHARE_HOST}/" if tenant else None
+    return None
 
 
 _ESCOPO_TENANT = {"cademi": _prefixo_cademi, "entregadigital": _prefixo_entregadigital}

@@ -14,7 +14,9 @@ Dublês com dentes (zero captura, zero sessão real, nenhum arquivo vivo):
      contas/dois hosts => recusa;
   6. tracker: pendências/terminais lidos por course_id `cademi:<host>:<id>` e
      `entregadigital:<tenant>:product:<pid>` (tenant inteiro, sem vazar para outro tenant
-     nem para o `/products/<id>` do Hotmart); o reaper não toca essas plataformas.
+     nem para o `/products/<id>` do Hotmart); o reaper não toca essas plataformas;
+  7. progresso no Notion: a Origem da Entrega Digital (`<tenant>.appmagic.link`) não mora
+     sob a URL do YAML — o daemon conta pela Origem real, senão o progresso seria 0.
 """
 import os
 import sqlite3
@@ -541,3 +543,60 @@ def test_reaper_de_boot_de_producao_passa_a_plataforma(tmp_path):
     ex = _exec(*cursos)
     athena_local._reaper_de_boot(cursos, ex, lambda url: md)()
     assert _status(md, "123") == ["transcrevendo"]          # o Hotmart 123 ficou intacto
+
+
+# ==========================================================================
+# 7) PROGRESSO NO NOTION — a Origem da Entrega Digital não mora sob a URL do YAML
+# ==========================================================================
+def _run_que_conta(n, prefixos):
+    def fake_run(cmd, *, cwd):
+        prefixos.append(cmd[-1])                           # o prefixo de Origem vai como argv
+        return f"{captura.PROGRESSO_SENTINELA} {n}\n"
+    return fake_run
+
+
+def test_prefixo_de_origem_da_entregadigital_e_o_share_url_do_tenant():
+    assert captura.prefixo_origem_notion(LUANA, "entregadigital") == \
+        "https://luanacarolina.appmagic.link/"
+    assert captura.prefixo_origem_notion(LUANA + "products/9", "entregadigital") == \
+        "https://luanacarolina.appmagic.link/"
+    # Cademí e as vivas: a Origem já mora sob a URL do YAML => nada muda (None)
+    assert captura.prefixo_origem_notion(ALFA, "cademi") is None
+    assert captura.prefixo_origem_notion(C1, "hotmart") is None
+    assert captura.prefixo_origem_notion("sem-host", "entregadigital") is None
+
+
+def test_progresso_de_producao_conta_a_entregadigital_pela_origem_real():
+    cursos = [_c("cademi", ALFA, "cademi-alfaresearch"),
+              _c("entregadigital", LUANA, "entregadigital-luanacarolina"),
+              _hot(C1, "h")]
+    origem = athena_local.origem_notion_por_curso(cursos)
+    assert origem == {LUANA: "https://luanacarolina.appmagic.link/"}
+    prefixos = []
+    fn = athena_local.progresso_local_fn("/py", "/dir", {}, run=_run_que_conta(5, prefixos),
+                                         origem_por_curso=origem)
+    assert fn(LUANA) == (5, 0) and fn(ALFA) == (5, 0) and fn(C1) == (5, 0)
+    assert prefixos == ["https://luanacarolina.appmagic.link/",   # a Origem real da ED
+                        "https://membros.alfaresearch.com.br/",   # Cademí: a URL do YAML
+                        C1 + "/"]                                 # Hotmart: como sempre
+
+
+def test_sem_o_mapa_a_entregadigital_contaria_pela_url_do_yaml():
+    # o defeito que o mapa conserta: pelo prefixo do YAML, nenhuma aula da ED casa.
+    prefixos = []
+    athena_local.progresso_local_fn("/py", "/dir", {}, run=_run_que_conta(0, prefixos))(LUANA)
+    assert prefixos == ["https://luanacarolina.entregadigital.app.br/"]
+
+
+def test_share_host_e_o_do_motor():
+    fonte = None
+    for raiz in _ARVORES_MOTOR:
+        p = os.path.join(raiz, "motor", "entregadigital", "enumerate.py")
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                fonte = f.read()
+            break
+    if fonte is None:
+        pytest.skip("nenhuma árvore do motor com motor/entregadigital/enumerate.py")
+    assert f'SHARE_HOST = "{captura._ED_SHARE_HOST}"' in fonte
+    assert 'f"https://{tenant}.{SHARE_HOST}/products/' in fonte

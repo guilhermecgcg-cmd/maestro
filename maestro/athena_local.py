@@ -1912,13 +1912,16 @@ def _run_local(cmd, *, cwd):  # pragma: no cover — subprocesso REAL
                           timeout=120).stdout
 
 
-def contar_no_notion_local(motor_python, motor_dir, curso_url, *, run=None) -> int:
+def contar_no_notion_local(motor_python, motor_dir, curso_url, *, run=None,
+                           prefixo=None) -> int:
     """Conta as aulas deste curso já no Notion (por prefixo de 'Origem'), rodando o
     MESMO script do adaptador (`captura._PROGRESSO_SCRIPT`) LOCALMENTE (motor_python -c),
     com cwd=motor_dir para o `motor.config` carregar o NOTION_TOKEN do .env. LEVANTA se a
-    sentinela não vier (silêncio NÃO vira 0 — subestimar re-capturaria; o chamador escala)."""
+    sentinela não vier (silêncio NÃO vira 0 — subestimar re-capturaria; o chamador escala).
+    `prefixo` (opcional) = a Origem da plataforma quando ela não mora sob a URL do curso
+    (`captura.prefixo_origem_notion` — Entrega Digital); None => o prefixo da URL."""
     run = run or _run_local
-    prefixo = captura._prefixo_de_curso(curso_url)
+    prefixo = prefixo or captura._prefixo_de_curso(curso_url)
     script = "import motor.config  # carrega .env (NOTION_TOKEN etc.)\n" + captura._PROGRESSO_SCRIPT
     cmd = [motor_python, "-c", script, prefixo]
     saida = run(cmd, cwd=motor_dir) or ""
@@ -1930,14 +1933,32 @@ def contar_no_notion_local(motor_python, motor_dir, curso_url, *, run=None) -> i
     return int(linha.split(captura.PROGRESSO_SENTINELA, 1)[1].strip().split()[0])
 
 
-def progresso_local_fn(motor_python, motor_dir, total_por_curso, *, run=None):
+def progresso_local_fn(motor_python, motor_dir, total_por_curso, *, run=None,
+                       origem_por_curso=None):
     """Fábrica da `progresso_fn` doméstica -> (no_notion, total). Numerador = contagem-
     verdade LOCAL do Notion; denominador = `total_por_curso` (o `total_esperado` do YAML).
-    Curso sem total => 0 (o owner não conclui: fail-closed)."""
+    Curso sem total => 0 (o owner não conclui: fail-closed). `origem_por_curso` (url ->
+    prefixo de Origem) cobre as plataformas cuja aula não mora sob a URL do YAML."""
+    origem = dict(origem_por_curso or {})
+
     def _fn(curso_url):
-        no_notion = contar_no_notion_local(motor_python, motor_dir, curso_url, run=run)
+        no_notion = contar_no_notion_local(motor_python, motor_dir, curso_url, run=run,
+                                           prefixo=origem.get(curso_url))
         return (no_notion, int(total_por_curso.get(curso_url, 0)))
     return _fn
+
+
+def origem_notion_por_curso(cursos) -> dict:
+    """url -> prefixo de 'Origem' no Notion, só dos cursos cuja plataforma grava a aula
+    FORA da URL do YAML (`captura.prefixo_origem_notion`; hoje: Entrega Digital). O main()
+    passa isto ao `progresso_local_fn` — sem ele o progresso da Entrega Digital seria 0
+    para sempre (nenhum avanço visto)."""
+    out = {}
+    for c in cursos:
+        p = captura.prefixo_origem_notion(c.url, c.plataforma)
+        if p:
+            out[c.url] = p
+    return out
 
 
 # Gate de DOMÍNIO default (main() -> `plataformas_suportadas`, casada por sufixo de host
@@ -2099,7 +2120,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         groq_key=groq_key, motor_dir_por_plataforma=_motor_dirs_por_plataforma(),
         portao_carga=portao_carga)
     total_por_curso = {c.url: c.total_esperado for c in cursos}
-    progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso)
+    progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso,
+                                      origem_por_curso=origem_notion_por_curso(cursos))
 
     # HIGIENE — motor_dir POR CURSO (Stoa vive noutro worktree): o mesmo mapa que o
     # executor usa (`_motor_dir_de`), para que reaper/pendência leiam o tracker.db CERTO.

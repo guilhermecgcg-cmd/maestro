@@ -61,10 +61,17 @@ _PROIBIDOS = ("relogar", "relogin", "auto-login", "autologin", "auto login",
 @dataclass(frozen=True)
 class Decisao:
     """A ação escolhida + de onde veio (auditoria). `fonte`: 'deterministico' | 'llm' |
-    'fail-closed'."""
+    'fail-closed'.
+
+    `sem_falha`: o óbito NÃO é falha da captura — (a) captura ÓRFÃ (de encarnação
+    anterior do loop, sem exit code observável) cuja cauda termina no RESUMO FINAL do
+    motor = saída limpa; (b) captura disparada ANTES do boot atual e sem outra causa na
+    cauda = o reinício/desligamento do Mac a matou. O loop NÃO conta falha no disjuntor,
+    NÃO alerta e NÃO conta flap (athena_local._aplicar_decisao / vigia)."""
     acao: str
     motivo: str = ""
     fonte: str = ""
+    sem_falha: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -269,6 +276,38 @@ def _ultima_linha(err):
     return "(stderr vazio)"
 
 
+# RESUMO FINAL do motor: a linha que TODO CLI imprime SÓ no caminho de SUCESSO, logo antes
+# de sair 0 — motor/cli.py (Hotmart): "Stats: total=N ok=N audio=N falhou=N";
+# motor/<plat>/cli.py: "<Plataforma>[...]: <x>=N total=N ok=N <y>=N falhou=N" (Kajabi,
+# Memberkit, Stoa[modo], Kiwify, Nutror, Alpaclass, Hubla, Greenn, Curseduca, Cademí).
+# Os abortos controlados (exit 2/3/4/5/6) imprimem OUTRA mensagem e um crash imprime
+# traceback — nenhum imprime o resumo. As linhas de log do pipeline ("...: ok=0 audio=0
+# falhou=0 de 0") e o "Parando com ok=... falhou=N de M" do circuit-breaker NÃO casam
+# (sem `total=`, e terminam em "de N").
+_RE_RESUMO_FINAL = re.compile(
+    r"^(?:Stats|\S.*?):\s(?:\S+=\d+\s+)*total=\d+\s+ok=\d+\s+\S+=\d+\s+falhou=\d+\s*$")
+
+
+def _resumo_final(err):
+    """A linha do RESUMO FINAL do motor quando a cauda termina nele — o run chegou ao
+    `return 0` —, senão None. "Termina nele" = nenhum traceback DEPOIS do resumo: o que
+    pode vir depois é só o fim do sucesso (as linhas 'Skills:' do Hotmart, avisos de
+    fechamento do contexto, o ruído do asyncio), e nada disso é traceback. Usado SÓ
+    quando o exit code é desconhecido (morte só-de-lock): um exit code REAL sempre vence
+    a prosa."""
+    linhas = (err or "").splitlines()
+    idx = None
+    for i, linha in enumerate(linhas):
+        if _RE_RESUMO_FINAL.match(linha):
+            idx = i
+    if idx is None:
+        return None
+    if any(_RE_FRAME.match(l) or l.startswith("Traceback (most recent call last)")
+           for l in linhas[idx + 1:]):
+        return None
+    return linhas[idx].strip()[:_LINHA_TRUNCA]
+
+
 # --------------------------------------------------------------------------
 # Enriquecimento do exit-4 com os erros REAIS do tracker (observabilidade).
 #
@@ -330,9 +369,18 @@ def _erros_recentes_tracker(curso_url, tracker_dir=None,
 
 
 def _deterministico(obito, tracker_dir=None):
-    """Devolve (acao, motivo) se bater numa assinatura conhecida; None se DESCONHECIDA."""
+    """Devolve (acao, motivo) — ou (acao, motivo, sem_falha) nas duas regras de morte
+    SEM FALHA da captura (ver `Decisao.sem_falha`) — se bater numa assinatura conhecida;
+    None se DESCONHECIDA."""
     err = obito.stderr_tail or ""
     code = obito.exit_code
+    # SAÍDA LIMPA: exit 0 REAL, ou — morte SÓ-DE-LOCK (exit code desconhecido: captura
+    # ÓRFÃ de uma encarnação anterior do loop, cujo .err a autópsia leu) — cauda que
+    # termina no RESUMO FINAL do motor. A órfã limpa recebe o MESMO tratamento do exit 0
+    # nas assinaturas de morte abaixo (OOM/timeout/rede/abort não a transformam em morte).
+    resumo = _resumo_final(err) if code is None else None
+    orfa_limpa = resumo is not None
+    limpa = code == 0 or orfa_limpa
 
     # 1) SESSÃO ASSERTIVA (precedência máxima): stderr que DECLARA a sessão morta.
     #    Vem antes de tudo — inclusive antes do exit-code — porque se o filho foi
@@ -405,16 +453,16 @@ def _deterministico(obito, tracker_dir=None):
     #    e perdia o cooldown de concluído — mesma classe do ERR_ABORTED abaixo.
     if code in _EXIT_SIGKILL:
         return "relancar", "exit code de SIGKILL (%s)" % code
-    if code != 0 and _RE_OOM.search(err):
+    if not limpa and _RE_OOM.search(err):
         return "relancar", "assinatura de OOM/falta de recurso no stderr"
-    if code != 0 and _RE_TIMEOUT.search(err):
+    if not limpa and _RE_TIMEOUT.search(err):
         return "relancar", "assinatura de timeout no stderr"
 
     # 6) net-errors de CONECTIVIDADE do Chromium (DNS/conexão/link/rede do SO mudou/Mac
     #    dormiu) numa MORTE (exit != 0): transitório de rede -> backoff. Antes do
     #    ERR_ABORTED (a rede caída arrasta navegações em voo; ver _RE_NET_CONECTIVIDADE).
     #    Com exit 0 cai no 8) — saída limpa, o motivo de sempre.
-    if code != 0 and _RE_NET_CONECTIVIDADE.search(err):
+    if not limpa and _RE_NET_CONECTIVIDADE.search(err):
         return "aguardar_backoff", (
             "net-error de conectividade do Chromium no stderr (rede caiu/mudou ou o "
             "Mac dormiu): transitório de rede")
@@ -428,7 +476,7 @@ def _deterministico(obito, tracker_dir=None):
     #    sonda/reseed de sessão, a SESSÃO é a 1ª suspeita (NÃO se afirma que está viva);
     #    senão, bug de navegação do adaptador. Vem DEPOIS de sessão/token/exit-code/OOM/
     #    conectividade (aquilo, se presente, é a causa-raiz).
-    if code != 0 and _abort_terminal(err) is not None:
+    if not limpa and _abort_terminal(err) is not None:
         fn_sessao = _funcao_de_sessao_no_abort(err)
         if fn_sessao:
             return "escalar_humano", (
@@ -442,8 +490,29 @@ def _deterministico(obito, tracker_dir=None):
     # 8) TRANSITÓRIO de rede/servidor, ou saída LIMPA (a completude é do loop/Notion).
     if code == 0:
         return "aguardar_backoff", "saída limpa (exit 0) — completude é do owner/Notion"
+    if orfa_limpa:
+        # A órfã que terminou LIMPA (o run chegou ao resumo final; o loop que a
+        # disparou morreu/foi reiniciado e levou o Popen — exit code não observável).
+        # NÃO é morte: sem falha, sem alerta (era o falso "MORREU ... causa
+        # desconhecida" das autópsias detectado_por=pid pós-bounce do loop).
+        return "aguardar_backoff", (
+            "saída limpa de captura órfã (disparada por encarnação anterior do loop; "
+            "exit code não observável): a cauda do .err termina no resumo final do "
+            "motor — %s" % resumo), True
     if _RE_TRANSITORIO.search(err):
         return "aguardar_backoff", "assinatura de transitório de rede/servidor no stderr"
+
+    # 9) REINÍCIO/DESLIGAMENTO DO MAC: morte só-de-lock cujo lock (= o disparo) é
+    #    ANTERIOR ao boot atual (kern.boottime) e cuja cauda não bateu em NENHUMA
+    #    assinatura acima (sem stderr conclusivo). Nenhum processo atravessa um reboot:
+    #    a captura morreu com o Mac, não por culpa dela. Relança SEM alerta essencial e
+    #    SEM contar falha no disjuntor (uma autópsia por conta que capturava, em todo
+    #    reboot, virava "causa desconhecida (fail-closed)" + backoff). Por último de
+    #    propósito: se a cauda DIZ a causa (sessão morta, token, timeout...), ela vence.
+    if code is None and getattr(obito, "lock_antes_do_boot", False):
+        return "relancar", (
+            "reinício/desligamento do Mac: a captura foi disparada antes do boot atual "
+            "e a cauda não aponta outra causa — relanço sem alerta e sem contar falha"), True
 
     return None                        # DESCONHECIDA -> seam do LLM
 
@@ -513,8 +582,9 @@ def classificar(obito, llm=None, tracker_dir=None):
     ATHENA_MOTOR_DIR, o default do daemon)."""
     det = _deterministico(obito, tracker_dir=tracker_dir)
     if det is not None:
-        acao, motivo = det
-        return Decisao(acao=acao, motivo=motivo, fonte="deterministico")
+        acao, motivo = det[0], det[1]
+        return Decisao(acao=acao, motivo=motivo, fonte="deterministico",
+                       sem_falha=len(det) > 2 and bool(det[2]))
 
     # DESCONHECIDA -> seam do LLM.
     if llm is None:

@@ -650,3 +650,61 @@ def test_exit0_com_timeout_real_na_cauda_segue_saida_limpa_no_loop():
     assert st.get("_saida_limpa_ciclo") == 1000.0
     assert "_morte_ciclo" not in st and "disj_falhas" not in st, st
     assert alertas.mortes == []
+
+
+# ==========================================================================
+# MORTE SEM FALHA (item 1 da rodada 3): reinício do Mac / órfã que saiu limpa. A causa
+# REAL decide `sem_falha`; o _aplicar_decisao REAL + a passada REAL não podem contar
+# falha (nem pelo fallback de morte da passada) nem alertar (nem o flap só-log).
+# ==========================================================================
+class _DisjEspiao:
+    def __init__(self):
+        self.falhas = []
+
+    def pode_tentar(self, st, agora):
+        from maestro import disjuntor
+        return disjuntor.pode_tentar(st, agora)
+
+    def registrar_falha(self, st, agora):
+        from maestro import disjuntor
+        self.falhas.append(agora)
+        disjuntor.registrar_falha(st, agora)
+
+    def registrar_sucesso(self, st):
+        from maestro import disjuntor
+        disjuntor.registrar_sucesso(st)
+
+
+@pytest.mark.parametrize("stderr,antes_do_boot,acao,redispara", [
+    ("", True, "relancar", True),                             # reinício do Mac
+    ("Stats: total=3 ok=3 audio=0 falhou=0\n", False, "aguardar_backoff", False),  # órfã limpa
+], ids=["reinicio", "orfa-limpa"])
+def test_morte_sem_falha_em_capturando_nao_conta_falha_nem_alerta(stderr, antes_do_boot,
+                                                                   acao, redispara):
+    # O curso pode estar em CAPTURANDO nesta encarnação (o disparo de uma órfã viva
+    # devolve "ja_capturando"). DENTES: (1) sem o ramo sem_falha, `relancar` cai no
+    # registrar_falha da morte; (2) sem voltar a NOVO, o FALLBACK de morte da passada
+    # conta a falha; (3) com o ramo DEPOIS do flap, flaps_na_janela=5 alerta "FLAP";
+    # (4) a órfã LIMPA tem o tratamento de um exit 0 real: sem avanço no Notion, a
+    # passada arma o cooldown de concluído (não re-dispara); o reinício re-dispara já.
+    from maestro import causa
+    from maestro.vigia import Obito
+    obito = Obito(conta="a", curso=C1, exit_code=None, stderr_tail=stderr,
+                  flaps_na_janela=5, lock_mtime=100.0, boot_ts=200.0 if antes_do_boot else 50.0,
+                  lock_antes_do_boot=antes_do_boot)
+    decisao = causa.classificar(obito)
+    assert decisao.acao == acao and decisao.sem_falha is True, decisao
+    st = {"fase": athena_local.FASE_CAPTURANDO, "tentativas": 1}
+    estado, disj, alertas = {C1: st}, _DisjEspiao(), _SpyAlertas()
+    athena_local._aplicar_decisao(C1, st, obito, decisao, disjuntor=disj, alertas=alertas,
+                                  agora=1000.0, meta_por_curso={}, flap_min=3,
+                                  espinha=_SpyEspinha())
+    ex = FakeExecutor({C1: "a"})
+    passada = athena_local._passada_local_fn(ex, _prog({C1: (0, 18)}), FakeVoz(), estado,
+                                             projeto_nome="t", disjuntor=disj, agora=1000.0)
+    passada(C1)
+    assert disj.falhas == [], st
+    assert alertas.mortes == []
+    assert "disj_falhas" not in st
+    assert ex.disparos == ([C1] if redispara else []), st
+    assert ("cooldown_ate" in st) is (not redispara), st

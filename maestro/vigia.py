@@ -23,10 +23,17 @@ equivalente). O `exit_code` (código de saída REAL do processo, ex.: `proc.retu
 após `wait()`) é o sinal FORTE de morte; na sua ausência, sonda-se a liveness do PID
 (do lock ou da fonte). O stderr do filho é lido de um arquivo (`stderr_path`, onde o
 spawn tee'a o stderr) ou fornecido direto (`stderr_tail`).
+
+MORTE SÓ-DE-LOCK: a captura de uma encarnação ANTERIOR do loop (bounce do vigia externo,
+restart do launchd, reboot do Mac) não tem fonte — o Popen morreu com o loop que a
+disparou. O lock durável é a evidência; `stderr_path_de(conta)` devolve o .err da conta
+(o tail desta morte) e o mtime do lock contra o `kern.boottime` diz se ela nasceu antes do
+boot atual (`Obito.lock_antes_do_boot` — o reinício/desligamento do Mac a matou).
 """
 import glob
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, asdict, replace
 from datetime import datetime
@@ -39,6 +46,12 @@ _AUTOPSIA_DIR_PADRAO = os.path.join(
 _JANELA_FLAP_S = 30 * 60          # 30 min — a janela do flapping
 _FLAP_MIN = 3                     # >= 3 mortes na janela = flapping
 _STDERR_LINHAS = 40              # quantas linhas de tail do stderr guardar
+# Folga entre o .err e o lock do MESMO disparo. O `_spawn_popen` TRUNCA o .err da conta
+# ("wb") logo ANTES do Popen e o lock com o PID é gravado logo DEPOIS — o .err de um
+# disparo nunca é mais velho que o lock dele além do tempo do Popen. Um .err mais velho
+# que isso é de um run ANTERIOR (o tee falhou neste disparo e caiu no DEVNULL): não é a
+# evidência desta morte e não entra na autópsia.
+_ERR_FOLGA_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -87,6 +100,15 @@ class Obito:
     ts: str = ""                 # ISO-8601 do momento da autópsia
     saida_limpa: bool = False    # exit_code == 0: encerrou LIMPO, NÃO é morte
     autopsia_path: str = ""      # JSON gravado desta morte (p/ anotar a causa depois)
+    # MORTE SÓ-DE-LOCK (detectada pelo PID morto do lock durável, sem exit_code: a
+    # captura foi disparada por uma encarnação ANTERIOR do loop, que levou o Popen
+    # junto). `lock_mtime` = quando o lock foi gravado (= o disparo); `boot_ts` = o
+    # kern.boottime do Mac. `lock_antes_do_boot` => a captura nasceu ANTES do boot
+    # atual: nenhum processo atravessa um reboot, então ela morreu (no máximo) no
+    # reinício/desligamento do Mac. None/False em qualquer outra morte.
+    lock_mtime: Optional[float] = None
+    boot_ts: Optional[float] = None
+    lock_antes_do_boot: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -139,8 +161,10 @@ def _coerce_fonte(fonte) -> FonteFilho:
 
 
 def _ler_locks(lock_dir) -> dict:
-    """Varre lock_dir e devolve {conta: {pid, course_url}} do CONTEÚDO de cada .lock
-    (o nome do arquivo é hash de mão-única da conta; a conta legível está no conteúdo)."""
+    """Varre lock_dir e devolve {conta: {pid, course_url, ..., _mtime}} do CONTEÚDO de
+    cada .lock (o nome do arquivo é hash de mão-única da conta; a conta legível está no
+    conteúdo). `_mtime` = mtime do arquivo (a hora do disparo; o lock não é regravado
+    durante a captura) — None se o stat falhar."""
     out = {}
     if not lock_dir or not os.path.isdir(lock_dir):
         return out
@@ -150,10 +174,47 @@ def _ler_locks(lock_dir) -> dict:
                 data = json.load(f)
         except (OSError, ValueError):
             continue                     # lock corrompido/ilegível: ignora (não trava)
+        if not isinstance(data, dict):
+            continue
         conta = data.get("conta")
         if conta is not None:
+            try:
+                data["_mtime"] = os.path.getmtime(path)
+            except OSError:
+                data["_mtime"] = None
             out[str(conta)] = data
     return out
+
+
+# --------------------------------------------------------------------------
+# boot do Mac — `sysctl kern.boottime` (a morte só-de-lock ANTERIOR ao boot é o reinício)
+# --------------------------------------------------------------------------
+_BOOT_TS_CACHE = []                  # [epoch] após a 1ª leitura BEM-SUCEDIDA (o boot não
+                                     # muda durante a vida do processo do loop)
+_RE_BOOTTIME = re.compile(r"sec\s*=\s*(\d+)(?:\s*,\s*usec\s*=\s*(\d+))?")
+
+
+def boot_ts_do_mac():
+    """Epoch (s) do boot ATUAL do Mac, lido de `sysctl -n kern.boottime` ("{ sec = N,
+    usec = M } <data>"). None se indisponível (não-macOS, sysctl ausente/erro) — e aí a
+    regra do reinício simplesmente não se aplica (fail-safe: cai no comportamento de
+    sempre). NÃO se estima por time.time()-monotonic(): no macOS o relógio monotônico
+    PARA durante o sono, e o boot estimado andaria para a frente a cada soneca."""
+    if _BOOT_TS_CACHE:
+        return _BOOT_TS_CACHE[0]
+    import subprocess
+    for exe in ("/usr/sbin/sysctl", "sysctl"):
+        try:
+            saida = subprocess.run([exe, "-n", "kern.boottime"], capture_output=True,
+                                   text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = _RE_BOOTTIME.search(saida or "")
+        if m:
+            valor = float(m.group(1)) + (float(m.group(2)) / 1e6 if m.group(2) else 0.0)
+            _BOOT_TS_CACHE.append(valor)
+            return valor
+    return None
 
 
 def _stderr_tail(fonte: FonteFilho, n_linhas: int) -> str:
@@ -196,6 +257,9 @@ def _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) -> int:
             continue
         if rec.get("saida_limpa") or rec.get("exit_code") == 0:
             continue                      # saída limpa não é morte -> não conta flap
+        if rec.get("sem_falha"):
+            continue                      # anotada pela causa como SEM FALHA da captura
+                                          # (reinício do Mac / órfã que saiu limpa)
         ts = rec.get("ts_epoch")
         if isinstance(ts, (int, float)) and limite <= ts <= agora:
             n += 1
@@ -226,9 +290,28 @@ def _gravar_autopsia(autopsia_dir, obito: Obito, ts_epoch: float, detectado_por:
 # --------------------------------------------------------------------------
 # a autópsia
 # --------------------------------------------------------------------------
+def _err_desta_morte(stderr_path_de, conta, lock_mtime):
+    """O .err da conta (onde o `_spawn_popen` tee'a o motor) SE ele é do MESMO disparo do
+    lock — senão None. O .err é TRUNCADO a cada disparo da conta e o lock é regravado no
+    mesmo disparo, então enquanto o lock morto está no disco o .err ainda é o do run que
+    morreu (a autópsia roda ANTES da passada que re-dispara e trunca). A única forma de
+    ele ser de OUTRO run é ser mais VELHO que o lock (tee falhou no disparo): descartado.
+    Best-effort: qualquer erro => None (a morte segue sem stderr, como antes)."""
+    try:
+        path = stderr_path_de(conta)
+        if not path:
+            return None
+        err_mtime = os.path.getmtime(path)
+    except Exception:
+        return None
+    if lock_mtime is None or err_mtime < lock_mtime - _ERR_FOLGA_S:
+        return None
+    return path
+
+
 def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
              autopsia_dir=None, janela_s=_JANELA_FLAP_S, flap_min=_FLAP_MIN,
-             stderr_linhas=_STDERR_LINHAS):
+             stderr_linhas=_STDERR_LINHAS, stderr_path_de=None, boot_ts=None):
     """Detecta filhos MORTOS cruzando os locks em `lock_dir` com `stderr_por_conta`
     (conta -> FonteFilho|dict|Popen|path). Grava uma autópsia por morte em `autopsia_dir`
     e devolve a lista de `Obito` (uma por conta morta), com o flap da janela preenchido.
@@ -236,11 +319,27 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
     `flap_min` não filtra nada aqui — todas as mortes são reportadas; `flap_min` é só a
     referência que a causa/never-stop usa para decidir que a conta está flapando. O VIGIA
     devolve o NÚMERO (`flaps_na_janela`); quem interpreta o limiar é o chamador.
+
+    MORTE SÓ-DE-LOCK (PID do lock morto, sem exit_code — captura de uma encarnação
+    ANTERIOR do loop, cujo Popen se perdeu com ela; o `drenar_obitos` só conhece os
+    filhos da encarnação atual):
+      - `stderr_path_de(conta) -> path` (o `LocalExecutor._stderr_path`): a autópsia lê
+        o .err da conta — sem ele a cauda era VAZIA e toda morte dessas virava "causa
+        desconhecida (fail-closed)". Só se o .err for do mesmo disparo do lock
+        (ver `_err_desta_morte`).
+      - `boot_ts` (epoch do boot do Mac; None => `boot_ts_do_mac()`, lido só se houver
+        morte assim): lock gravado ANTES do boot => `Obito.lock_antes_do_boot`.
     """
     pid_vivo = pid_vivo or _pid_vivo
     agora = time.time() if agora is None else agora
     autopsia_dir = autopsia_dir or _AUTOPSIA_DIR_PADRAO
     stderr_por_conta = stderr_por_conta or {}
+    boot = {"ts": boot_ts, "lido": boot_ts is not None}
+
+    def _boot():
+        if not boot["lido"]:
+            boot["ts"], boot["lido"] = boot_ts_do_mac(), True
+        return boot["ts"]
 
     locks = _ler_locks(lock_dir)
     contas = set(locks) | set(str(c) for c in stderr_por_conta)
@@ -263,6 +362,21 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
             # (fail-safe — nunca inventar um óbito que dispara escalonamento à toa).
             continue
 
+        lock_mtime = boot_do_mac = None
+        lock_antes_do_boot = False
+        if detectado_por == "pid" and lock is not None:
+            lock_mtime = lock.get("_mtime")
+            if lock_mtime is None and isinstance(lock.get("ts"), (int, float)):
+                lock_mtime = float(lock["ts"])
+            if (stderr_path_de is not None and fonte.stderr_tail is None
+                    and not fonte.stderr_path):
+                err_path = _err_desta_morte(stderr_path_de, conta, lock_mtime)
+                if err_path:
+                    fonte = replace(fonte, stderr_path=err_path)
+            boot_do_mac = _boot()
+            lock_antes_do_boot = (lock_mtime is not None and boot_do_mac is not None
+                                  and lock_mtime < boot_do_mac)
+
         curso = fonte.curso or (lock.get("course_url") if lock else "") or ""
         stderr_tail = _stderr_tail(fonte, stderr_linhas)
         ts_iso = datetime.fromtimestamp(agora).isoformat()
@@ -283,7 +397,9 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
 
         flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) + 1
         obito = Obito(conta=conta, curso=curso, exit_code=fonte.exit_code,
-                      stderr_tail=stderr_tail, flaps_na_janela=flaps, ts=ts_iso)
+                      stderr_tail=stderr_tail, flaps_na_janela=flaps, ts=ts_iso,
+                      lock_mtime=lock_mtime, boot_ts=boot_do_mac,
+                      lock_antes_do_boot=lock_antes_do_boot)
         path = _gravar_autopsia(autopsia_dir, obito, ts_epoch=agora,
                                 detectado_por=detectado_por)
         # O Obito devolvido CARREGA o path da autópsia gravada — é o gancho para o

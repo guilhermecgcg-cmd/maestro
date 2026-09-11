@@ -37,10 +37,12 @@ PENDENTE / o que ficou por LIGAR (honesto):
   - `total_esperado` (denominador da completude) vem do YAML; sem ele (0) o owner nunca
     conclui (fail-closed). Não há oráculo local de quantas aulas o curso tem.
   - AUTO-INGEST/SINTETIZADOR pós-captura (esteira downstream) não roda aqui.
-  - STDERR na autópsia: o `_spawn_popen` default manda stderr→DEVNULL, então a causa-raiz
-    doméstica classifica pelo EXIT_CODE (forte). Assinaturas de sessão/token no stderr só
-    ficam disponíveis com um spawn que tee'a o stderr por conta — costura pronta para
-    recebê-lo (o vigia lê `stderr_tail`/`stderr_path`), mas o tee ainda não está ligado.
+  - STDERR na autópsia: o `_spawn_popen` tee'a stdout+stderr do motor por CONTA em
+    ~/.athena-local/motor-logs/<hash>.err (truncado a cada disparo). O filho DESTA
+    encarnação chega à autópsia com exit_code + stderr_path; a morte SÓ-DE-LOCK (captura
+    de uma encarnação anterior, sem exit code) lê o mesmo .err via `stderr_path_de`. O
+    exit code de uma órfã continua NÃO observável: a causa só a dá por limpa pelo resumo
+    final do motor na cauda, e por morta no reinício do Mac pelo lock anterior ao boot.
 """
 import asyncio
 import json
@@ -246,9 +248,30 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     # MORTE REAL abaixo — anti-ban intacto (uma sessão morta que saiu 0 ainda escala). Aqui
     # NÃO se conta flap, NÃO se escala, NÃO se avança o backoff, NÃO se marca _morte_ciclo:
     # a passada decide cooldown/conclusão pela completude/avanço no Notion.
-    if getattr(obito, "exit_code", None) == 0 and acao == "aguardar_backoff":
+    # A captura ÓRFÃ que terminou LIMPA (causa: `sem_falha` + aguardar_backoff — exit
+    # code não observável, a cauda do .err termina no resumo final do motor) recebe o
+    # MESMO tratamento: se esta encarnação a tinha em CAPTURANDO ("ja_capturando" no
+    # disparo), a passada arma o cooldown de concluído como num exit 0 real.
+    sem_falha = bool(getattr(decisao, "sem_falha", False))
+    if ((getattr(obito, "exit_code", None) == 0 or sem_falha)
+            and acao == "aguardar_backoff"):
         st["_saida_limpa_ciclo"] = agora
         st.pop("exit5_seguidas", None)   # um run limpo prova a sonda sã: zera o bench
+        return
+
+    # MORTE SEM FALHA da captura (causa: `sem_falha` — reinício/desligamento do Mac
+    # matou uma captura disparada ANTES do boot, sem outra causa na cauda): NÃO conta
+    # falha no disjuntor, NÃO alerta (nem o essencial, nem o de flap — e o vigia não a
+    # conta no flap das próximas) e o curso volta a NOVO: a passada re-avalia e
+    # re-dispara sob o gate de sempre (never-stop). Voltar a NOVO também tira o curso do
+    # FALLBACK de morte da passada (que só age em CAPTURANDO) — senão ele contaria a
+    # falha que esta decisão acabou de NÃO contar.
+    if sem_falha:
+        _registrar(espinha, f"relanço {curso} sem contar falha",
+                   motivo_causa or "morte sem falha da captura", reversivel=True,
+                   curso=curso, plataforma=plat, fonte=fonte_causa,
+                   origem="athena-local/causa")
+        st["fase"] = FASE_NOVO
         return
 
     # MORTE REAL (não é saída limpa): um cooldown de 'concluído' herdado de um run limpo
@@ -412,6 +435,9 @@ def _anotar_causa_na_autopsia(obito, decisao, plataforma):
         rec["detalhe"] = motivo
         rec["fonte"] = getattr(decisao, "fonte", "") or ""
         rec["plataforma"] = plataforma
+        # morte SEM FALHA da captura (reinício do Mac / órfã que saiu limpa): o vigia
+        # NÃO a conta no flap das próximas mortes desta conta.
+        rec["sem_falha"] = bool(getattr(decisao, "sem_falha", False))
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(rec, f, ensure_ascii=False, indent=2)
@@ -421,11 +447,17 @@ def _anotar_causa_na_autopsia(obito, decisao, plataforma):
 
 
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
-                     autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None):
+                     autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None,
+                     boot_ts=None):
     """Passe de AUTÓPSIA do ciclo: drena os óbitos do executor, roda o vigia (que também
     varre `lock_dir` por mortes de encarnações anteriores), classifica cada óbito pela
     causa-raiz e aplica a decisão ao `st` do curso. Best-effort: um erro aqui NÃO derruba
-    o ciclo (a passada ainda tem o fallback de morte)."""
+    o ciclo (a passada ainda tem o fallback de morte).
+
+    Morte SÓ-DE-LOCK (captura de encarnação anterior; o `drenar_obitos` só conhece os
+    filhos DESTA): o vigia recebe `stderr_path_de` = `executor._stderr_path` (o .err da
+    conta, que o `_spawn_popen` trunca a cada disparo — por isso a autópsia roda ANTES
+    da passada que re-dispara) e `boot_ts` (None => o vigia lê o kern.boottime)."""
     stderr_por_conta = {}
     drenar = getattr(executor, "drenar_obitos", None)
     if callable(drenar):
@@ -433,9 +465,15 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
             stderr_por_conta = drenar() or {}
         except Exception:
             stderr_por_conta = {}
+    extra = {}
+    stderr_path_de = getattr(executor, "_stderr_path", None)
+    if callable(stderr_path_de):
+        extra["stderr_path_de"] = stderr_path_de
+    if boot_ts is not None:
+        extra["boot_ts"] = boot_ts
     try:
         obitos = vigia.autopsia(lock_dir, stderr_por_conta, agora=agora,
-                                autopsia_dir=autopsia_dir, flap_min=flap_min)
+                                autopsia_dir=autopsia_dir, flap_min=flap_min, **extra)
     except Exception:
         obitos = []
     espinha = espinha or _EspinhaNula()
@@ -1303,7 +1341,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
                 sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                pulsar=None):
+                pulsar=None, boot_ts=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -1380,7 +1418,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     _autopsiar_ciclo(executor, estado, vigia=vigia, causa=causa, disjuntor=disjuntor,
                      alertas=alertas, lock_dir=lock_dir, autopsia_dir=autopsia_dir,
                      agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min,
-                     llm=llm, espinha=espinha)
+                     llm=llm, espinha=espinha, boot_ts=boot_ts)
 
     # (4) passada LOCAL + owner.
     passada_do_curso = _passada_local_fn(executor, progresso_cached, voz, estado,
@@ -1467,7 +1505,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 llm=None, espinha=None, sistemas=None, sistema_executor=None,
                 causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                reaper_fn=None):
+                reaper_fn=None, boot_ts=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). O PULSO
     é gravado no BOOT, em cada fase/curso do ciclo, no fim do ciclo e a cada fatia da espera
@@ -1550,7 +1588,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         estado_sistemas=estado_sistemas, sistema_lock_dir=sistema_lock_dir,
                         sistema_autopsia_dir=sistema_autopsia_dir,
                         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
-                        pendencia_fn=pendencia_fn, pulsar=_bater)
+                        pendencia_fn=pendencia_fn, pulsar=_bater, boot_ts=boot_ts)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"

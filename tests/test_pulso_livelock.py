@@ -398,3 +398,205 @@ def test_pulsar_que_levanta_nao_derruba_o_ciclo():
     athena_local.ciclo_local([_curso(C1)], ex, lambda c: (0, 18), FakeVoz(), {}, {},
                              agora=1000.0, pulsar=pulsar_quebrado)
     assert ex.disparos == [C1]
+
+
+# ==========================================================================
+# RUÍDO PÓS-REBOOT / PÓS-BOUNCE (item 1 da rodada 3). Com o boot preservando o lock de
+# PID morto (item acima), CADA captura de uma encarnação anterior vira autópsia
+# detectado_por=pid, exit_code None — e, sem o .err, com stderr VAZIO: alerta ESSENCIAL
+# "causa desconhecida (fail-closed)" + backoff do disjuntor, um por conta que capturava
+# (9 autópsias reais assim em ~/.athena-local/autopsias). Tudo REAL aqui: LocalExecutor
+# (lock_dir e motor_log_dir em tmp), vigia, causa e o módulo disjuntor; o spawn é um
+# dublê que TRUNCA o .err da conta como o `_spawn_popen` real ("wb" antes do Popen) —
+# prova de que a autópsia lê a cauda ANTES do re-disparo apagá-la. O boot é injetado.
+# ==========================================================================
+from maestro import disjuntor as _disjuntor_real  # noqa: E402
+
+
+class _SpawnQueTrunca:
+    """Dublê do `_spawn_popen`: trunca o .err da conta (como o real) e devolve um
+    processo 'vivo' (o PID do próprio pytest — os.kill(pid, 0) real diz vivo)."""
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, cmd, *, env, cwd):
+        err = env.get(captura._ENV_STDERR_TEE)
+        if err:
+            os.makedirs(os.path.dirname(err), exist_ok=True)
+            open(err, "wb").close()
+        self.calls.append(cmd)
+        return SimpleNamespace(pid=os.getpid(), returncode=None, poll=lambda: None)
+
+
+class _AlertasEspiao:
+    def __init__(self):
+        self.mortes = []
+
+    def captura_morreu(self, plataforma, motivo, **kw):
+        self.mortes.append((motivo, kw))
+
+    def sessao_expirada(self, plataforma, **kw):
+        self.mortes.append(("SESSAO", kw))
+
+    def curso_concluido(self, *a, **kw):
+        pass
+
+    def essenciais(self):
+        return [m for m in self.mortes if m[1].get("essencial") or m[0] == "SESSAO"]
+
+
+class _DisjuntorEspiao:
+    """O módulo disjuntor REAL, com as falhas registradas contadas."""
+    def __init__(self):
+        self.falhas = []
+
+    def pode_tentar(self, st, agora):
+        return _disjuntor_real.pode_tentar(st, agora)
+
+    def registrar_falha(self, st, agora):
+        self.falhas.append(agora)
+        _disjuntor_real.registrar_falha(st, agora)
+
+    def registrar_sucesso(self, st):
+        _disjuntor_real.registrar_sucesso(st)
+
+
+def _orfa_da_encarnacao_anterior(tmp_path, cursos, conta, curso, *, err, quando):
+    """A encarnação ANTERIOR disparou `curso` (lock durável com o PID) e o motor tee'ou
+    `err` no .err da conta; tudo com mtime `quando`. Depois o processo sumiu."""
+    ant = _executor_local(cursos, tmp_path)
+    ant._escrever_lock(conta, curso, _PID_MORTO)
+    os.utime(ant._lock_path(conta), (quando, quando))
+    if err is not None:
+        path = ant._stderr_path(conta)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(err)
+        os.utime(path, (quando + 30, quando + 30))
+    return ant._stderr_path(conta)
+
+
+def _rodar_pos_boot(cursos, tmp_path, *, boot_ts, spawn):
+    from maestro import causa, vigia
+    alertas, disj = _AlertasEspiao(), _DisjuntorEspiao()
+    novo = _executor_local(cursos, tmp_path, spawn=spawn)
+    asyncio.run(athena_local.rodar(
+        cursos, novo, lambda c: (0, 18), FakeVoz(), sleep=_noop_sleep, max_iters=1,
+        intervalo_s=0.0, pulso_path=str(tmp_path / "pulso.json"), vigia=vigia, causa=causa,
+        disjuntor=disj, alertas=alertas, lock_dir=str(tmp_path / "locks"),
+        autopsia_dir=str(tmp_path / "aut"), boot_ts=boot_ts))
+    [aut] = _autopsias_em(tmp_path / "aut")
+    return aut, alertas, disj
+
+
+_CAUDA_NO_MEIO_DO_RUN = (
+    "2026-09-04 08:59:40,120 INFO motor.stoa.pipeline: aula 7/21 — baixando áudio\n"
+    "2026-09-04 08:59:58,441 INFO httpx: HTTP Request: POST https://api.groq.com/openai/v1/"
+    "audio/transcriptions \"HTTP/1.1 200 OK\"\n")
+
+
+def test_reboot_captura_anterior_ao_boot_relanca_sem_alerta_e_sem_falha(tmp_path):
+    # O Mac desligou no meio da captura (cauda parada no meio do run) e o loop subiu no
+    # boot seguinte. DENTES (item 1b): antes -> "causa desconhecida (fail-closed)"
+    # ESSENCIAL + registrar_falha no disjuntor. Agora: relancar SEM alerta e SEM falha,
+    # e o curso é re-disparado no MESMO ciclo (never-stop).
+    cursos = [_curso(C1, conta="a")]
+    boot = time.time() - 600
+    err = _orfa_da_encarnacao_anterior(tmp_path, cursos, "a", C1, err=_CAUDA_NO_MEIO_DO_RUN,
+                                       quando=boot - 3600)
+    spawn = _SpawnQueTrunca()
+    aut, alertas, disj = _rodar_pos_boot(cursos, tmp_path, boot_ts=boot, spawn=spawn)
+    assert aut["detectado_por"] == "pid" and aut["exit_code"] is None
+    assert aut["lock_antes_do_boot"] is True
+    assert aut["acao"] == "relancar" and aut["sem_falha"] is True, aut
+    assert aut["motivo"].startswith("reinício/desligamento do Mac"), aut
+    assert "aula 7/21" in aut["stderr_tail"]              # item 1a: a cauda do .err chegou
+    assert alertas.essenciais() == [], alertas.mortes     # nenhum ping ao dono
+    assert alertas.mortes == []                            # nem o só-log de "MORREU"/flap
+    assert disj.falhas == []                               # sem backoff
+    assert len(spawn.calls) == 1                           # re-disparado no mesmo ciclo
+    assert open(err).read() == ""                          # ...que truncou o .err (depois)
+
+
+def test_orfa_pos_bounce_que_saiu_limpa_nao_e_morte(tmp_path):
+    # O caso REAL das 9 autópsias (bounces do vigia em 07/08, 19/08, 23/08 — nenhum
+    # reboot nessas datas): a captura sobreviveu ao loop (start_new_session), terminou
+    # LIMPA e o loop novo achou o lock com PID morto. DENTES: antes -> alerta ESSENCIAL
+    # "MORREU ... causa desconhecida" + falha no disjuntor.
+    from tests.test_causa import _CAUDA_LIMPA_STOA
+    cursos = [_curso(C1, conta="a")]
+    boot = time.time() - 30 * 86400                        # Mac de pé há 30 dias
+    _orfa_da_encarnacao_anterior(tmp_path, cursos, "a", C1, err=_CAUDA_LIMPA_STOA,
+                                 quando=time.time() - 7200)
+    aut, alertas, disj = _rodar_pos_boot(cursos, tmp_path, boot_ts=boot,
+                                         spawn=_SpawnQueTrunca())
+    assert aut["lock_antes_do_boot"] is False
+    assert aut["acao"] == "aguardar_backoff" and aut["sem_falha"] is True, aut
+    assert "saída limpa de captura órfã" in aut["motivo"], aut
+    assert alertas.mortes == [] and disj.falhas == []
+
+
+def test_orfa_pos_bounce_que_crashou_e_classificada_pela_cauda_do_err(tmp_path):
+    # DENTES (item 1a): uma órfã que MORREU de verdade (timeout real do page.goto) agora
+    # é classificada pela cauda do .err (relancar, falha contada, sem alerta essencial)
+    # em vez do cego "causa desconhecida" ESSENCIAL.
+    from tests.test_causa import _STDERR_MEMBERKIT_TIMEOUT_GOTO
+    cursos = [_curso(C1, conta="a")]
+    _orfa_da_encarnacao_anterior(tmp_path, cursos, "a", C1,
+                                 err=_STDERR_MEMBERKIT_TIMEOUT_GOTO,
+                                 quando=time.time() - 7200)
+    aut, alertas, disj = _rodar_pos_boot(cursos, tmp_path, boot_ts=time.time() - 86400,
+                                         spawn=_SpawnQueTrunca())
+    assert aut["acao"] == "relancar" and aut["sem_falha"] is False, aut
+    assert "timeout" in aut["motivo"], aut
+    assert alertas.essenciais() == [] and len(disj.falhas) == 1
+
+
+def test_orfa_pos_boot_sem_cauda_segue_escalando_o_dono(tmp_path):
+    # Contraprova (honestidade): sem .err e com o lock DEPOIS do boot, nada explica a
+    # morte — segue fail-closed (alerta essencial + falha), como antes.
+    cursos = [_curso(C1, conta="a")]
+    _orfa_da_encarnacao_anterior(tmp_path, cursos, "a", C1, err=None,
+                                 quando=time.time() - 7200)
+    aut, alertas, disj = _rodar_pos_boot(cursos, tmp_path, boot_ts=time.time() - 86400,
+                                         spawn=_SpawnQueTrunca())
+    assert aut["acao"] == "escalar_humano" and aut["fonte"] == "fail-closed", aut
+    assert len(alertas.essenciais()) == 1 and len(disj.falhas) == 1
+
+
+def test_orfa_de_verdade_subprocesso_real_que_saiu_limpa_nao_alerta_nem_conta_falha(tmp_path):
+    # PONTA A PONTA SEM DUBLÊ no caminho da evidência: a encarnação A dispara um motor
+    # de verdade pelo `_spawn_popen` REAL (subprocesso python, tee REAL no .err da conta,
+    # start_new_session) e morre sem drenar (o motor sai 0 imprimindo o resumo). A
+    # encarnação B sobe e roda 1 ciclo com vigia/causa/disjuntor REAIS e o boot REAL do
+    # Mac (sysctl, não injetado). Antes do item 1 (conferido rodando este cenário contra
+    # o HEAD anterior): 'causa desconhecida (fail-closed)' ESSENCIAL + falha no disjuntor.
+    import sys
+    from maestro import causa, vigia
+    motor = tmp_path / "motor"
+    (motor / "motor").mkdir(parents=True)
+    (motor / "motor" / "__init__.py").write_text("")
+    (motor / "motor" / "cli.py").write_text(
+        'print("2026-09-10 20:00:00,000 INFO motor.cli: sessão pronta (origem=state)")\n'
+        'print("Stats: total=2 ok=2 audio=0 falhou=0")\n')
+    cursos = [_curso(C1, conta="a")]
+    kw = dict(motor_python=sys.executable, motor_dir=str(motor),
+              lock_dir=str(tmp_path / "locks"), motor_log_dir=str(tmp_path / "logs"),
+              pendencias_fn=lambda u, d: None)
+    a = captura.LocalExecutor(cursos, **kw)                 # spawn = _spawn_popen REAL
+    a.disparar(C1)
+    a._procs[C1].wait(timeout=60)                           # o motor terminou; A 'morre'
+    assert a._procs[C1].returncode == 0
+    assert "Stats: total=2" in open(a._stderr_path("a")).read()    # o tee real gravou
+    assert os.listdir(tmp_path / "locks")                   # e o lock ficou (A não drenou)
+    alertas, disj = _AlertasEspiao(), _DisjuntorEspiao()
+    b = captura.LocalExecutor(cursos, spawn=_SpawnEspiao(), **kw)
+    asyncio.run(athena_local.rodar(
+        cursos, b, lambda c: (18, 18), FakeVoz(), sleep=_noop_sleep, max_iters=1,
+        intervalo_s=0.0, vigia=vigia, causa=causa, disjuntor=disj, alertas=alertas,
+        lock_dir=str(tmp_path / "locks"), autopsia_dir=str(tmp_path / "aut")))
+    [aut] = _autopsias_em(tmp_path / "aut")
+    assert aut["detectado_por"] == "pid" and aut["exit_code"] is None
+    assert aut["acao"] == "aguardar_backoff" and aut["sem_falha"] is True, aut
+    assert "Stats: total=2 ok=2 audio=0 falhou=0" in aut["motivo"], aut
+    assert alertas.mortes == [] and disj.falhas == []

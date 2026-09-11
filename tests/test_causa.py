@@ -865,3 +865,118 @@ def test_exit6_sem_stderr_ainda_e_nomeado():
     d = causa.classificar(_obito(exit_code=6, stderr=""))
     assert d.acao == "escalar_humano" and d.fonte == "deterministico", d
     assert d.motivo == "enumeração/completude fail-closed do adaptador: (stderr vazio)", d
+
+
+# --------------------------------------------------------------------------
+# MORTE SÓ-DE-LOCK (item 1 da rodada 3): captura disparada por uma encarnação ANTERIOR
+# do loop — o exit code se perdeu com o Popen dela (exit_code None, detectado pelo PID
+# morto do lock). A autópsia agora lê o .err da conta; a causa distingue:
+#   - cauda que termina no RESUMO FINAL do motor  -> saída limpa ÓRFÃ (sem falha)
+#   - lock anterior ao boot + cauda inconclusiva  -> reinício/desligamento do Mac (sem falha)
+#   - cauda conclusiva                             -> a assinatura dela, como sempre
+#   - nada disso (pós-boot, cauda muda)            -> desconhecida, fail-closed (como antes)
+# --------------------------------------------------------------------------
+def _orfa(stderr="", antes_do_boot=False):
+    return Obito(conta="stoa-principal", curso="https://educacao.stoa.com.br/",
+                 exit_code=None, stderr_tail=stderr, flaps_na_janela=1, ts="",
+                 lock_mtime=1000.0, boot_ts=2000.0 if antes_do_boot else 500.0,
+                 lock_antes_do_boot=antes_do_boot)
+
+
+# Caudas REAIS de runs LIMPOS (~/.athena-local/motor-logs, 10/09 — só o texto; o teste
+# não lê os arquivos vivos): o resumo final é a última linha que o CLI imprime antes de
+# sair 0.
+_CAUDA_LIMPA_STOA = (
+    "2026-09-10 17:27:55,656 INFO motor.stoa.pipeline: stoa curso stoa:educacao:13594: ok=0 audio=0 falhou=0 de 0\n"
+    "2026-09-10 17:27:55,656 INFO motor.stoa.pipeline: stoa curso stoa:educacao:12742: ok=0 audio=0 falhou=0 de 0\n"
+    "2026-09-10 17:28:32,585 INFO motor.stoa.pipeline: stoa curso stoa:educacao:30709: ok=0 audio=4 falhou=0 de 4\n"
+    "Stoa[audio]: cursos=21 total=4 ok=0 benigno=4 falhou=0\n"
+)
+_CAUDA_LIMPA_HOTMART = (
+    "2026-09-10 17:22:42,987 INFO motor.hotmart.session: sessão viva (state)\n"
+    "2026-09-10 17:22:43,933 INFO motor.hotmart.session: sessão persistida em .hotmart-session.json (151 cookies)\n"
+    "2026-09-10 17:22:43,933 INFO motor.cli: sessão pronta (origem=state)\n"
+    "2026-09-10 17:22:46,298 INFO motor.hotmart.enumerate: nome do curso capturado de page.title(): 'Treinamentos do Dailtinho' (bruto='Treinamentos do Dailtinho | Hotmart Club')\n"
+    "Stats: total=0 ok=0 audio=0 falhou=0\n"
+)
+
+
+@pytest.mark.parametrize("cauda,resumo", [
+    (_CAUDA_LIMPA_STOA, "Stoa[audio]: cursos=21 total=4 ok=0 benigno=4 falhou=0"),
+    (_CAUDA_LIMPA_HOTMART, "Stats: total=0 ok=0 audio=0 falhou=0"),
+    # o que pode vir DEPOIS do resumo num sucesso: 'Skills:' do Hotmart, aviso de
+    # teardown, e o ruído do asyncio (não é traceback).
+    (_CAUDA_LIMPA_HOTMART + "Skills: 3/4 geradas\n"
+     "2026-09-10 17:22:47,001 WARNING motor.cli: falha ao fechar o contexto: x\n"
+     + _RUIDO_ASYNCIO_ERR_ABORTED, "Stats: total=0 ok=0 audio=0 falhou=0"),
+    # timeout de aula (tratado e retentado) ANTES do resumo: segue limpa (gate `limpa`)
+    (_STDERR_MEMBERKIT_TIMEOUT_GOTO + "Memberkit: modulos=1 total=26 ok=25 sem_audio=0 falhou=1\n",
+     "Memberkit: modulos=1 total=26 ok=25 sem_audio=0 falhou=1"),
+], ids=["stoa-real", "hotmart-real", "hotmart-skills-teardown-ruido", "timeout-antes-do-resumo"])
+def test_orfa_que_termina_no_resumo_final_e_saida_limpa_sem_falha(cauda, resumo):
+    # DENTES: sem a regra, exit None + cauda limpa não bate em assinatura nenhuma e cai
+    # no fail-closed "causa desconhecida" (alerta ESSENCIAL "MORREU" + backoff) — o ruído
+    # das 9 autópsias detectado_por=pid reais (todas pós-bounce do loop pelo vigia).
+    d = causa.classificar(_orfa(cauda))
+    assert d.acao == "aguardar_backoff", d
+    assert d.fonte == "deterministico", d
+    assert d.sem_falha is True, d
+    assert "saída limpa de captura órfã" in d.motivo and resumo in d.motivo, d
+
+
+def test_resumo_com_traceback_depois_nao_e_saida_limpa():
+    # O resumo seguido de um traceback = o processo morreu DEPOIS (teardown): não se
+    # afirma saída limpa pela prosa.
+    d = causa.classificar(_orfa(_CAUDA_LIMPA_HOTMART + _TRACEBACK_KEYERROR_DURATION))
+    assert d.sem_falha is False and d.fonte == "fail-closed", d
+
+
+@pytest.mark.parametrize("code", [1, 4, -9])
+def test_exit_code_real_vence_o_resumo_da_cauda(code):
+    # A prosa NUNCA sobrepõe um exit code REAL: o resumo só decide quando o exit é
+    # desconhecido (morte só-de-lock).
+    d = causa.classificar(_obito(exit_code=code, stderr=_CAUDA_LIMPA_STOA))
+    assert d.sem_falha is False, d
+    assert "órfã" not in d.motivo, d
+
+
+@pytest.mark.parametrize("cauda", [
+    "",                                                     # tee vazio/ausente
+    "2026-09-10 03:10:01,000 INFO motor.stoa.pipeline: baixando aula 7/21\n",  # no meio do run
+    # o shutdown mata o Chrome antes do Python: TargetClosedError (8 autópsias reais)
+    'Traceback (most recent call last):\n'
+    '  File "/Users/guilhermerodrigues/teste/aula/motor/stoa/enumerate.py", line 254, in _content_at\n'
+    '    html = await page.content()\n'
+    'playwright._impl._errors.TargetClosedError: Page.content: Target page, context or '
+    'browser has been closed\n',
+], ids=["vazia", "meio-do-run", "target-closed"])
+def test_lock_antes_do_boot_sem_cauda_conclusiva_e_reinicio_do_mac(cauda):
+    # DENTES (item 1b): a captura nasceu ANTES do boot atual e a cauda não aponta outra
+    # causa -> o reinício/desligamento do Mac a matou: relancar SEM falha (sem alerta
+    # essencial, sem backoff). Sem a regra: fail-closed "causa desconhecida".
+    d = causa.classificar(_orfa(cauda, antes_do_boot=True))
+    assert d.acao == "relancar", d
+    assert d.fonte == "deterministico", d
+    assert d.sem_falha is True, d
+    assert d.motivo.startswith("reinício/desligamento do Mac"), d
+
+
+@pytest.mark.parametrize("cauda,acao", [
+    ("SESSÃO MORTA — LOGIN MANUAL NECESSÁRIO\n", "escalar_reseed"),   # a cauda DIZ a causa
+    (_STDERR_MEMBERKIT_TIMEOUT_GOTO, "relancar"),
+    (_STDERR_STOA_IO_SUSPENDED, "aguardar_backoff"),                 # o Mac dormiu antes
+], ids=["sessao-morta", "timeout", "io-suspended"])
+def test_lock_antes_do_boot_com_cauda_conclusiva_classifica_pela_cauda(cauda, acao):
+    # "sem stderr conclusivo" é condição da regra do reinício: quando a cauda nomeia a
+    # causa, ela vence — e aí é falha de verdade (conta no disjuntor como sempre).
+    d = causa.classificar(_orfa(cauda, antes_do_boot=True))
+    assert d.acao == acao and d.sem_falha is False, d
+    assert "reinício" not in d.motivo, d
+
+
+def test_lock_depois_do_boot_sem_cauda_segue_fail_closed():
+    # Contraprova: a regra do reinício é CONDICIONADA ao boot. Uma órfã pós-boot que
+    # morreu sem cauda nenhuma segue desconhecida (fail-closed, chama o dono).
+    d = causa.classificar(_orfa("", antes_do_boot=False))
+    assert d.acao == "escalar_humano" and d.fonte == "fail-closed", d
+    assert d.sem_falha is False, d

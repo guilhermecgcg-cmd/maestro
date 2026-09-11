@@ -22,7 +22,11 @@ INVIOLÁVEIS (o que, relaxado, quebra o projeto):
   - O resultado do zelo NÃO é óbito de captura: nada de autópsia, disjuntor, flap, bench.
   - Morte PROVADA (exit 3 + linha `morta`) => `aguardando-humano` e o zelador PARA de tocar
     na conta (zero navegação deslogada repetida) até o CARIMBO de um reseed humano ou uma
-    mudança de CONTEÚDO do arquivo de sessão feita por outro (M4, abaixo). Morte de
+    mudança de CONTEÚDO do arquivo de sessão feita por outro (M4, abaixo). Esse gatilho
+    humano só é CONSUMIDO por um desfecho CONCLUSIVO (viva ou morta): um zelo inconclusivo
+    (rede, 5xx, teto, watchdog, 5) deixa-o PENDENTE, e a nova tentativa respeita o backoff
+    — a ação do humano nunca se perde num blip, e nenhum blip dispara o zelo seguinte na
+    hora. Morte de
     plataforma com PROVA FRACA (Stoa, Alpaclass, Hubla) exige uma 2ª morte, >= 30 min
     depois. Na Stoa e na Alpaclass cada morte só conta com `prova: positiva` (a sonda
     TRI-ESTADO do zelo leu a tela/código de login; rede/5xx = inconclusivo): a confirmação
@@ -53,11 +57,23 @@ QUALQUER abertura (inclusive num zelo inconclusivo), então o mtime do perfil é
 zelador se lendo: cada zelo inconclusivo disparava o seguinte (4 zelos em 6 min, até o teto
 por hora). O gatilho é a IDENTIDADE (sha256 do conteúdo) do ARQUIVO DE SESSÃO — que só um
 login (reseed, `--reseed` avulso) ou uma sessão PROVADA viva (a captura de outro curso
-re-persistindo) reescrevem; o zelo que não prova viva nunca o grava. A identidade de
-referência é RELIDA depois de TODO zelo da conta aguardando (morta, inconclusiva, 5): nada
-que o próprio zelo tenha feito dispara o próximo. E a re-sonda respeita o espaçamento
-(`proximo_ts`: 30 min, 1 h, 2 h... até o intervalo) — um carimbo humano novo passa na
-frente.
+re-persistindo) reescrevem; o zelo que não prova viva nunca o grava. A re-sonda respeita o
+espaçamento (`proximo_ts`: 30 min, 1 h, 2 h... até o intervalo) — um carimbo humano novo
+passa na frente.
+
+O GATILHO HUMANO SÓ É CONSUMIDO POR DESFECHO CONCLUSIVO (achado bloqueante da revisão da
+rodada 10): o carimbo (`carimbo_visto`) e a identidade de referência (`ident_na_morte`) só
+andam num zelo que PROVOU algo — viva (sai do aguardando; o carimbo rearma a captura) ou
+morta (a referência passa a ser a identidade de DEPOIS do zelo: nada que ele tenha gravado
+dispara o próximo). Antes, o carimbo era consumido no DISPARO e a identidade relida depois
+de QUALQUER zelo: o humano relogava, o zelo urgente caía num inconclusivo passageiro, e a
+conta nunca mais era zelada (sem 2º zelo, sem alerta novo, captura travada — nem um restart
+resolvia, porque os dois são persistidos). Agora, num inconclusivo, 5 ou watchdog, o
+gatilho segue PENDENTE e a nova tentativa espera o `proximo_ts` que o desfecho gravou
+(backoff de 1 h, 2 h... até o intervalo; `ocupado_s` no perfil em uso): o carimbo JÁ
+TENTADO (`carimbo_tentado`, persistido) não fura mais o espaçamento — só um carimbo MAIS
+NOVO fura. O laço da rodada 8 (cada inconclusivo disparando o seguinte) fica fechado pelo
+espaçamento, sem descartar a ação humana.
 """
 import hashlib
 import json
@@ -139,7 +155,7 @@ _RE_EXCECAO = re.compile(r"[A-Z][A-Za-z0-9]{0,47}(Error|Exception|Timeout|Interr
 _T_PERSISTIDO = frozenset({
     "intervalo_s", "proximo_ts", "ultimo_zelo_ts", "provado_ts", "expira_ts",
     "expira_prova_ts", "primeira_morte_ts", "morte_ts", "ident_na_morte",
-    "ultima_captura_ts", "carimbo_visto",
+    "ultima_captura_ts", "carimbo_visto", "carimbo_tentado",
 })
 
 _H = 3600.0
@@ -697,6 +713,11 @@ class Zelador:
             st["detalhe"] = _detalhe_seguro(linha.get("detalhe"))
         exp = _num(linha.get("expira_em")) if resultado in (R_VIVA, R_MORTA) else None
         cfg = self.cfg
+        if resultado in (R_VIVA, R_MORTA):
+            # Só um desfecho CONCLUSIVO consome o login humano que este zelo tentou (o
+            # carimbo lido no disparo). Inconclusivo/5/watchdog: segue pendente (docstring).
+            t["carimbo_visto"] = max(_num(t.get("carimbo_visto")) or 0.0,
+                                     _num(t.get("carimbo_tentado")) or 0.0)
 
         if resultado == R_VIVA:
             estava = st["status"]
@@ -751,11 +772,13 @@ class Zelador:
                            plataforma=u.plataforma, fonte="deterministico")
             return
 
-        if st["status"] == AGUARDANDO:
-            # Achado bloqueante da rodada 8: o zelo que NÃO provou viva numa conta aguardando
-            # (inconclusivo, 5, watchdog, teto) também abriu o navegador — nada do que ele fez
-            # pode disparar o próximo. A referência é a identidade de DEPOIS dele.
-            t["ident_na_morte"] = self._identidade(u, executor)
+        # Conta aguardando e zelo que NÃO concluiu (inconclusivo, 5, watchdog, teto): a
+        # identidade de referência NÃO é relida. O gatilho que disparou este zelo (arquivo
+        # reescrito por um login, ou o carimbo) continua PENDENTE — relê-la aqui absorvia a
+        # identidade que o próprio humano gravou, e a conta nunca mais era zelada (achado
+        # bloqueante da revisão da rodada 10). O que impede o laço da rodada 8 (cada
+        # inconclusivo disparando o seguinte) é o `proximo_ts` abaixo, que `_candidata`
+        # respeita para a identidade nova E para o carimbo já tentado.
 
         if resultado in _RESULTADOS_5:
             espera = cfg.ocupado_s if resultado == R_OCUPADO else float(t["intervalo_s"])
@@ -884,9 +907,18 @@ class Zelador:
             return (False, False, 0, "zelando")
         carimbo = self._carimbo(u, executor)
         humano = carimbo > (_num(t.get("carimbo_visto")) or 0.0)
+        prox = _num(t.get("proximo_ts"))
+        # Carimbo JÁ TENTADO por um zelo que não concluiu (inconclusivo, 5, watchdog): segue
+        # pendente — só viva/morta o consome —, mas a nova tentativa respeita o backoff que
+        # aquele desfecho gravou; senão cada blip dispararia o zelo seguinte na hora (o laço
+        # da rodada 8). Um carimbo MAIS NOVO (o humano agiu de novo) fura o espaçamento.
+        humano_em_espera = (humano and carimbo <= (_num(t.get("carimbo_tentado")) or 0.0)
+                            and prox is not None and agora < prox)
         if st["status"] == AGUARDANDO:
-            if humano:
+            if humano and not humano_em_espera:
                 return (True, True, float(t.get("morte_ts") or 0), "")
+            if humano:
+                return (False, False, 0, "aguardando-espacamento")
             ident = self._identidade(u, executor)
             base = t.get("ident_na_morte")
             if not isinstance(base, int) or isinstance(base, bool):
@@ -894,15 +926,14 @@ class Zelador:
                 return (False, False, 0, "aguardando-humano")
             if ident == 0 or ident == base:
                 return (False, False, 0, "aguardando-humano")
-            prox = _num(t.get("proximo_ts"))
             if prox is not None and agora < prox:
                 return (False, False, 0, "aguardando-espacamento")
             return (True, True, float(t.get("morte_ts") or 0), "")
-        if humano:
+        if humano and not humano_em_espera:
             # login humano NOVO (carimbo do reseed): prova JÁ — é o zelo viva que rearma a
             # captura travada (M4); esperar o intervalo deixaria a captura parada horas.
+            # Já tentado sem desfecho: depois do backoff, idem (sem esperar a ociosidade).
             return (True, True, carimbo, "")
-        prox = _num(t.get("proximo_ts"))
         if prox is not None and agora < prox:
             return (False, False, 0, "agendada")
         ultima = _num(t.get("ultima_captura_ts"))
@@ -994,7 +1025,9 @@ class Zelador:
             self._url_do_zelo[u.chave] = meta.url
             t["ultimo_zelo_ts"] = agora
             t["proximo_ts"] = agora + self.cfg.adiar_s     # guarda: resultado perdido num restart
-            t["carimbo_visto"] = carimbo                   # este login humano já tem o seu zelo
+            # o login humano que ESTE zelo tenta: só um desfecho conclusivo o consome
+            # (`_aplicar` -> `carimbo_visto`); até lá ele segue pendente, sob backoff
+            t["carimbo_tentado"] = carimbo
             self._decisao[u.chave] = "zelando"
             break
         marcar("espera-outro-zelo")

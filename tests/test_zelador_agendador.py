@@ -1619,26 +1619,35 @@ def _aguardando_kiwify(tmp_path):
     (5, "inconclusiva", "SessionProbeInconclusiveError"),     # queda de rede / 5xx
     (5, "inconclusiva", "teto de tempo"),                     # teto próprio do motor
     (-15, None, ""),                                          # watchdog: TERM, sem linha
-    (5, "inconclusiva", "renovacao do app nao recusada"),     # a Alpaclass sem renovação
+    (5, "inconclusiva", "sem renovacao do app na sessao"),    # a Alpaclass sem o r5
+    (5, "ocupado", "perfil em uso"),                          # um --reseed avulso no perfil
 ])
-def test_aguardando_zelo_que_nao_prova_viva_nunca_dispara_o_proximo(tmp_path, code, resultado,
-                                                                    detalhe):
-    """O cenário do achado (reproduzido pelo revisor contra 020ca1a: 4 zelos em 6 min, até o
-    teto por hora): o arquivo foi reescrito por fora (1 re-sonda é o previsto), a re-sonda
-    cai num inconclusivo — e o Chrome dela mexeu no perfil. Nada mais pode sair sozinho."""
+def test_aguardando_zelo_que_nao_concluiu_nunca_dispara_o_proximo_na_hora_mas_o_gatilho_fica(
+        tmp_path, code, resultado, detalhe):
+    """O cenário da rodada 8 (reproduzido contra 020ca1a: 4 zelos em 6 min, até o teto por
+    hora): o arquivo foi reescrito por fora, a re-sonda cai num desfecho que NÃO concluiu — e
+    o Chrome dela mexeu no perfil. Nada disso dispara o próximo NA HORA. REESCRITO na rodada
+    11: a versão anterior exigia "nunca mais" — o bug do achado bloqueante (a reescrita foi um
+    login de verdade; a conta ficava aguardando para sempre). A re-sonda segue PENDENTE e sai
+    depois do espaçamento; só um desfecho conclusivo (aqui, morta) a consome."""
     sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
     sess.write_text('{"cookies": ["relogin-avulso"]}')       # alguém mexeu DE VERDADE
     t = T0 + 2 * H
     _passo(z, ex, t, alertas=al)
     assert len(ex.sp.zelos()) == 2
     ex.sp.terminar(1, code, resultado, detalhe=detalhe)       # o dublê mexe no perfil (+30 s)
-    for k in range(1, 7):                                     # 6 ciclos de 2 min
+    for k in range(1, 14):                                    # 26 min de ciclos de 2 min
         _passo(z, ex, t + 120 * k, alertas=al)
-    for dt in (2 * H, 5 * H, DIA, 3 * DIA):                   # e dias depois, passado o backoff
+    assert len(ex.sp.zelos()) == 2, z._decisao                # o laço da rodada 8 fechado
+    assert z._decisao["kiwify:kiwify-principal"] == "aguardando-espacamento"
+    _passo(z, ex, t + 13 * H, alertas=al)                     # passado o espaçamento
+    assert len(ex.sp.zelos()) == 3, ("o login nunca mais foi provado", z._decisao)
+    ex.sp.terminar(2, 3, "morta")                             # conclusivo: consome o gatilho
+    for dt in (13 * H + 120, 14 * H, 2 * DIA, 4 * DIA):
         _passo(z, ex, t + dt, alertas=al)
-    assert len(ex.sp.zelos()) == 2, z._decisao
+    assert len(ex.sp.zelos()) == 3, z._decisao
     assert z.estado["kiwify:kiwify-principal"]["status"] == "aguardando-humano"
-    assert z._decisao["kiwify:kiwify-principal"].startswith("aguardando")
+    assert z._decisao["kiwify:kiwify-principal"] == "aguardando-humano"
     assert len(al.logins) == 1
 
 
@@ -1653,19 +1662,46 @@ def test_aguardando_mtime_do_perfil_ou_do_arquivo_nunca_resonda(tmp_path):
     assert len(ex.sp.zelos()) == 1
 
 
-def test_aguardando_mesmo_se_o_zelo_regravasse_o_arquivo_nao_dispara_o_proximo(tmp_path):
-    """Defesa em profundidade: a referência é relida DEPOIS de todo zelo da conta aguardando —
-    se um motor um dia regravar o arquivo num desfecho que não é viva, isso não vira gatilho
-    (passado o backoff do inconclusivo, o zelo seguinte sairia sozinho)."""
+def test_aguardando_o_que_o_zelo_regravou_e_absorvido_na_morte(tmp_path):
+    """Defesa em profundidade: se um motor um dia regravar o arquivo num zelo que termina em
+    MORTE (conclusivo), a referência passa a ser a identidade de DEPOIS dele — o que o
+    próprio zelo gravou nunca dispara o próximo."""
     sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
     sess.write_text('{"cookies": ["relogin-avulso"]}')
     _passo(z, ex, T0 + 2 * H, alertas=al)
     assert len(ex.sp.zelos()) == 2
     sess.write_text('{"cookies": ["o proprio zelo regravou"]}')
-    ex.sp.terminar(1, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")
-    for dt in (2 * H + 60, 4 * H, 8 * H, 2 * DIA):
+    ex.sp.terminar(1, 3, "morta")
+    for dt in (2 * H + 60, 4 * H, 8 * H, 2 * DIA, 5 * DIA):
         _passo(z, ex, T0 + dt, alertas=al)
     assert len(ex.sp.zelos()) == 2
+
+
+def test_aguardando_inconclusivos_seguidos_resondam_so_sob_o_backoff(tmp_path):
+    """REESCRITO na rodada 11 (a versão anterior exigia que a ação humana fosse descartada
+    num inconclusivo): o gatilho segue pendente enquanto nada conclui, mas as re-sondas
+    saem ESPAÇADAS pelo backoff (1 h, 2 h, 4 h... até o intervalo) — mesmo que o próprio
+    zelo regrave o arquivo. Nunca uma por ciclo, nunca o teto por hora."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    sess.write_text('{"cookies": ["relogin-avulso"]}')
+    t = T0 + 2 * H
+    fim = t + 3 * DIA
+    while t < fim:
+        _passo(z, ex, t, alertas=al)
+        n = len(ex.sp.zelos())
+        if ex.sp.calls[n - 1]["proc"].poll() is None:
+            sess.write_text(json.dumps({"cookies": [f"o proprio zelo regravou {t}"]}))
+            ex.sp.terminar(n - 1, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")
+        t += 600
+    ts = [c["t"] for c in ex.sp.zelos()[1:]]
+    gaps = [b - a for a, b in zip(ts, ts[1:])]
+    assert len(ts) >= 3, ts                                   # segue pendente: re-sonda
+    assert all(g >= H for g in gaps), gaps                    # nunca na hora
+    assert gaps == sorted(gaps), gaps                         # backoff crescente
+    intervalo = z.estado["kiwify:kiwify-principal"]["_t"]["intervalo_s"]
+    # teto: o intervalo (+ 1 ciclo até a colheita + 1 ciclo de granulação do passo)
+    assert max(gaps) <= intervalo + 1200, (gaps, intervalo)
+    assert len(al.logins) == 1
 
 
 def test_aguardando_reescritas_seguidas_resondam_espacado(tmp_path):
@@ -1793,3 +1829,225 @@ def test_backoff_com_contador_enorme_nao_estoura_o_float(tmp_path):
         st = z.estado["kiwify:kiwify-principal"]
         assert st[campo] == 5001, (resultado, st[campo])      # o _aplicar foi até o fim
         assert st["_t"]["proximo_ts"] == T0 + 60 + st["_t"]["intervalo_s"], resultado
+
+
+# ==========================================================================================
+# RODADA 11 (o fecho do P7) — o GATILHO HUMANO só é consumido por desfecho CONCLUSIVO
+# (achado bloqueante da revisão da rodada 10: o carimbo era consumido no DISPARO e a
+# identidade relida depois de QUALQUER zelo — um blip no zelo urgente perdia o login humano)
+# ==========================================================================================
+@pytest.mark.parametrize("code,resultado,detalhe", [
+    (5, "inconclusiva", "SessionProbeInconclusiveError"),     # rede / 5xx
+    (5, "inconclusiva", "teto de tempo"),                     # teto próprio do motor
+    (-15, None, ""),                                          # watchdog: TERM, sem linha
+])
+def test_login_humano_seguido_de_inconclusivo_segue_pendente_sob_backoff_e_viva_rearma(
+        tmp_path, code, resultado, detalhe):
+    """O cenário do revisor (falhava 3/3 contra f5f2c76): conta aguardando com a captura
+    travada; o humano roda o reseed.py (arquivo reescrito + carimbo); o zelo urgente cai num
+    blip. O login NÃO se perde: a nova tentativa espera o backoff (nada na hora) e, viva,
+    rearma a captura."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - 10 * H, T0 - 2 * DIA)
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado, alertas=al)
+    ex.sp.terminar(0, 3, "morta")
+    _passo(z, ex, T0 + 60, estado=estado, alertas=al)
+    assert z.estado["kiwify:kiwify-principal"]["status"] == "aguardando-humano"
+    sess.write_text('{"cookies": ["login-humano"]}')
+    _carimbar(ex, "kiwify-principal", T0 + 3 * H)
+    t = T0 + 3 * H + 60
+    _passo(z, ex, t, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 2                            # urgente, na hora
+    ex.sp.terminar(1, code, resultado, detalhe=detalhe)       # o blip
+    for k in range(1, 26):                                    # 50 min de ciclos de 2 min
+        _passo(z, ex, t + 120 * k, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 2, z._decisao                # nunca na hora (rodada 8)
+    assert z._decisao["kiwify:kiwify-principal"] == "aguardando-espacamento"
+    _passo(z, ex, t + 2 * H, estado=estado, alertas=al)       # passado o backoff de 1 h
+    assert len(ex.sp.zelos()) == 3, ("o login humano nunca mais foi provado", z._decisao)
+    ex.sp.terminar(2, 0, "viva")
+    _passo(z, ex, t + 2 * H + 60, estado=estado, alertas=al)
+    assert z.estado["kiwify:kiwify-principal"]["status"] == "viva"
+    assert "irredutivel" not in estado[KIW]                  # M4: a captura rearmou
+    for dt in (3 * H, 4 * H):                                 # e o carimbo foi consumido
+        _passo(z, ex, t + dt, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 3
+
+
+def test_login_humano_nao_consumido_pelo_blip_sobrevive_ao_restart(tmp_path):
+    """O `carimbo_visto` é persistido: se o blip o consumisse, nem um restart traria o zelo
+    de volta (o achado). Agora o restart acha o carimbo PENDENTE (o `carimbo_tentado` e o
+    backoff também persistidos) e o prova depois do espaçamento."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - 10 * H, T0 - 2 * DIA)
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado, alertas=al)
+    ex.sp.terminar(0, 3, "morta")
+    _passo(z, ex, T0 + 60, estado=estado, alertas=al)
+    sess.write_text('{"cookies": ["login-humano"]}')
+    _carimbar(ex, "kiwify-principal", T0 + 3 * H)
+    _passo(z, ex, T0 + 3 * H + 60, estado=estado, alertas=al)
+    ex.sp.terminar(1, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")
+    _passo(z, ex, T0 + 3 * H + 120, estado=estado, alertas=al)
+    t = _status(tmp_path)["contas"][0]["_t"]
+    assert t["carimbo_tentado"] == T0 + 3 * H
+    assert (t.get("carimbo_visto") or 0) < T0 + 3 * H         # PENDENTE no disco
+    z2 = _zel(tmp_path, cursos)                               # restart do daemon
+    _passo(z2, ex, T0 + 3 * H + 600, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 2                            # o backoff sobreviveu também
+    _passo(z2, ex, T0 + 5 * H, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 3
+    ex.sp.terminar(2, 0, "viva")
+    _passo(z2, ex, T0 + 5 * H + 60, estado=estado, alertas=al)
+    assert "irredutivel" not in estado[KIW]
+
+
+def test_carimbo_mais_novo_fura_o_backoff_do_carimbo_ja_tentado(tmp_path):
+    """O humano agiu DE NOVO (outro reseed.py) enquanto o 1º carimbo esperava o backoff: o
+    carimbo novo é outra ação humana e passa na frente, como sempre passou."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - 10 * H, T0 - 2 * DIA)
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado, alertas=al)
+    ex.sp.terminar(0, 3, "morta")
+    _passo(z, ex, T0 + 60, estado=estado, alertas=al)
+    _carimbar(ex, "kiwify-principal", T0 + 3 * H)
+    _passo(z, ex, T0 + 3 * H + 60, estado=estado, alertas=al)
+    ex.sp.terminar(1, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")
+    _passo(z, ex, T0 + 3 * H + 120, estado=estado, alertas=al)
+    _passo(z, ex, T0 + 3 * H + 300, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 2                            # o 1º espera o backoff
+    _carimbar(ex, "kiwify-principal", T0 + 3 * H + 400)       # 2º reseed humano
+    _passo(z, ex, T0 + 3 * H + 460, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 3                            # na hora
+
+
+def test_login_humano_com_captura_de_outro_curso_ativa_nao_se_perde_no_blip(tmp_path):
+    """Conta NÃO aguardando (o zelador não viu a morte): um curso travou (latch), OUTRO curso
+    da conta segue capturando (conta nunca ociosa). O humano relogou (carimbo) e o zelo
+    urgente caiu num blip. Se o blip consumisse o carimbo, o zelo seguinte esperaria a conta
+    ficar ociosa — o que não acontece com a outra captura rodando — e o curso travado nunca
+    rearmaria. Pendente, ele volta depois do backoff, sem esperar a ociosidade."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - H, T0 - 2 * DIA)
+    KIW3 = "https://dashboard.kiwify.com.br/courses/terceiro"
+    cursos = cursos + [_c(KIW3, "kiwify-principal", "kiwify", str(sess))]
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _carimbar(ex, "kiwify-principal", T0 - 600)               # o humano relogou há 10 min
+    t = T0
+    _ocioso(ex, "kiwify-principal", t - 60)                   # KIW3 capturando agora
+    _passo(z, ex, t, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 1                            # urgente, apesar da captura
+    ex.sp.terminar(0, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")
+    while t < T0 + 3 * H:
+        t += 600
+        _ocioso(ex, "kiwify-principal", t - 60)               # a outra captura não para
+        _passo(z, ex, t, estado=estado, alertas=al)
+        n = len(ex.sp.zelos())
+        if n == 2 and ex.sp.calls[-1]["proc"].poll() is None:
+            ex.sp.terminar(len(ex.sp.calls) - 1, 0, "viva")
+    zelos = ex.sp.zelos()
+    assert len(zelos) == 2, ("o login humano nunca mais foi provado", z._decisao)
+    assert zelos[1]["t"] - zelos[0]["t"] >= H                 # depois do backoff
+    assert "irredutivel" not in estado[KIW]                  # e a captura travada rearmou
+
+
+def test_carimbo_e_consumido_pela_morte_provada(tmp_path):
+    """O outro desfecho conclusivo: o humano relogou, o zelo PROVOU morte (o login não
+    pegou). O carimbo foi respondido — não gera outro zelo (a conta volta ao aguardando e
+    ao alerta, sem martelar)."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    _carimbar(ex, "kiwify-principal", T0 + H)
+    _passo(z, ex, T0 + H + 60, alertas=al)
+    assert len(ex.sp.zelos()) == 2
+    ex.sp.terminar(1, 3, "morta")
+    for dt in (H + 120, 3 * H, 13 * H, 2 * DIA, 5 * DIA):
+        _passo(z, ex, T0 + dt, alertas=al)
+    assert len(ex.sp.zelos()) == 2, z._decisao
+    assert z._decisao["kiwify:kiwify-principal"] == "aguardando-humano"
+
+
+# --- lacunas de dente da revisão da rodada 10 (código correto; agora com observável) -------
+def test_aguardando_sem_referencia_de_identidade_nao_resonda_a_atual_vira_a_base(tmp_path):
+    """Status de uma versão sem `ident_na_morte` (ou referência perdida): a conta aguardando
+    NÃO é re-sondada por isso — sem base, a identidade atual vira a base. Só uma mudança
+    DEPOIS dela re-sonda."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    dados = _status(tmp_path)
+    dados["contas"][0]["_t"].pop("ident_na_morte")
+    (tmp_path / "sessoes-status.json").write_text(json.dumps(dados))
+    sess.write_text('{"cookies": ["mexido antes da referencia"]}')
+    z2 = _zel(tmp_path, [_c(KIW, "kiwify-principal", "kiwify", str(sess))])   # restart
+    for dt in (2 * H, 6 * H, DIA, 2 * DIA):
+        _passo(z2, ex, T0 + dt, alertas=al)
+    assert len(ex.sp.zelos()) == 1, z2._decisao
+    assert z2._decisao["kiwify:kiwify-principal"] == "aguardando-humano"
+    sess.write_text('{"cookies": ["login depois da referencia"]}')
+    _passo(z2, ex, T0 + 3 * DIA, alertas=al)
+    assert len(ex.sp.zelos()) == 2
+
+
+@pytest.mark.parametrize("some", ["apagado", "ilegivel"])
+def test_aguardando_arquivo_de_sessao_sumido_ou_ilegivel_nao_resonda(tmp_path, some):
+    """Identidade 0 (arquivo ausente/ilegível) nunca é "mudou": o motor sairia 5 sem navegar
+    (sem-sessao-salva), mas o zelador não spawna nada à toa numa conta dada como morta."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    if some == "apagado":
+        sess.unlink()
+    else:
+        sess.unlink()
+        sess.mkdir()                                          # open() -> IsADirectoryError
+    for dt in (2 * H, 6 * H, DIA, 3 * DIA):
+        _passo(z, ex, T0 + dt, alertas=al)
+    assert len(ex.sp.zelos()) == 1, z._decisao
+    assert z._decisao["kiwify:kiwify-principal"] == "aguardando-humano"
+
+
+def _lock_exclusivo_de_fora(ex, conta, dados):
+    """O que `motor/conta_lock.py` (o reseed.py) faz: temp COMPLETO + os.link (exclusivo)."""
+    path = ex._lock_path(conta)
+    tmp = path + ".de-fora.tmp"
+    with open(tmp, "w") as f:
+        json.dump(dados, f)
+    try:
+        os.link(tmp, path)
+    finally:
+        os.remove(tmp)
+
+
+@pytest.mark.parametrize("quem", ["a-conta", "a-parceira"])
+def test_reseed_que_pega_o_lock_na_janela_do_disparar_zelo_vence_sem_sobrescrita(tmp_path,
+                                                                                   quem):
+    """Lacuna (a) da rodada 10: entre o `contas_livres` ("sem lock") e a criação do lock do
+    zelo cabem o `_montar` e o `ps` do `_navegador_no_perfil`. O reseed.py (ou a sonda p102)
+    cria o lock NESSA janela — reproduzida DE VERDADE: ele entra de dentro do `comando_fn`
+    (o `ps` do PID do SingletonLock, aqui um PID reusado por outro processo). Com uma escrita
+    simples no lugar da criação EXCLUSIVA, o zelo sobrescreveria o lock do humano, limparia
+    o SingletonLock e abriria um 2º navegador na conta (ban)."""
+    sess = str(tmp_path / "aula" / ".memberkit-session.json")
+    cursos = [_c(MK_T, "memberkit-triade", "memberkit", sess),
+              _c(MK_E, "memberkit-empreender", "memberkit", sess)]
+    alvo = "memberkit-triade" if quem == "a-conta" else "memberkit-empreender"
+    externo = {"pid": 4343, "course_url": "reseed:memberkit", "conta": alvo,
+               "ts": T0, "dono": "reseed"}
+    box = {}
+
+    def ps(pid):                                  # a janela: o reseed entra AQUI
+        _lock_exclusivo_de_fora(box["ex"], alvo, externo)
+        return "/usr/sbin/outro-processo"          # PID reusado: não é o navegador do perfil
+
+    ex = _exec(tmp_path, cursos, comando_fn=ps)
+    box["ex"] = ex
+    ex.sp.mundo.procs[4242] = FakeProc()           # o PID do SingletonLock está VIVO
+    perfil = tmp_path / "aula" / ".chrome-profile-memberkit-triade"
+    perfil.mkdir(parents=True)
+    (perfil / "SingletonLock").symlink_to("host-4242")
+    with pytest.raises(captura.ContaOcupada):
+        ex.disparar_zelo("memberkit:memberkit-triade", cursos[0],
+                         parceiras=["memberkit-empreender"], agora=T0)
+    assert ex.sp.calls == []                                  # nenhum navegador
+    assert _lock(ex, alvo) == externo                         # o lock do humano INTACTO
+    outra = ({"memberkit-triade", "memberkit-empreender"} - {alvo}).pop()
+    assert not os.path.lexists(ex._lock_path(outra))          # o nosso foi desfeito
+    assert os.path.lexists(perfil / "SingletonLock")          # o perfil não foi mexido
+    assert sorted(os.listdir(tmp_path / "locks")) == [os.path.basename(ex._lock_path(alvo))]

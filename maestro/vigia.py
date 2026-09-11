@@ -162,11 +162,19 @@ def _coerce_fonte(fonte) -> FonteFilho:
     raise TypeError("fonte de stderr desconhecida: %r" % (type(fonte),))
 
 
+# M2 (P7): locks de quem NÃO é captura — o reseed humano (`scripts/reseed.py` do motor) e o
+# zelador de sessão. ESPELHO de `captura.DONOS_NAO_CAPTURA` (o vigia não importa o executor,
+# de propósito). Um reseed morto por SIGKILL, ou um zelo que terminou depois de um restart
+# do loop, deixa um lock de PID MORTO: lido como óbito, ele virava "morte de captura" (flap
+# +1, causa tirada do .err da ÚLTIMA captura, talvez até escalar_reseed). Não é: ignorado.
+_DONOS_NAO_CAPTURA = ("reseed", "zelador")
+
+
 def _ler_locks(lock_dir) -> dict:
     """Varre lock_dir e devolve {conta: {pid, course_url, ..., _mtime}} do CONTEÚDO de
     cada .lock (o nome do arquivo é hash de mão-única da conta; a conta legível está no
     conteúdo). `_mtime` = mtime do arquivo (a hora do disparo; o lock não é regravado
-    durante a captura) — None se o stat falhar."""
+    durante a captura) — None se o stat falhar. Locks de reseed/zelador (M2) ficam de fora."""
     out = {}
     if not lock_dir or not os.path.isdir(lock_dir):
         return out
@@ -178,6 +186,8 @@ def _ler_locks(lock_dir) -> dict:
             continue                     # lock corrompido/ilegível: ignora (não trava)
         if not isinstance(data, dict):
             continue
+        if data.get("dono") in _DONOS_NAO_CAPTURA:
+            continue                     # reseed/zelador: o fim deles não é óbito (M2)
         conta = data.get("conta")
         if conta is not None:
             try:

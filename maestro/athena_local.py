@@ -183,6 +183,12 @@ class _AlertasNulo:
     def maquina_sobrecarregada(self, motivo, **kw):
         return None
 
+    def logins_pendentes(self, alvos, comando, **kw):
+        return True                                        # sem canal: nada a re-tentar
+
+    def sessao_vence(self, alvo, quando, dias, comando, **kw):
+        return True
+
 
 class _EspinhaNula:
     """DEFAULT F4-a (espinha): SEM log de decisões — o comportamento pré-integração.
@@ -1441,7 +1447,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
                 sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                pulsar=None, boot_ts=None, estado_carga=None):
+                pulsar=None, boot_ts=None, estado_carga=None, zelador=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -1460,7 +1466,12 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
 
     `estado_carga` (dict cross-ciclo, criado 1x pelo `rodar`): episódio de sobrecarga do
     PORTÃO DE CARGA (ver `_avisar_adiamentos`). None => um dict local (sem escalada por
-    persistência entre chamadas avulsas)."""
+    persistência entre chamadas avulsas).
+
+    `zelador` (P7, `maestro.zelador.Zelador` | None — DESLIGADO por padrão, ligado só por
+    ATHENA_ZELADOR_ATIVO): passo (4b), DEPOIS da captura — ela tem prioridade no lock da
+    conta. Só zela conta cujo curso passou gate/controle neste ciclo. Best-effort: um erro
+    no zelador nunca derruba o ciclo nem mexe na captura."""
     def _bater(fase, curso=None):
         if pulsar is None:
             return
@@ -1558,6 +1569,17 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     _avisar_adiamentos(adiados, alertas=alertas, espinha=espinha, agora=agora,
                        estado_carga=estado_carga if estado_carga is not None else {})
 
+    # (4b) ZELADOR DE SESSÃO (P7): contas OCIOSAS têm a sessão provada pela sonda da própria
+    # plataforma, segurando o MESMO lock durável da conta (nunca junto de captura). Depois
+    # da passada: quem disparou captura neste ciclo já está com a conta travada.
+    if zelador is not None:
+        _bater("zelador")
+        try:
+            zelador.passo(executor, estado, agora=agora, alertas=alertas, espinha=espinha,
+                          ativos=frozenset(cursos_ok))
+        except Exception:
+            pass                                           # o zelo NUNCA derruba o ciclo
+
     # (5) SISTEMAS GERADOS (F4-d): supervisão ao lado da captura. A captura acima NÃO
     # muda em nada; sem sistemas registrados (default) este passo é um no-op — o
     # padrão P1–P6 preservado (zero regressão na captura). Best-effort por sistema:
@@ -1621,7 +1643,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 llm=None, espinha=None, sistemas=None, sistema_executor=None,
                 causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                reaper_fn=None, boot_ts=None):
+                reaper_fn=None, boot_ts=None, zelador=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). O PULSO
     é gravado no BOOT, em cada fase/curso do ciclo, no fim do ciclo e a cada fatia da espera
@@ -1706,7 +1728,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         sistema_autopsia_dir=sistema_autopsia_dir,
                         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
                         pendencia_fn=pendencia_fn, pulsar=_bater, boot_ts=boot_ts,
-                        estado_carga=estado_carga)
+                        estado_carga=estado_carga, zelador=zelador)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -1917,10 +1939,21 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     decisoes_mod.registrar_decisao(
         "portão de carga ligado", portao_carga.descrever(), reversivel=True,
         fonte="guard", origem="athena-local/main")
+    # ZELADOR DE SESSÃO (P7): DESLIGADO por padrão. ATHENA_ZELADOR_ATIVO=seco => só grava
+    # o status (~/.athena-local/sessoes-status.json ou ATHENA_SESSOES_STATUS), sem abrir
+    # navegador; =1 => zela. A ativação é assistida (docs/P7 do motor). None = zero mudança.
+    from maestro import zelador as zelador_mod
+    zelador = zelador_mod.zelador_do_ambiente(cursos)
+    if zelador is not None:
+        decisoes_mod.registrar_decisao(
+            f"zelador de sessão em modo {zelador.modo}", zelador.descrever(),
+            reversivel=True, fonte="guard", origem="athena-local/main")
     executor = captura.LocalExecutor(
         cursos, motor_python=motor_python, motor_dir=motor_dir, lock_dir=lock_dir,
         groq_key=groq_key, motor_dir_por_plataforma=_motor_dirs_por_plataforma(),
-        portao_carga=portao_carga)
+        portao_carga=portao_carga,
+        zelo_timeout_s=(zelador.cfg.timeout_s if zelador is not None
+                        else captura._ZELO_TIMEOUT_PADRAO_S))
     total_por_curso = {c.url: c.total_esperado for c in cursos}
     progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso)
 
@@ -2001,7 +2034,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         causa_sistema=causa_sistema_mod, sistema_lock_dir=sistema_lock_dir,
         sistema_autopsia_dir=sistema_autopsia_dir,
         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
-        pendencia_fn=pendencia_fn, reaper_fn=reaper_fn))
+        pendencia_fn=pendencia_fn, reaper_fn=reaper_fn, zelador=zelador))
 
 
 if __name__ == "__main__":  # pragma: no cover

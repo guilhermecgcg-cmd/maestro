@@ -429,13 +429,65 @@ class CursoLocal:
     (Curseduca: uuid do tenant, exigido pelo motor p/ resolver vídeo no player — NÃO é
     segredo): quando o spec declara `tenant_env`, `_montar` o injeta DEPOIS do
     `spec.env`, logo um tenant por-curso VENCE o default fixado no spec; vazio => vale
-    o default do spec (o caso de hoje: tenant único segueadi)."""
+    o default do spec (o caso de hoje: tenant único segueadi).
+
+    O default "hotmart" do campo só serve a quem constrói o objeto à mão; o carregador do
+    YAML resolve a ausência de `plataforma:` por `plataforma_padrao` (Hotmart SÓ num host
+    hotmart.com), e o `_montar` recusa o motor Hotmart em qualquer outro host."""
     url: str
     conta: str
     plataforma: str = "hotmart"
     total_esperado: int = 0
     session_path: str = ""
     tenant: str = ""
+
+
+# ---- PLATAFORMA DE UMA ENTRADA SEM `plataforma:` — FAIL-CLOSED (rodada 9) ---------------
+# O carregador do YAML assumia "hotmart" para QUALQUER host. Um tenant novo de domínio
+# próprio (ex.: um 5º Cademí) posto no gate SEM a linha `plataforma:` rodaria o `motor.cli`
+# (Hotmart), HEADED, no `.chrome-profile` do Hotmart VIVO — e o `disparar` ainda apagaria
+# os Singleton* desse perfil (a conta é outra: o lock 1-por-conta não o protege). A trava
+# `hosts` só cobre os hosts JÁ cadastrados. Agora o default "hotmart" só vale num host do
+# Hotmart (`hotmart.com` e subdomínios — a mesma regra de sufixo do gate de domínio); em
+# qualquer outro host a entrada vira PLATAFORMA_NAO_DECLARADA, que nunca tem spec:
+# `_montar` a recusa NOMEADA (sem lock, sem spawn, sem mexer em perfil) e os leitores do
+# tracker (pendência, reaper) não lhe dão escopo nenhum (nunca o `/products/<id>` do
+# Hotmart). O inverso também vale no `_montar`: `plataforma: hotmart` explícita num host
+# que não é do Hotmart é recusada (o motor Hotmart só abre o perfil do Hotmart).
+HOSTS_HOTMART = ("hotmart.com",)
+PLATAFORMA_NAO_DECLARADA = "nao-declarada"
+
+
+def host_do_hotmart(url) -> bool:
+    """O host de `url` é do Hotmart (`hotmart.com` ou subdomínio)? URL sem host => False."""
+    return plataforma_suportada(url, HOSTS_HOTMART)
+
+
+def plataforma_padrao(url) -> str:
+    """A plataforma de uma entrada do YAML SEM `plataforma:` (ou com ela vazia): "hotmart"
+    SÓ num host do Hotmart; qualquer outro host => PLATAFORMA_NAO_DECLARADA (recusa
+    nomeada no disparo — nunca o motor Hotmart por omissão)."""
+    return "hotmart" if host_do_hotmart(url) else PLATAFORMA_NAO_DECLARADA
+
+
+def plataformas_do_host(url) -> tuple:
+    """As plataformas cujo `hosts` (a trava host -> plataforma) casa o host de `url`, na
+    ordem do registro. Só as que declaram `hosts` (Cademí, Entrega Digital)."""
+    return tuple(p for p, s in _PLATAFORMAS.items()
+                 if s.hosts and plataforma_suportada(url, s.hosts))
+
+
+def _recusa_sem_plataforma(meta) -> str:
+    """Texto da recusa de uma entrada PLATAFORMA_NAO_DECLARADA. O essencial vem nos 160
+    primeiros caracteres (o alerta da passada corta aí); conta e URL vão no fim, pelo
+    `rotulo_seguro` (nunca casa as âncoras de morte do classificador)."""
+    from maestro.rotulo import rotulo_seguro
+    donos = plataformas_do_host(meta.url)
+    dica = (f"o host é de {donos[0]}: declare plataforma: {donos[0]}" if donos
+            else "declare a linha plataforma: (a do adaptador deste host)")
+    return (f"sem plataforma: no YAML e host fora do hotmart.com — {dica}; fail-closed, "
+            f"não disparo (nunca Hotmart por omissão) — conta "
+            f"{rotulo_seguro(meta.conta, maximo=60)!r}, {rotulo_seguro(meta.url, maximo=90)}")
 
 
 @dataclass(frozen=True)
@@ -483,16 +535,24 @@ class PlataformaSpec:
       - `sessao_por_tenant`: True => a sessão é CREDENCIAL DE UM TENANT e o daemon
         NUNCA deixa o motor cair na de outro (inviolável "nunca duas contas/tenants
         misturando credencial"). `_montar` recusa (fail-closed, sem spawn): curso SEM
-        `session_path` (o default do motor pode ser um arquivo único para todos os
-        tenants — Entrega Digital: `.entregadigital-session.json`) e `session_path`
-        que outro curso do YAML usa com OUTRA conta ou OUTRO host. False (as vivas) =>
-        nada muda.
+        `session_path` e `session_path` que outro curso do YAML usa com OUTRA conta ou
+        OUTRO host. False (as vivas) => nada muda. Por que exigir o arquivo no YAML se
+        os CLIs da rodada 9 já derivam um POR TENANT (Cademí r9-cademi:
+        `.cademi-session-<host>.json`; Entrega Digital r9-entregadigital, 677d61d em
+        diante: `.entregadigital-<tenant>-session.json`): (1) o daemon só cruza as
+        sessões que CONHECE — no default do motor, duas contas do MESMO tenant
+        partilhariam um arquivo sem que esta checagem visse; (2) vale o arquivo da árvore
+        do motor que o daemon executa (ATHENA_MOTOR_DIR[_<PLAT>]), e o adaptador da
+        Entrega Digital ANTERIOR à rodada 9 (902105c) caía num `.entregadigital-session.
+        json` único para todos os tenants. Exigir o arquivo no YAML não depende de qual
+        versão do motor está na árvore.
       - `hosts`: hosts (exatos ou sufixo, a mesma regra do gate de domínio) que SÓ esta
         plataforma captura. Um curso num desses hosts com OUTRA `plataforma` no YAML
-        (ex.: a linha `plataforma:` esquecida => o carregador assume "hotmart" e
-        rodaria o motor Hotmart no perfil `.chrome-profile` VIVO) é recusado em
-        `_montar`. É checagem cruzada, não gate: host fora da lista não é barrado
-        aqui (quem barra é `PLATAFORMAS_SUPORTADAS`). '' (as vivas) => nada muda."""
+        (ex.: `plataforma: hotmart` copiada de um bloco do Hotmart) é recusado em
+        `_montar`. É checagem cruzada, não gate: host fora da lista não é barrado aqui
+        (quem barra é `PLATAFORMAS_SUPORTADAS`; e a entrada SEM `plataforma:` fora do
+        hotmart.com é recusada por `plataforma_padrao`, cadastrada aqui ou não).
+        '' (as vivas) => nada muda."""
     modulo: str
     passes: tuple = ("base",)
     headless: bool = False
@@ -600,14 +660,19 @@ _PLATAFORMAS = {
     # PLATAFORMAS_SUPORTADAS do launch.sh vivo é explícita). Mesmo padrão dos adaptadores
     # de 22/07: passe ÚNICO ("base" — os CLIs não têm flag de passe), HEADLESS (no motor:
     # `allow_reseed=False` => sessão morta sai 3, nunca login automático), channel=chrome,
-    # perfil DEDICADO por conta via `_perfil_de_conta` (sem CHROME_USER_DATA_DIR aqui — o
-    # default do CLI da Entrega Digital é o `.chrome-profile` do Hotmart VIVO; o daemon
-    # sempre força o da conta). `url_env`/`session_env` = os nomes que os CLIs leem
-    # (motor/cademi/cli.py: CADEMI_URL, CADEMI_SESSION_PATH; motor/entregadigital/cli.py:
-    # ENTREGADIGITAL_URL, ENTREGADIGITAL_SESSION_PATH). `sessao_por_tenant`: a sessão do
-    # YAML é obrigatória e exclusiva do (conta, host). `hosts`: a checagem cruzada
-    # host -> plataforma. Cademí: os 3 tenants de domínio próprio NÃO têm sufixo comum
-    # (a plataforma vem do `plataforma:` do YAML; aqui só o cruzamento dos conhecidos).
+    # perfil DEDICADO por conta via `_perfil_de_conta` (sem CHROME_USER_DATA_DIR aqui: o
+    # `_montar` FORÇA o da conta, que é o MESMO nome que os CLIs da rodada 9 derivam
+    # sozinhos — `.chrome-profile-cademi-<tenant>` e `.chrome-profile-entregadigital-
+    # <tenant>` — e os dois CLIs RECUSAM o `.chrome-profile`. Forçar não depende da versão
+    # do motor na árvore: o CLI da Entrega Digital ANTERIOR à rodada 9 (902105c) caía no
+    # `.chrome-profile` do Hotmart VIVO). `url_env`/`session_env` = os nomes que os CLIs
+    # leem (motor/cademi/cli.py: CADEMI_URL, CADEMI_SESSION_PATH; motor/entregadigital/
+    # cli.py: ENTREGADIGITAL_URL, ENTREGADIGITAL_SESSION_PATH). `sessao_por_tenant`: a
+    # sessão do YAML é obrigatória e exclusiva do (conta, host). `hosts`: a checagem
+    # cruzada host -> plataforma. Cademí: os 3 tenants de domínio próprio NÃO têm sufixo
+    # comum (a plataforma vem do `plataforma:` do YAML; aqui só o cruzamento dos
+    # conhecidos — um 4º tenant precisa do host no gate e da linha `plataforma: cademi`;
+    # pô-lo também aqui liga a trava contra `plataforma:` errada para ele).
     # Tracker: `pendencia_capturavel_local(..., plataforma=)` lê os course_id
     # `cademi:<host>:<id>` / `entregadigital:<tenant>:product:<pid>` do tenant inteiro.
     "cademi": PlataformaSpec(
@@ -813,6 +878,9 @@ def reap_orphans_local(curso_url, motor_dir, *, curso_ativo, plataforma=None) ->
     não há órfã a resgatar; (b) o course_id delas NÃO é o `/products/<id>` do Hotmart —
     uma URL da Entrega Digital com `/products/123` resetaria aulas do curso Hotmart 123
     (outra conta, possivelmente VIVA). `plataforma=None` => comportamento de sempre.
+    PLATAFORMA_NAO_DECLARADA (entrada sem `plataforma:` fora do hotmart.com) => NO-OP
+    também: não se sabe de quem é o curso, e ler o `/products/<id>` da URL mexeria no
+    curso Hotmart de mesmo número.
 
     DENTES / INVIOLÁVEIS:
       - `curso_ativo(curso_url)` True (captura VIVA) => NO-OP (retorna 0). NUNCA toca uma
@@ -829,6 +897,8 @@ def reap_orphans_local(curso_url, motor_dir, *, curso_ativo, plataforma=None) ->
         return 0                                            # captura VIVA: intocável
     if plataforma in _ESCOPO_TENANT:
         return 0                                            # o motor retoma o próprio in-flight
+    if plataforma == PLATAFORMA_NAO_DECLARADA:
+        return 0                                            # dono desconhecido: não toco
     course_id = _course_id_de_url(curso_url)
     if not course_id:
         return 0
@@ -991,8 +1061,12 @@ class _EscopoTracker:
 def _escopo_tracker(curso_url, plataforma=None):
     """Escopo da leitura de pendência do curso. Plataforma de tenant (`_ESCOPO_TENANT`)
     => prefixo do tenant, SEM cair no `/products/` do Hotmart (URL sem host => None).
-    Qualquer outra (inclusive None, o chamador antigo) => o course_id `/products/<id>`
-    de sempre, com o resgate YouTube — o MESMO SQL e os MESMOS parâmetros de antes."""
+    PLATAFORMA_NAO_DECLARADA => None (desconhecido: nenhum escopo, nunca o `/products/`
+    do Hotmart de uma URL alheia). Qualquer outra (inclusive None, o chamador antigo) =>
+    o course_id `/products/<id>` de sempre, com o resgate YouTube — o MESMO SQL e os
+    MESMOS parâmetros de antes."""
+    if plataforma == PLATAFORMA_NAO_DECLARADA:
+        return None
     prefixo_fn = _ESCOPO_TENANT.get(plataforma)
     if prefixo_fn is not None:
         prefixo = prefixo_fn(curso_url)
@@ -1659,22 +1733,29 @@ class LocalExecutor:
 
     def _checar_host_e_credencial(self, meta, spec):
         """Última linha de defesa do host e da credencial (LEVANTA RuntimeError => nada é
-        spawnado nem travado; a passada escala). Duas regras, ambas só para os specs que
-        as declaram (as plataformas vivas não declaram => nada muda para elas):
+        spawnado nem travado; a passada escala). Três regras:
 
           1. HOST -> PLATAFORMA: o host do curso está em `hosts` de OUTRA plataforma =>
-             recusa. O caso real: uma entrada Cademí/Entrega Digital sem a linha
-             `plataforma:` vira "hotmart" no carregador e rodaria o motor Hotmart no
-             `.chrome-profile` VIVO, na conta errada.
-          2. CREDENCIAL DO TENANT (`sessao_por_tenant`): sem `session_path` => recusa (o
-             default do motor pode ser um arquivo ÚNICO para todos os tenants); com um
-             `session_path` que outro curso do YAML usa com OUTRA conta ou OUTRO host =>
-             recusa (dois tenants/contas no mesmo storage_state misturam credencial e um
-             sobrescreve a renovação do outro). Caminhos comparados só por STRING
-             (normpath relativo ao cwd do motor de cada curso) — o arquivo de sessão NUNCA
-             é aberto nem sondado aqui.
-        As mensagens passam a URL/caminho pelo `rotulo_seguro`: texto do daemon nunca casa
-        as âncoras de morte do classificador."""
+             recusa. O caso real: `plataforma: hotmart` (bloco copiado do Hotmart) num
+             host Cademí/Entrega Digital rodaria o motor Hotmart no `.chrome-profile`
+             VIVO, na conta errada. (A entrada SEM `plataforma:` fora do hotmart.com chega
+             ao `_montar` como PLATAFORMA_NAO_DECLARADA e é recusada antes de chegar aqui.)
+          2. HOTMART SÓ NO HOST DO HOTMART: `plataforma: hotmart` num host que não é
+             hotmart.com => recusa, cadastrado em `hosts` ou não (o motor Hotmart abre o
+             `.chrome-profile` do Hotmart, HEADED, e o `disparar` limpa os Singleton*
+             dele). Hotmart em hotmart.com: nada muda.
+          3. CREDENCIAL DO TENANT (`sessao_por_tenant`): sem `session_path` => recusa (sem
+             ele o daemon não confere a credencial: no default do motor, duas contas do
+             MESMO tenant partilhariam um arquivo sem esta regra ver; e o adaptador da
+             Entrega Digital anterior à rodada 9 caía num arquivo único para todos os
+             tenants); com um `session_path` que outro curso do YAML usa com OUTRA conta
+             ou OUTRO host => recusa (dois tenants/contas no mesmo storage_state misturam
+             credencial e um sobrescreve a renovação do outro). Caminhos comparados só por
+             STRING (normpath relativo ao cwd do motor de cada curso) — o arquivo de
+             sessão NUNCA é aberto nem sondado aqui.
+        As regras 1 e 3 só valem para os specs que as declaram (`hosts`,
+        `sessao_por_tenant` — as vivas não declaram). As mensagens passam URL/caminho pelo
+        `rotulo_seguro`: texto do daemon nunca casa as âncoras de morte do classificador."""
         from maestro.rotulo import rotulo_seguro
         for plat, outro in _PLATAFORMAS.items():
             if (plat != meta.plataforma and outro.hosts
@@ -1682,15 +1763,23 @@ class LocalExecutor:
                 raise RuntimeError(
                     f"host de {plat} com plataforma {meta.plataforma!r} no YAML — "
                     f"fail-closed, não disparo {rotulo_seguro(meta.url, maximo=90)} "
-                    f"(corrija a linha plataforma: da conta {meta.conta!r})")
+                    f"(corrija a linha plataforma: da conta "
+                    f"{rotulo_seguro(meta.conta, maximo=60)!r})")
+        if meta.plataforma == "hotmart" and not host_do_hotmart(meta.url):
+            raise RuntimeError(
+                "plataforma hotmart num host fora do hotmart.com — fail-closed, não disparo "
+                "(o motor Hotmart só abre o .chrome-profile do Hotmart); corrija a linha "
+                f"plataforma: da conta {rotulo_seguro(meta.conta, maximo=60)!r} — "
+                f"{rotulo_seguro(meta.url, maximo=90)}")
         if not spec.sessao_por_tenant:
             return
         sess = str(getattr(meta, "session_path", "") or "")
         if not sess:
             raise RuntimeError(
                 f"{meta.plataforma} exige session_path do tenant no YAML (conta "
-                f"{meta.conta!r}) — sem ele o motor usaria o arquivo padrão, que não é do "
-                f"tenant: fail-closed, não disparo {rotulo_seguro(meta.url, maximo=90)}")
+                f"{rotulo_seguro(meta.conta, maximo=60)!r}) — sem ele o daemon não confere "
+                f"de quem é a credencial: "
+                f"fail-closed, não disparo {rotulo_seguro(meta.url, maximo=90)}")
         host = plataforma_de_url(meta.url)
         alvo = _caminho_normalizado(self._motor_dir_de(meta.plataforma), sess)
         for outro in self._meta.values():
@@ -1702,12 +1791,18 @@ class LocalExecutor:
                 continue
             if outro.conta != meta.conta or plataforma_de_url(outro.url) != host:
                 raise RuntimeError(
-                    f"session_path da conta {meta.conta!r} também serve a conta "
-                    f"{outro.conta!r} ({rotulo_seguro(plataforma_de_url(outro.url), maximo=60)})"
+                    f"session_path da conta {rotulo_seguro(meta.conta, maximo=60)!r} também "
+                    f"serve a conta {rotulo_seguro(outro.conta, maximo=60)!r} "
+                    f"({rotulo_seguro(plataforma_de_url(outro.url), maximo=60)})"
                     f" — credencial de um tenant não vale para outro: fail-closed, não "
                     f"disparo {rotulo_seguro(meta.url, maximo=90)}")
 
     def _montar(self, meta, passe="base"):
+        if meta.plataforma == PLATAFORMA_NAO_DECLARADA:
+            # entrada SEM `plataforma:` num host que não é do Hotmart (`plataforma_padrao`):
+            # recusa NOMEADA, antes de qualquer lock/spawn/limpeza de perfil — nunca o
+            # motor Hotmart por omissão.
+            raise RuntimeError(_recusa_sem_plataforma(meta))
         spec = _PLATAFORMAS.get(meta.plataforma)
         if spec is None:
             # fail-closed: o motor só sabe as plataformas mapeadas. Uma nova nunca é

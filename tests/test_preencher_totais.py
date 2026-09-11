@@ -46,6 +46,18 @@ def test_parse_cursos_ordem_e_plataforma():
     assert cursos[0]["plataforma"] == "hotmart"
 
 
+def test_parse_cursos_sem_plataforma_so_e_hotmart_no_host_do_hotmart():
+    # ESPELHO do carregar_cursos: um bloco SEM `plataforma:` só é Hotmart num host
+    # hotmart.com — este script nunca pede /v1/navigation com a sessão do Hotmart num
+    # tenant de domínio próprio (ex.: um Cademí posto no YAML sem a linha).
+    texto = ('- url: "https://aulas.novotenant.com.br/"\n  conta: "c"\n'
+             '- url: "https://evilhotmart.com/x/products/1"\n  conta: "e"\n'
+             '- url: "https://sub.hotmart.com/x/products/2"\n  conta: "h"\n'
+             '- url: "https://hotmart.com/pt-br/club/z/products/3"\n  conta: "h"\n')
+    assert [c["plataforma"] for c in pt.parse_cursos(texto)] == [
+        "nao-declarada", "nao-declarada", "hotmart", "hotmart"]
+
+
 def test_rewrite_troca_so_o_numero_e_preserva_comentario():
     out = pt.atualizar_yaml_texto(
         YAML, {"https://hotmart.com/pt-br/club/x/products/111": 42})

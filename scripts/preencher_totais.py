@@ -43,6 +43,7 @@ import os
 import random
 import re
 import sys
+from urllib.parse import urlparse
 
 SESSION_PATH = os.environ.get(
     "HOTMART_SESSION_PATH",
@@ -66,16 +67,30 @@ _PLAT_RE = re.compile(r'^\s*plataforma:\s*(?P<plat>\S+)')
 _TOTAL_RE = re.compile(r'^(?P<pre>\s*total_esperado:\s*)(?P<val>\d+)(?P<post>.*)$')
 
 
+def _plataforma_padrao(url):
+    """ESPELHO de maestro/adaptadores/captura.py::plataforma_padrao (o default do
+    carregar_cursos): sem `plataforma:`, é 'hotmart' SÓ num host hotmart.com (ou
+    subdomínio); outro host => 'nao-declarada' — este script nunca injeta a sessão do
+    Hotmart nem pede /v1/navigation num domínio que não é do Hotmart."""
+    host = (urlparse(str(url)).hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    if host == "hotmart.com" or host.endswith(".hotmart.com"):
+        return "hotmart"
+    return "nao-declarada"
+
+
 def parse_cursos(texto):
     """Extrai, na ordem do arquivo, [{'url','plataforma'}] de cada bloco de curso.
-    Bloco = uma linha `- url: "..."` seguida (mais abaixo) por `plataforma:`. A
-    plataforma default é 'hotmart' (como no carregar_cursos do athena_local)."""
+    Bloco = uma linha `- url: "..."` seguida (mais abaixo) por `plataforma:`. Sem a
+    linha, a plataforma é a do carregar_cursos do athena_local (`_plataforma_padrao`:
+    'hotmart' só em host hotmart.com)."""
     cursos = []
     atual = None
     for linha in texto.splitlines():
         m = _URL_RE.match(linha)
         if m:
-            atual = {"url": m.group("url"), "plataforma": "hotmart"}
+            atual = {"url": m.group("url"),
+                     "plataforma": _plataforma_padrao(m.group("url"))}
             cursos.append(atual)
             continue
         if atual is not None:

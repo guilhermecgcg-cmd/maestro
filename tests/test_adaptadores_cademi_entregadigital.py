@@ -8,8 +8,11 @@ Dublês com dentes (zero captura, zero sessão real, nenhum arquivo vivo):
      nem quando o ambiente/extra_env do daemon vaza esse perfil;
   3. gate: os 3 hosts Cademí (exatos, sem sufixo comum) e `*.entregadigital.app.br`
      passam; host fora do gate NÃO dispara (ciclo real com o LocalExecutor real);
-  4. host -> plataforma: host Cademí/Entrega Digital com outra `plataforma` no YAML (ex.:
-     a linha esquecida => "hotmart") é recusado ANTES de qualquer spawn;
+  4. host -> plataforma: host Cademí/Entrega Digital com outra `plataforma` no YAML é
+     recusado ANTES de qualquer spawn — um dente POR HOST da trava; e o default do YAML é
+     FAIL-CLOSED: sem `plataforma:`, "hotmart" só num host hotmart.com (um 5º tenant de
+     domínio próprio posto no gate sem a linha é recusado NOMEADO, nunca o motor Hotmart
+     no `.chrome-profile`); `plataforma: hotmart` fora do hotmart.com também;
   5. credencial por tenant: sem `session_path` => recusa; o mesmo arquivo em duas
      contas/dois hosts => recusa;
   6. tracker: pendências/terminais lidos por course_id `cademi:<host>:<id>` e
@@ -76,17 +79,23 @@ def test_dispara_o_modulo_proprio_com_os_envs_do_cli(plat, url, conta, url_env, 
     assert env["PYTHONPATH"] == DIR and call["cwd"] == DIR
 
 
-@pytest.mark.parametrize("plat,url_env,sess_env", [
-    ("cademi", "CADEMI_URL", "CADEMI_SESSION_PATH"),
-    ("entregadigital", "ENTREGADIGITAL_URL", "ENTREGADIGITAL_SESSION_PATH"),
+@pytest.mark.parametrize("plat,url_env,sess_env,hosts", [
+    ("cademi", "CADEMI_URL", "CADEMI_SESSION_PATH",
+     {"membros.alfaresearch.com.br", "cursos.codigoviral.com.br",
+      "aulas.ramonpereira.com.br"}),
+    ("entregadigital", "ENTREGADIGITAL_URL", "ENTREGADIGITAL_SESSION_PATH",
+     {"entregadigital.app.br"}),
 ])
-def test_spec_registrado_exatamente(plat, url_env, sess_env):
+def test_spec_registrado_exatamente(plat, url_env, sess_env, hosts):
     spec = captura._PLATAFORMAS[plat]
     assert spec.modulo == f"motor.{plat}"
     assert spec.passes == ("base",)
     assert spec.headless is True and spec.chromium is False
     assert (spec.url_env, spec.session_env) == (url_env, sess_env)
     assert spec.sessao_por_tenant is True
+    # a trava host -> plataforma, host a host (tirar um deles falha AQUI e no teste da
+    # seção 4 que dispara cada host com a plataforma errada)
+    assert len(spec.hosts) == len(hosts) and set(spec.hosts) == hosts
     # nenhum perfil FIXO no spec => `_montar` dá o perfil da CONTA (`_perfil_de_conta`)
     assert "CHROME_USER_DATA_DIR" not in dict(spec.env)
 
@@ -117,14 +126,42 @@ def test_envs_do_spec_sao_os_que_o_cli_do_motor_le(plat):
     assert f'os.getenv("{spec.session_env}"' in fonte
 
 
+def _fonte_do_cli(plat):
+    for raiz in _ARVORES_MOTOR:
+        cli = os.path.join(raiz, "motor", plat, "cli.py")
+        if os.path.isfile(cli):
+            with open(cli, encoding="utf-8") as f:
+                return f.read()
+    return None
+
+
+def test_cli_da_entregadigital_r9_e_por_tenant_e_recusa_o_perfil_do_hotmart():
+    # a doc do spec/`_checar_host_e_credencial` diz: o CLI da rodada 9 deriva perfil e
+    # sessão POR TENANT (os mesmos nomes do daemon) e RECUSA o `.chrome-profile`; o
+    # anterior (902105c) caía nele e num arquivo único. Conferido no FONTE do motor.
+    fonte = _fonte_do_cli("entregadigital")
+    if fonte is None:
+        pytest.skip("nenhuma árvore do motor com motor/entregadigital/cli.py")
+    assert 'return f".chrome-profile-entregadigital-{_slug(tenant_of(home_url))}"' in fonte
+    assert 'return f".entregadigital-{_slug(tenant_of(home_url))}-session.json"' in fonte
+    assert 'PERFIL_HOTMART = ".chrome-profile"' in fonte
+    assert "if Path(perfil).name == PERFIL_HOTMART:" in fonte
+    assert 'DEFAULT_SESSION_PATH = ".entregadigital-session.json"' not in fonte
+    # o perfil que o daemon dá à conta do YAML é o MESMO nome que o CLI deriva
+    assert captura._perfil_de_conta("entregadigital-luanacarolina") == \
+        ".chrome-profile-entregadigital-luanacarolina"
+
+
 # ==========================================================================
 # 2) PERFIL POR CONTA — nunca o `.chrome-profile` do Hotmart
 # ==========================================================================
 @pytest.mark.parametrize("plat,url,conta,url_env,sess_env,sess", NOVAS)
 def test_perfil_da_conta_mesmo_com_o_perfil_do_hotmart_vazado(monkeypatch, plat, url, conta,
                                                              url_env, sess_env, sess):
-    # o CLI da Entrega Digital cai em `.chrome-profile` (o do Hotmart VIVO) sem a env; um
-    # CHROME_USER_DATA_DIR herdado do ambiente/extra_env do daemon NÃO pode vencer.
+    # um CHROME_USER_DATA_DIR herdado do ambiente/extra_env do daemon NÃO pode vencer o
+    # perfil da conta. (Os CLIs da rodada 9 já recusam o `.chrome-profile`; o daemon
+    # forçar o da conta cobre também uma árvore com o CLI anterior da Entrega Digital,
+    # 902105c, que caía nele sem a env.)
     monkeypatch.setenv("CHROME_USER_DATA_DIR", ".chrome-profile")
     sp = FakeSpawn()
     ex = _exec(_c(plat, url, conta, sess), spawn=sp,
@@ -240,20 +277,181 @@ def test_gate_vivo_sem_os_hosts_novos_mantem_desligado_e_o_default_liga():
 # ==========================================================================
 # 4) HOST -> PLATAFORMA: a linha `plataforma:` esquecida não roda o motor Hotmart
 # ==========================================================================
-def test_yaml_sem_plataforma_num_host_cademi_nao_roda_o_motor_hotmart(tmp_path):
+NOVO_TENANT = "https://aulas.novotenant.com.br/"          # 5º Cademí, domínio próprio
+
+
+def _yaml_sem_plataforma(tmp_path, url, conta, sess):
     p = tmp_path / "cursos.yaml"
-    p.write_text(f"- url: \"{ALFA}\"\n  conta: cademi-alfaresearch\n"
-                 f"  session_path: {DIR}/.cademi-session-membros.alfaresearch.com.br.json\n")
-    cursos = athena_local.carregar_cursos(str(p))
-    assert cursos[0].plataforma == "hotmart"               # o default do carregador
+    p.write_text(f"- url: \"{url}\"\n  conta: {conta}\n  session_path: {sess}\n")
+    return athena_local.carregar_cursos(str(p))
+
+
+@pytest.mark.parametrize("url,conta,dono", [
+    (ALFA, "cademi-alfaresearch", "cademi"),
+    (VIRAL, "cademi-codigoviral", "cademi"),
+    (RAMON, "cademi-ramonpereira", "cademi"),
+    (LUANA, "entregadigital-luanacarolina", "entregadigital"),
+    (NOVO_TENANT, "cademi-novotenant", None),              # fora da trava `hosts`
+])
+def test_yaml_sem_plataforma_fora_do_hotmart_e_recusado_nomeado(tmp_path, monkeypatch,
+                                                               url, conta, dono):
+    limpos = []
+    monkeypatch.setattr(captura, "_limpar_singleton_orfao", limpos.append)
+    cursos = _yaml_sem_plataforma(tmp_path, url, conta, f"{DIR}/.{conta}-session.json")
+    # o default do carregador NUNCA é "hotmart" fora do hotmart.com
+    assert cursos[0].plataforma == captura.PLATAFORMA_NAO_DECLARADA
     sp = FakeSpawn()
-    lock_dir = str(tmp_path / "locks")
-    ex = _exec(*cursos, spawn=sp, lock_dir=lock_dir)
+    ex = _exec(*cursos, spawn=sp, lock_dir=str(tmp_path / "locks"))
     with pytest.raises(RuntimeError) as e:
-        ex.disparar(ALFA)
-    assert sp.calls == []                                  # nenhum Chrome no .chrome-profile
-    assert not ex.conta_ocupada("cademi-alfaresearch")     # nem lock
-    assert "cademi" in str(e.value) and _sem_ancora_de_morte(str(e.value))
+        ex.disparar(url)
+    msg = str(e.value)
+    assert sp.calls == []                                  # nenhum motor (nem o Hotmart)
+    assert limpos == []                                    # nenhum Singleton* apagado
+    assert not ex.conta_ocupada(conta)                     # nem lock
+    assert msg.startswith("sem plataforma: no YAML e host fora do hotmart.com")
+    assert "não disparo" in msg[:160]                      # o alerta da passada corta em 160
+    if dono:                                               # a dica aponta a plataforma certa
+        assert f"declare plataforma: {dono}" in msg[:160]
+    assert _sem_ancora_de_morte(msg)
+
+
+def test_yaml_sem_plataforma_no_hotmart_segue_hotmart(tmp_path, monkeypatch):
+    # controle positivo: o default para o Hotmart continua o de sempre (o teste acima não
+    # passa por recusar tudo).
+    limpos = []
+    monkeypatch.setattr(captura, "_limpar_singleton_orfao", limpos.append)
+    cursos = _yaml_sem_plataforma(tmp_path, C1, "hotmart-principal", "")
+    assert cursos[0].plataforma == "hotmart"
+    sp = FakeSpawn()
+    _exec(*cursos, spawn=sp).disparar(C1)
+    assert sp.calls[0]["cmd"][:3] == [PY, "-m", "motor.cli"]
+    assert sp.calls[0]["env"]["CHROME_USER_DATA_DIR"] == ".chrome-profile"
+    assert limpos == [os.path.join(DIR, ".chrome-profile")]
+
+
+@pytest.mark.parametrize("url,esperada", [
+    ("https://hotmart.com/pt-br/club/x/products/1", "hotmart"),
+    ("https://sub.hotmart.com/x/products/1", "hotmart"),
+    ("https://www.hotmart.com/x/products/1", "hotmart"),
+    ("https://HOTMART.COM/x/products/1", "hotmart"),
+    ("https://evilhotmart.com/x/products/1", captura.PLATAFORMA_NAO_DECLARADA),
+    ("https://hotmart.com.evil.com/x/products/1", captura.PLATAFORMA_NAO_DECLARADA),
+    ("https://hotmart.com.br/x/products/1", captura.PLATAFORMA_NAO_DECLARADA),
+    (ALFA, captura.PLATAFORMA_NAO_DECLARADA),
+    (NOVO_TENANT, captura.PLATAFORMA_NAO_DECLARADA),
+    ("https://minha.memberkit.com.br/9", captura.PLATAFORMA_NAO_DECLARADA),
+    ("sem-host", captura.PLATAFORMA_NAO_DECLARADA),
+])
+def test_plataforma_padrao_so_e_hotmart_no_host_do_hotmart(url, esperada):
+    assert captura.plataforma_padrao(url) == esperada
+
+
+def test_sentinela_nunca_tem_spec():
+    assert captura.PLATAFORMA_NAO_DECLARADA not in captura._PLATAFORMAS
+
+
+@pytest.mark.parametrize("valor", ["", "  ", "null"])
+def test_yaml_com_plataforma_vazia_segue_a_regra_do_host(tmp_path, valor):
+    p = tmp_path / "cursos.yaml"
+    linha = "plataforma:" if valor == "null" else f"plataforma: \"{valor}\""
+    p.write_text(f"- url: \"{NOVO_TENANT}\"\n  conta: x\n  {linha}\n"
+                 f"- url: \"{C1}\"\n  conta: h\n  {linha}\n")
+    cursos = athena_local.carregar_cursos(str(p))
+    assert [c.plataforma for c in cursos] == [captura.PLATAFORMA_NAO_DECLARADA, "hotmart"]
+
+
+def test_quinto_tenant_no_gate_sem_plataforma_nao_dispara_no_ciclo_real(tmp_path,
+                                                                        monkeypatch):
+    # o cenário do achado, ponta a ponta no ciclo REAL: o host novo ESTÁ no gate, a entrada
+    # não tem `plataforma:`. Antes: motor.cli, HEADED, `.chrome-profile`, Singleton* do
+    # perfil do Hotmart apagados. Agora: nada spawna e a escalada é NOMEADA.
+    limpos = []
+    monkeypatch.setattr(captura, "_limpar_singleton_orfao", limpos.append)
+    cursos = _yaml_sem_plataforma(tmp_path, NOVO_TENANT, "cademi-novotenant",
+                                  f"{DIR}/.cademi-session-aulas.novotenant.com.br.json")
+    sp = FakeSpawn()
+    pedidos = []
+
+    class _Voz(_VozMin):
+        def escalar(self, problema, pedido):
+            super().escalar(problema, pedido)
+            pedidos.append(pedido)
+
+    gate = frozenset(athena_local.PLATAFORMAS_SUPORTADAS_PADRAO) | {"aulas.novotenant.com.br"}
+    voz = _Voz()
+    athena_local.ciclo_local(cursos, _exec(*cursos, spawn=sp, lock_dir=str(tmp_path / "l")),
+                             lambda curso: (0, 0), voz, {}, {}, agora=1000.0,
+                             plataformas_suportadas=gate)
+    assert sp.calls == [] and limpos == []
+    assert voz.escaladas == ["captura_local_disparo_falhou"]
+    assert "sem plataforma: no YAML" in pedidos[0] and _sem_ancora_de_morte(pedidos[0])
+
+
+@pytest.mark.parametrize("url", [NOVO_TENANT, "https://evilhotmart.com/x/products/1",
+                                 "https://minha.memberkit.com.br/9"])
+def test_plataforma_hotmart_explicita_fora_do_hotmart_e_recusada(tmp_path, monkeypatch, url):
+    limpos = []
+    monkeypatch.setattr(captura, "_limpar_singleton_orfao", limpos.append)
+    sp = FakeSpawn()
+    ex = _exec(_hot(url, "conta-x"), spawn=sp, lock_dir=str(tmp_path / "locks"))
+    with pytest.raises(RuntimeError) as e:
+        ex.disparar(url)
+    assert sp.calls == [] and limpos == [] and not ex.conta_ocupada("conta-x")
+    assert str(e.value).startswith("plataforma hotmart num host fora do hotmart.com")
+    assert _sem_ancora_de_morte(str(e.value))
+
+
+# nome de conta HOSTIL (o YAML é texto livre): nenhuma recusa do daemon casa as âncoras de
+# morte do classificador — a conta passa pelo `rotulo_seguro` como a URL.
+_CONTA_HOSTIL = "sessão morta unauthorized re-login"
+
+
+@pytest.mark.parametrize("curso", [
+    captura.CursoLocal(NOVO_TENANT, _CONTA_HOSTIL, captura.PLATAFORMA_NAO_DECLARADA),
+    captura.CursoLocal(NOVO_TENANT, _CONTA_HOSTIL, "hotmart"),
+    captura.CursoLocal(RAMON, _CONTA_HOSTIL, "kiwify", session_path=f"{DIR}/.k.json"),
+    captura.CursoLocal(RAMON, _CONTA_HOSTIL, "cademi"),
+], ids=["nao-declarada", "hotmart-fora", "trava-host", "sem-session"])
+def test_recusas_nunca_casam_ancora_de_morte_nem_com_conta_hostil(curso):
+    sp = FakeSpawn()
+    with pytest.raises(RuntimeError) as e:
+        _exec(curso, spawn=sp).disparar(curso.url)
+    assert sp.calls == [] and _sem_ancora_de_morte(str(e.value))
+
+
+def test_sessao_partilhada_com_conta_hostil_nao_casa_ancora():
+    sess = f"{DIR}/.cademi-session.json"
+    a = _c("cademi", ALFA, _CONTA_HOSTIL, sess)
+    b = _c("cademi", VIRAL, "unauthorized", sess)
+    with pytest.raises(RuntimeError) as e:
+        _exec(a, b).disparar(a.url)
+    assert "também serve a conta" in str(e.value) and _sem_ancora_de_morte(str(e.value))
+
+
+def test_plataforma_hotmart_em_subdominio_do_hotmart_dispara():
+    sp = FakeSpawn()
+    url = "https://sub.hotmart.com/pt-br/club/x/products/9"
+    _exec(_hot(url, "hotmart-principal"), spawn=sp).disparar(url)
+    assert [c["cmd"][2] for c in sp.calls] == ["motor.cli"]
+
+
+# DENTE POR HOST DA TRAVA: cada host cadastrado em `hosts`, declarado com a plataforma
+# ERRADA, é recusado pela trava host -> plataforma (a mensagem é a dela: "host de <dono>").
+# "kiwify"/"memberkit" não têm nenhuma outra checagem que os barre — sem o host na trava,
+# spawnariam; "hotmart" seria barrado também pela regra do hotmart.com, por isso o dente
+# confere a MENSAGEM da trava.
+@pytest.mark.parametrize("url,dono", [
+    (ALFA, "cademi"), (VIRAL, "cademi"), (RAMON, "cademi"),
+    (LUANA, "entregadigital"), ("https://outratenant.entregadigital.app.br/",
+                                "entregadigital")])
+@pytest.mark.parametrize("errada", ["kiwify", "memberkit", "hotmart"])
+def test_cada_host_da_trava_recusa_a_plataforma_errada(url, dono, errada):
+    sp = FakeSpawn()
+    with pytest.raises(RuntimeError) as e:
+        _exec(_c(errada, url, "conta-x", f"{DIR}/.x-session.json"), spawn=sp).disparar(url)
+    assert sp.calls == []
+    assert str(e.value).startswith(f"host de {dono} com plataforma {errada!r} no YAML")
+    assert _sem_ancora_de_morte(str(e.value))
 
 
 @pytest.mark.parametrize("url,errada", [
@@ -281,8 +479,9 @@ def test_plataformas_vivas_nao_ganham_checagem_de_host():
 # ==========================================================================
 @pytest.mark.parametrize("plat,url,conta,url_env,sess_env,sess", NOVAS)
 def test_sem_session_path_nao_dispara(plat, url, conta, url_env, sess_env, sess):
-    # sem o arquivo do tenant o motor cairia no default dele — o da Entrega Digital é UM
-    # arquivo para todos os tenants (`.entregadigital-session.json`).
+    # sem o arquivo do tenant no YAML o daemon não confere de quem é a credencial: no
+    # default do motor (r9: um arquivo por tenant; ED anterior à rodada 9: UM arquivo
+    # para todos), duas contas do mesmo tenant partilhariam a sessão sem a trava ver.
     sp = FakeSpawn()
     with pytest.raises(RuntimeError) as e:
         _exec(_c(plat, url, conta, ""), spawn=sp).disparar(url)
@@ -520,6 +719,24 @@ def test_reaper_nao_toca_tenant_nem_o_hotmart_de_mesmo_numero(tmp_path):
     assert _status(md, "cademi:membros.alfaresearch.com.br:10") == ["transcrevendo"]
     # sem a plataforma, a URL da Entrega Digital com /products/123 resetaria o Hotmart
     assert captura.reap_orphans_local(url_ed, md, curso_ativo=lambda u: False) == 1
+
+
+def test_entrada_nao_declarada_nao_le_nem_reapa_o_hotmart_de_mesmo_numero(tmp_path):
+    # entrada sem `plataforma:` fora do hotmart.com: dono desconhecido. Nem a pendência
+    # (desconhecida => None) nem o reaper (no-op) usam o `/products/123` da URL — que é o
+    # curso Hotmart 123, de outra conta, talvez VIVO.
+    md = _tracker(tmp_path)
+    _seed(md, "123", "transcrevendo", "pendente")
+    url = NOVO_TENANT + "products/123"
+    nd = captura.PLATAFORMA_NAO_DECLARADA
+    assert captura.pendencia_capturavel_local(url, md, plataforma=nd) is None
+    assert captura.reap_orphans_local(url, md, curso_ativo=lambda u: False,
+                                      plataforma=nd) == 0
+    assert _status(md, "123") == ["pendente", "transcrevendo"]
+    # controle: como "hotmart" (o default antigo) a MESMA URL lia e resetava o 123
+    assert captura.pendencia_capturavel_local(url, md, plataforma="hotmart") == 2
+    assert captura.reap_orphans_local(url, md, curso_ativo=lambda u: False,
+                                      plataforma="hotmart") == 1
 
 
 # --- fiação de PRODUÇÃO (o que o main() injeta) ---------------------------------------

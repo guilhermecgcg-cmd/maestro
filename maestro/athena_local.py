@@ -1977,7 +1977,10 @@ def origem_notion_por_curso(cursos) -> dict:
 # core.cademi.com.br) — entram os 3 hosts EXATOS (o gate aceita host igual; subdomínio
 # deles também casa, prefixo/sufixo parecido não). ENTREGA DIGITAL: `<tenant>.
 # entregadigital.app.br`. Nenhum dispara sem entrada no YAML; e o launch.sh vivo fixa a
-# env PLATAFORMAS_SUPORTADAS (sem estes 4) — ligar = acrescentá-los lá também.
+# env PLATAFORMAS_SUPORTADAS (sem estes 4) — ligar = acrescentá-los lá também. Host no
+# gate NÃO escolhe plataforma: a entrada sem `plataforma:` fora do hotmart.com é recusada
+# no disparo (`captura.plataforma_padrao`) — tenant novo = host aqui/no launch.sh + linha
+# `plataforma:` no YAML (+ o host em `hosts` do spec, para a trava contra linha errada).
 # Env PLATAFORMAS_SUPORTADAS sobrepõe (ex.: para pausar uma plataforma sem tocar código).
 PLATAFORMAS_SUPORTADAS_PADRAO = (
     "hotmart.com", "memberkit.com.br", "stoa.com.br", "mykajabi.com",
@@ -1990,7 +1993,13 @@ PLATAFORMAS_SUPORTADAS_PADRAO = (
 def carregar_cursos(path) -> list:
     """Lê a lista de cursos desejados do YAML doméstico. Cada entrada:
     {url, conta, plataforma?, total_esperado?, session_path?, tenant?}. `conta` é
-    OBRIGATÓRIA (chave anti-ban) — a ausência LEVANTA (fail-closed). `session_path`
+    OBRIGATÓRIA (chave anti-ban) — a ausência LEVANTA (fail-closed). `plataforma`
+    ausente (ou vazia) => `captura.plataforma_padrao(url)`: "hotmart" SÓ num host
+    hotmart.com; em qualquer outro host a entrada vira PLATAFORMA_NAO_DECLARADA e o
+    disparo a recusa NOMEADA (nunca o motor Hotmart por omissão — um tenant novo de
+    domínio próprio posto no gate sem a linha rodaria o `motor.cli` no `.chrome-profile`
+    do Hotmart vivo). Não levanta aqui: uma entrada mal configurada não derruba o boot
+    do daemon (as outras seguem); ela escala a cada ciclo. `session_path`
     (opcional) aponta o storage_state EXISTENTE da conta (semeado por login manual do
     usuário); só é INJETADO no motor pelas plataformas cujo spec declara `session_env`
     — nas demais é carregado mas inerte (comportamento vivo intacto). `tenant`
@@ -2003,7 +2012,8 @@ def carregar_cursos(path) -> list:
     for d in dados:
         out.append(captura.CursoLocal(
             url=d["url"], conta=d["conta"],
-            plataforma=d.get("plataforma", "hotmart"),
+            plataforma=(str(d.get("plataforma") or "").strip()
+                        or captura.plataforma_padrao(d["url"])),
             total_esperado=int(d.get("total_esperado", 0)),
             session_path=str(d.get("session_path", "") or ""),
             tenant=str(d.get("tenant", "") or "")))

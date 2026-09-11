@@ -919,6 +919,43 @@ _LOCK_DIR_PADRAO = os.path.join(os.path.expanduser("~"), ".athena-local", "locks
 _MOTOR_LOG_DIR_PADRAO = os.path.join(
     os.path.expanduser("~"), ".athena-local", "motor-logs")
 
+# EVIDÊNCIA COPIADA NO REAP (fix do incidente 10/09 23:33–23:55): o .err é POR CONTA e o
+# `_spawn_popen` o TRUNCA a cada disparo. Guardar só o path no óbito deixava a autópsia
+# ler o arquivo DEPOIS — e, entre o reap (que roda em qualquer consulta ao executor,
+# inclusive no meio da passada) e a autópsia do ciclo seguinte, a conta era relançada e o
+# .err passava a ser do run NOVO (a morte por TimeoutError virava "causa desconhecida").
+# Por isso o `_reap` copia a CAUDA no momento em que colhe o filho: antes de soltar o lock
+# e, portanto, antes de qualquer relançamento da conta. Só os últimos bytes (o .err de um
+# run de horas tem MBs; o vigia usa as últimas ~40 linhas).
+_CAUDA_REAP_BYTES = 64 * 1024
+# Folga entre o disparo e o mtime do .err do MESMO run: o spawn trunca o .err logo depois
+# de o disparo ser carimbado. Um .err mais velho que o disparo além disso é de um run
+# ANTERIOR (o tee falhou neste disparo e caiu no DEVNULL) — não é evidência desta morte.
+# Mesmo critério do `vigia._ERR_FOLGA_S` (morte só-de-lock).
+_CAUDA_FOLGA_S = 5.0
+
+
+def _cauda_do_err(path, desde=None) -> str:
+    """Últimos `_CAUDA_REAP_BYTES` do .err do run que acabou de ser colhido. "" quando não
+    há evidência DESTE run: arquivo ausente/ilegível, ou mais velho que o disparo `desde`
+    (sobra de um run anterior). Nunca levanta — a autópsia segue com cauda vazia (e a causa
+    fica fail-closed, honesta), jamais com a cauda de outro run."""
+    try:
+        if desde is not None and os.path.getmtime(path) < desde - _CAUDA_FOLGA_S:
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            tamanho = f.tell()
+            inicio = max(0, tamanho - _CAUDA_REAP_BYTES)
+            f.seek(inicio)
+            bruto = f.read()
+    except OSError:
+        return ""
+    texto = bruto.decode("utf-8", errors="replace")
+    if inicio > 0:
+        texto = texto.split("\n", 1)[1] if "\n" in texto else ""   # 1ª linha veio cortada
+    return texto
+
 
 # Arquivos de singleton que o Chrome cria DENTRO do user-data-dir. Um crash/SIGKILL do
 # motor pode deixar o SingletonLock ÓRFÃO; o próximo run da MESMA conta então falharia com
@@ -1019,6 +1056,9 @@ class LocalExecutor:
         # alimentar a autópsia (maestro.vigia). Guardar o exit_code REAL do filho ANTES de
         # descartar o handle dá à causa-raiz (maestro.causa) o sinal FORTE de morte.
         self._obitos = {}
+        # Carimbo do disparo por curso (antes do spawn, que trunca o .err): o `_reap` só
+        # aceita como evidência um .err que não seja mais velho que ELE (ver `_cauda_do_err`).
+        self._disparo_ts = {}
         # Guard DURÁVEL: dir estável (sobrevive a restart) + sonda de PID injetável (os
         # testes de RESTART simulam o processo antigo ainda vivo sem um pid real).
         self._lock_dir = lock_dir or _LOCK_DIR_PADRAO
@@ -1096,9 +1136,11 @@ class LocalExecutor:
         e não-colhido continuaria 'vivo' para `os.kill(pid, 0)`."""
         for url in [u for u, p in self._procs.items() if p.poll() is not None]:
             proc = self._procs.pop(url)
+            disparo_ts = self._disparo_ts.pop(url, None)
             meta = self._meta.get(url)
             if meta is None:
                 continue
+            err_path = self._stderr_path(meta.conta)
             # ÓBITO: grava o exit_code REAL do filho ANTES de descartar o handle. É o
             # sinal FORTE que a autópsia (vigia) e a causa-raiz (causa) consomem para
             # distinguir saída limpa (exit 0), SIGKILL/OOM (-9/137) e falha genérica.
@@ -1106,10 +1148,12 @@ class LocalExecutor:
                 "conta": str(meta.conta), "course_url": url,
                 "exit_code": getattr(proc, "returncode", None),
                 "pid": getattr(proc, "pid", None),
-                # EVIDÊNCIA: onde o motor desta conta tee'ou stdout+stderr. A autópsia
-                # (vigia._coerce_fonte) lê o TAIL deste arquivo -> a causa deixa de ser
-                # 'desconhecida'. Só o path (o arquivo pode ser grande); o vigia faz o tail.
-                "stderr_path": self._stderr_path(meta.conta)}
+                "stderr_path": err_path,
+                # EVIDÊNCIA COPIADA AGORA (fix 10/09): a cauda do .err da conta no instante
+                # do reap — ANTES de soltar o lock abaixo, logo antes de qualquer
+                # relançamento que truncaria o arquivo. O vigia usa esta cópia (o
+                # `stderr_tail` tem precedência sobre o path); "" = sem evidência DESTE run.
+                "stderr_tail": _cauda_do_err(err_path, desde=disparo_ts)}
             path = self._lock_path(meta.conta)
             try:
                 with open(path) as f:
@@ -1122,16 +1166,23 @@ class LocalExecutor:
     def drenar_obitos(self) -> dict:
         """Colhe (via `_reap`) e ZERA os óbitos dos filhos que ESTA encarnação spawnou e
         que encerraram desde a última drenagem. Devolve {conta -> {conta, curso,
-        exit_code, pid}} — a fonte por-conta que `maestro.vigia.autopsia` consome
-        (`_coerce_fonte` aceita o dict). Idempotente entre ciclos: a MESMA morte não volta
-        na drenagem seguinte, então não infla o flapping (contrato do vigia)."""
-        self._reap()
-        out = {c: {"conta": d["conta"], "curso": d.get("course_url", ""),
-                   "exit_code": d.get("exit_code"), "pid": d.get("pid"),
-                   "stderr_path": d.get("stderr_path")}
-               for c, d in self._obitos.items()}
-        self._obitos = {}
-        return out
+        exit_code, pid, stderr_path, stderr_tail}} — a fonte por-conta que
+        `maestro.vigia.autopsia` consome (`_coerce_fonte` aceita o dict). `stderr_tail` é
+        a cauda COPIADA no reap (a do run que morreu, mesmo que a conta já tenha sido
+        relançada e o .err truncado); o vigia a usa no lugar de reler o path.
+        Idempotente entre ciclos: a MESMA morte não volta na drenagem seguinte, então não
+        infla o flapping (contrato do vigia)."""
+        try:
+            self._reap()
+        finally:
+            # zera SEMPRE (mesmo se o reap estourar no meio): um óbito colhido e nunca
+            # drenado voltaria em toda drenagem seguinte.
+            obitos, self._obitos = self._obitos, {}
+        return {c: {"conta": d["conta"], "curso": d.get("course_url", ""),
+                    "exit_code": d.get("exit_code"), "pid": d.get("pid"),
+                    "stderr_path": d.get("stderr_path"),
+                    "stderr_tail": d.get("stderr_tail")}
+                for c, d in obitos.items()}
 
     def curso_ativo(self, curso_url, *, limpar=True) -> bool:
         """O curso tem captura VIVA agora? `limpar=False` responde IGUAL mas sem apagar
@@ -1206,6 +1257,9 @@ class LocalExecutor:
         # a conta OCUPADA no restart, de modo que NADA re-dispara. Gravar o lock só DEPOIS
         # do spawn (o bug) deixaria essa janela sem lock -> re-disparo -> ban + captura dupla.
         self._escrever_lock(meta.conta, curso_url, None)
+        # carimbo do disparo ANTES do spawn (que trunca o .err): o reap só aceita como
+        # evidência deste run um .err que não seja mais velho que isto (`_cauda_do_err`).
+        self._disparo_ts[curso_url] = time.time()
         try:
             proc = self._spawn(cmd, env=env, cwd=cwd)
         except Exception:
@@ -1213,6 +1267,7 @@ class LocalExecutor:
             # não travar a conta para sempre por um disparo que nunca aconteceu (o processo
             # não existe; manter o lock seria uma conta ocupada por nada).
             self._remover_lock(self._lock_path(meta.conta))
+            self._disparo_ts.pop(curso_url, None)
             raise
         self._procs[curso_url] = proc
         # PROMOVE o lock de intenção a lock DEFINITIVO, com o PID real do processo de

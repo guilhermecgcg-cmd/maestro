@@ -62,7 +62,9 @@ class FonteFilho:
       ainda vivo/desconhecido — nesse caso a morte é aferida pela liveness do `pid`.
     `stderr_path`: arquivo onde o stderr do filho foi tee'd (lê-se o TAIL).
     `stderr_tail`: texto do stderr direto (tem precedência sobre o path — para quem já
-      colheu o stderr em memória).
+      colheu o stderr em memória). O `LocalExecutor` copia a cauda NO REAP: o .err é por
+      conta e TRUNCADO a cada disparo, então reler o path depois pode devolver o run
+      SEGUINTE da conta (incidente 10/09: TimeoutError virou "causa desconhecida").
     `pid`: pid do filho (para sondar liveness quando `exit_code` é None). Se ausente,
       cai no pid do lock.
     `curso`: URL do curso (fallback quando NÃO há lock em disco).

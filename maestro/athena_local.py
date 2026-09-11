@@ -39,7 +39,9 @@ PENDENTE / o que ficou por LIGAR (honesto):
   - AUTO-INGEST/SINTETIZADOR pós-captura (esteira downstream) não roda aqui.
   - STDERR na autópsia: o `_spawn_popen` tee'a stdout+stderr do motor por CONTA em
     ~/.athena-local/motor-logs/<hash>.err (truncado a cada disparo). O filho DESTA
-    encarnação chega à autópsia com exit_code + stderr_path; a morte SÓ-DE-LOCK (captura
+    encarnação chega à autópsia com exit_code + a CAUDA COPIADA NO REAP (`stderr_tail`:
+    o reap roda até no meio da passada, e a conta podia ser relançada — truncando o .err
+    — antes da autópsia do ciclo seguinte; incidente 10/09). A morte SÓ-DE-LOCK (captura
     de uma encarnação anterior, sem exit code) lê o mesmo .err via `stderr_path_de`. O
     exit code de uma órfã continua NÃO observável: a causa só a dá por limpa pelo resumo
     final do motor na cauda, e por morta no reinício do Mac pelo lock anterior ao boot.

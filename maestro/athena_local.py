@@ -111,6 +111,13 @@ _COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"
 # INVARIANTE: pendência REAL (parede/throttle => aula pendente/in-flight) NÃO cai aqui.
 _COOLDOWN_SEM_PENDENCIA_S = float(os.getenv("ATHENA_COOLDOWN_SEM_PENDENCIA_S", "86400"))  # 24h
 
+# PORTÃO DE CARGA (maestro.carga; incidente 10/09): o LocalExecutor ADIA o disparo quando o
+# Mac está sobrecarregado. Adiar é auto-tratado — o aviso agregado por ciclo fica SÓ-LOG;
+# se a sobrecarga PERSISTIR por esta janela (nada sendo capturado), o aviso vira ESSENCIAL
+# (1 ping por janela de dedup do Alertas) + 1 escalada na espinha por episódio. 0 = nunca
+# escala (só-log sempre). Default 1h.
+_CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
+
 
 # ---------------------------------------------------------------------------
 # NULL-OBJECTS (defaults) — assinaturas IDÊNTICAS às dos módulos reais (P3/P4/P5/P2),
@@ -171,6 +178,9 @@ class _AlertasNulo:
         return None
 
     def curso_concluido(self, plataforma, curso, n, **kw):
+        return None
+
+    def maquina_sobrecarregada(self, motivo, **kw):
         return None
 
 
@@ -548,7 +558,8 @@ def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st, *, espinha=None):
 
 def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disjuntor,
                       agora, cooldown_s=_COOLDOWN_SAIDA_LIMPA_S, espinha=None,
-                      pendencia_fn=None, cooldown_sem_pendencia_s=_COOLDOWN_SEM_PENDENCIA_S):
+                      pendencia_fn=None, cooldown_sem_pendencia_s=_COOLDOWN_SEM_PENDENCIA_S,
+                      adiados=None):
     """Fábrica da `passada_fn` LOCAL que o owner (`orquestrar_captura`) invoca por curso.
 
     A máquina de estados por-curso (persiste em `estado[curso]` entre ciclos):
@@ -565,7 +576,10 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
          NÃO tratou -> conta uma falha (backoff) e volta a NOVO (never-stop).
       7. `disjuntor.pode_tentar` FECHADO (teto/backoff/irredutível) -> escala UMA vez (latch).
       8. senão -> DISPARA. `ContaOcupada` (anti-ban) => aguarda a vez (None). Falha/silêncio
-         do disparo -> escala honesto.
+         do disparo -> escala honesto. `MaquinaSobrecarregada` (portão de carga) => ADIADO
+         neste ciclo (None): NÃO é falha (sem disjuntor/flap/tentativa, sem alerta por
+         curso); decisão "adiei <curso>: <motivo>" 1x por episódio e o curso entra em
+         `adiados` (a lista do ciclo, p/ o aviso AGREGADO de `ciclo_local`).
     """
     esp = espinha or _EspinhaNula()
 
@@ -739,9 +753,29 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         st["esgotado_avisado"] = False                     # disjuntor reabriu: re-arma o latch
         try:
             conf = executor.disparar(curso)
+        except captura.MaquinaSobrecarregada as e:
+            # PORTÃO DE CARGA (incidente 10/09): Mac sufocado => ADIA. Não é falha: nada de
+            # registrar_falha, tentativa, fase CAPTURANDO nem escalada por curso. Decisão
+            # registrada na ENTRADA do episódio (latch: uma sobrecarga de horas não vira uma
+            # linha por ciclo por curso); o aviso AGREGADO do ciclo é do `ciclo_local`.
+            motivo = str(getattr(e, "motivo", "") or e)
+            st["_adiado_ciclo"] = agora
+            if adiados is not None:
+                adiados.append((curso, motivo))
+            if not st.get("adiado_carga_avisado"):
+                st["adiado_carga_avisado"] = True
+                _registrar(esp, f"adiei {curso}: {motivo}",
+                           "portão de carga: disparo ADIADO neste ciclo — NÃO é falha (não "
+                           "conta disjuntor, flap nem tentativa; sem alerta por curso); "
+                           "reavalio a cada ciclo e disparo quando a máquina aliviar",
+                           reversivel=True, fonte="guard", curso=curso, plataforma=plat,
+                           origem="athena-local/portao-carga")
+            return None
         except captura.ContaOcupada:
+            st.pop("adiado_carga_avisado", None)           # não é mais adiamento por carga
             return None                                    # anti-ban: aguarda a vez (não é falha)
         except Exception as e:
+            st.pop("adiado_carga_avisado", None)           # o portão deixou passar: re-arma
             pedido = (f"[{projeto_nome}] FALHEI ao disparar a captura LOCAL de {curso}: "
                       f"{str(e)[:160]}")
             voz.escalar(Problema("captura_local_disparo_falhou", curso, pedido, "critico"),
@@ -752,6 +786,7 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                        fonte="fail-closed", curso=curso, plataforma=plat,
                        origem="athena-local/passada")
             return Acao("", False, True, pedido)
+        st.pop("adiado_carga_avisado", None)               # o portão deixou passar: re-arma
         if not conf:
             pedido = (f"[{projeto_nome}] disparo LOCAL de {curso} SEM confirmação — "
                       f"não assumo sucesso")
@@ -1361,6 +1396,43 @@ def passada_sistema(spec, st, executor, *, vigia, causa_sistema, disjuntor, aler
     return Acao(f"[{slug}] run disparado: {conf}", True, False)
 
 
+def _avisar_adiamentos(adiados, *, alertas, espinha, agora, estado_carga,
+                       limiar_s=None):
+    """Aviso AGREGADO do portão de carga, no MÁXIMO 1 por ciclo (nunca 1 por curso).
+
+    `adiados` = [(curso, motivo)] deste ciclo. Ciclo sem adiamento FECHA o episódio. Com
+    adiamento: `alertas.maquina_sobrecarregada` SÓ-LOG enquanto o episódio é curto; se ele
+    PERSISTE por `limiar_s` (ATHENA_CARGA_ALERTA_S), vira ESSENCIAL (a chave única deixa
+    o dedup do Alertas em 1 ping por janela) + UMA escalada na espinha por episódio — o
+    dono tem de saber que nada está sendo capturado (nunca "0 aulas" em silêncio).
+    `estado_carga` (dict cross-ciclo do `rodar`) guarda {desde, escalado}. Best-effort."""
+    limiar_s = _CARGA_ALERTA_S if limiar_s is None else limiar_s
+    if not adiados:
+        estado_carga.pop("desde", None)
+        estado_carga.pop("escalado", None)
+        return
+    desde = estado_carga.setdefault("desde", agora)
+    duracao = max(agora - desde, 0.0)
+    persistente = limiar_s > 0 and duracao >= limiar_s
+    motivo = adiados[-1][1]
+    texto = f"{len(adiados)} disparo(s) adiado(s) neste ciclo — {motivo}"
+    if duracao > 0:
+        texto += f" (adiando há {int(duracao // 60)} min)"
+    aviso = getattr(alertas, "maquina_sobrecarregada", None)
+    if callable(aviso):
+        try:
+            aviso(texto, essencial=persistente, chave=("portao_carga",))
+        except Exception:
+            pass                                            # observabilidade nunca derruba
+    if persistente and not estado_carga.get("escalado"):
+        estado_carga["escalado"] = True
+        _registrar(espinha, f"máquina sobrecarregada há {int(duracao // 60)} min — "
+                   f"{len(adiados)} disparo(s) de captura adiado(s)",
+                   f"{motivo}. Nada novo é capturado enquanto durar; retomo sozinho quando "
+                   f"a carga baixar", tipo="escalada", reversivel=True, escalada=True,
+                   fonte="guard", origem="athena-local/portao-carga")
+
+
 def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 plataformas_suportadas=None, max_tentativas=3, projeto_nome="athena-local",
                 controle=None, controle_path=None, disjuntor=None, vigia=None, causa=None,
@@ -1369,7 +1441,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                 sistema_executor=None, causa_sistema=None, estado_sistemas=None,
                 sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                pulsar=None, boot_ts=None):
+                pulsar=None, boot_ts=None, estado_carga=None):
     """UM ciclo doméstico. Ordem: (1) CONTROLE filtra plataformas/contas PAUSADAS (P5,
     lido a cada volta); (2) gate de PLATAFORMA-NOVA pula cursos sem adaptador; (3) AUTÓPSIA
     dos cursos que morreram desde o último ciclo (P3->P4); (4) delega os demais ao OWNER
@@ -1384,7 +1456,11 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     escalada no Telegram de até 30s): sem isto o pulso só existia no FIM do ciclo e o vigia
     externo (limiar 900s) matava um loop que estava AVANÇANDO. A batida é SÍNCRONA e ligada
     ao progresso (nunca uma thread independente): se uma chamada travar de verdade, o
-    pulso CONGELA apontando a fase/curso — o livelock real continua detectável."""
+    pulso CONGELA apontando a fase/curso — o livelock real continua detectável.
+
+    `estado_carga` (dict cross-ciclo, criado 1x pelo `rodar`): episódio de sobrecarga do
+    PORTÃO DE CARGA (ver `_avisar_adiamentos`). None => um dict local (sem escalada por
+    persistência entre chamadas avulsas)."""
     def _bater(fase, curso=None):
         if pulsar is None:
             return
@@ -1449,16 +1525,26 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                      llm=llm, espinha=espinha, boot_ts=boot_ts)
 
     # (4) passada LOCAL + owner.
+    adiados = []                                           # portão de carga: (curso, motivo)
     passada_do_curso = _passada_local_fn(executor, progresso_cached, voz, estado,
                                          projeto_nome=projeto_nome, disjuntor=disjuntor,
                                          agora=agora, espinha=espinha,
-                                         pendencia_fn=pendencia_fn)
+                                         pendencia_fn=pendencia_fn, adiados=adiados)
 
     def passada(curso):
         # batida ANTES de cada curso: a janela entre duas batidas é UM curso (leitura do
         # Notion <=120s + escalada), não o ciclo inteiro (N cursos).
         _bater("passada", curso)
-        return passada_do_curso(curso)
+        acao = passada_do_curso(curso)
+        # ADIADO PELO PORTÃO DE CARGA neste ciclo: o relógio de STALL do owner NÃO corre —
+        # o curso não empacou, a Athena é que o segurou. Sem isto, 30 min de sobrecarga
+        # viravam um "captura ESTAGNADA" POR CURSO (o alerta por curso que o portão não
+        # pode gerar); a sobrecarga longa é avisada UMA vez, agregada.
+        if estado.get(curso, {}).get("_adiado_ciclo") == agora:
+            info = voo.get(curso)
+            if info is not None:
+                info["desde"] = agora
+        return acao
 
     def notion_fn(curso):
         try:
@@ -1469,6 +1555,8 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
 
     resultado_captura = orquestrador.orquestrar_captura(cursos_ok, passada, notion_fn,
                                                         voz, voo, agora=agora)
+    _avisar_adiamentos(adiados, alertas=alertas, espinha=espinha, agora=agora,
+                       estado_carga=estado_carga if estado_carga is not None else {})
 
     # (5) SISTEMAS GERADOS (F4-d): supervisão ao lado da captura. A captura acima NÃO
     # muda em nada; sem sistemas registrados (default) este passo é um no-op — o
@@ -1543,6 +1631,7 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     estado = {}
     voo = {}
     estado_sistemas = {}
+    estado_carga = {}                                      # episódio do portão de carga
     controle = controle or _ControleNulo()
     disjuntor = disjuntor or _DisjuntorTeto(max_tentativas)
     vigia = vigia or _VigiaNulo()
@@ -1616,7 +1705,8 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                         estado_sistemas=estado_sistemas, sistema_lock_dir=sistema_lock_dir,
                         sistema_autopsia_dir=sistema_autopsia_dir,
                         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
-                        pendencia_fn=pendencia_fn, pulsar=_bater, boot_ts=boot_ts)
+                        pendencia_fn=pendencia_fn, pulsar=_bater, boot_ts=boot_ts,
+                        estado_carga=estado_carga)
             ultimo_erro = None                             # ciclo passou: re-arma o latch
         except Exception as e:
             assinatura = f"{type(e).__name__}:{str(e)[:120]}"
@@ -1799,6 +1889,7 @@ def _montar_alertas(cfg):  # pragma: no cover — I/O real (constrói o canal de
 
 def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o loop)
     from maestro import batimento as batimento_mod
+    from maestro import carga as carga_mod
     from maestro import causa as causa_mod
     from maestro import controle as controle_mod
     from maestro import decisoes as decisoes_mod
@@ -1820,9 +1911,16 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
 
     lock_dir = os.getenv("ATHENA_LOCK_DIR") or None
     groq_key = _ler_groq_key(motor_dir) or None
+    # PORTÃO DE CARGA (incidente 10/09): ATHENA_CARGA_MAX (default 1,5×núcleos),
+    # ATHENA_MEM_LIVRE_MIN_PCT (default 10), ATHENA_MAX_MOTORES (default 0 = sem teto).
+    portao_carga = carga_mod.PortaoCarga.do_ambiente()
+    decisoes_mod.registrar_decisao(
+        "portão de carga ligado", portao_carga.descrever(), reversivel=True,
+        fonte="guard", origem="athena-local/main")
     executor = captura.LocalExecutor(
         cursos, motor_python=motor_python, motor_dir=motor_dir, lock_dir=lock_dir,
-        groq_key=groq_key, motor_dir_por_plataforma=_motor_dirs_por_plataforma())
+        groq_key=groq_key, motor_dir_por_plataforma=_motor_dirs_por_plataforma(),
+        portao_carga=portao_carga)
     total_por_curso = {c.url: c.total_esperado for c in cursos}
     progresso_fn = progresso_local_fn(motor_python, motor_dir, total_por_curso)
 

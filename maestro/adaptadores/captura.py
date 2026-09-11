@@ -378,6 +378,20 @@ class ContaOcupada(RuntimeError):
     como 'aguarda a vez' (fail-safe), nunca como sucesso nem como crash."""
 
 
+class MaquinaSobrecarregada(ContaOcupada):
+    """Disparo ADIADO pelo PORTÃO DE CARGA (`maestro.carga`): a máquina está sobrecarregada
+    (carga média / memória livre) ou no teto de motores simultâneos. Levantada por
+    `LocalExecutor.disparar` DEPOIS do guard anti-ban e ANTES de qualquer lock/spawn.
+
+    NÃO é falha (incidente 10/09: disparar num Mac sufocado só fabricava mortes): não conta
+    disjuntor, flap nem tentativa. Herda de `ContaOcupada` de propósito — quem só conhece o
+    "aguarda a vez" já a trata como espera benigna (fail-safe); o loop doméstico a captura
+    ANTES para registrar a decisão e o aviso agregado. `motivo` = o texto do portão."""
+    def __init__(self, motivo):
+        super().__init__(motivo)
+        self.motivo = motivo
+
+
 @dataclass(frozen=True)
 class CursoLocal:
     """Um curso desejado no modelo DOMÉSTICO. `conta` é a chave de serialização
@@ -1026,8 +1040,13 @@ class LocalExecutor:
 
     def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
                  extra_env=None, lock_dir=None, pid_vivo=None,
-                 motor_dir_por_plataforma=None, motor_log_dir=None, pendencias_fn=None):
+                 motor_dir_por_plataforma=None, motor_log_dir=None, pendencias_fn=None,
+                 portao_carga=None):
         self._meta = {c.url: c for c in cursos}
+        # PORTÃO DE CARGA (maestro.carga.PortaoCarga | None): consultado em `disparar`
+        # depois do guard anti-ban e antes de qualquer spawn. None (default) = sem portão —
+        # os testes nunca leem a carga REAL desta máquina; o `main()` liga o do ambiente.
+        self._portao_carga = portao_carga
         self._motor_python = motor_python
         self._motor_dir = motor_dir
         # SEAM da escolha de passe: lê pendências do tracker p/ decidir QUAL passe rodar.
@@ -1225,6 +1244,29 @@ class LocalExecutor:
         self._reap()
         return self._ler_lock(conta) is not None
 
+    def motores_ativos(self) -> int:
+        """Quantos motores rodam AGORA, pela verdade-em-disco do guard anti-ban: locks do
+        `lock_dir` com PID vivo, ou de INTENÇÃO (pid=None, fail-closed) — inclusive de
+        encarnações anteriores (órfãs que sobreviveram ao loop). SÓ LEITURA (não apaga lock
+        morto: a autópsia precisa dele). Mesma regra do `controle.capturas_vivas`."""
+        from maestro.controle import capturas_vivas
+        self._reap()
+        return len(capturas_vivas(self._lock_dir, pid_vivo=self._pid_vivo))
+
+    def _veto_de_carga(self):
+        """Motivo do adiamento pelo portão de carga, ou None. Fail-open: um portão/contagem
+        que LEVANTA não pode parar a captura (volta ao comportamento sem portão)."""
+        if self._portao_carga is None:
+            return None
+        try:
+            ativos = self.motores_ativos()
+        except Exception:
+            ativos = 0
+        try:
+            return self._portao_carga.avaliar(ativos)
+        except Exception:
+            return None
+
     def disparar(self, curso_url):
         self._reap()
         meta = self._meta.get(curso_url)
@@ -1242,6 +1284,13 @@ class LocalExecutor:
                 f"conta {meta.conta!r} já captura {lock.get('course_url')} (PID "
                 f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
                 f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
+        # PORTÃO DE CARGA (incidente 10/09): máquina sobrecarregada (carga/memória) ou no
+        # teto de motores => ADIA, antes de escolher o passe (não avança o rodízio), gravar
+        # lock ou spawnar. Vem DEPOIS da idempotência e do anti-ban: se a conta já está
+        # ocupada, a causa de não disparar é ELA — o log do adiamento não mente.
+        veto = self._veto_de_carga()
+        if veto:
+            raise MaquinaSobrecarregada(veto)
         # ESCOLHA DO PASSE (por demanda, com rodízio anti-fome). Feita AQUI, DEPOIS do guard
         # anti-ban e ANTES do único spawn: muda só o ARGV do processo — jamais a QUANTIDADE
         # (1 spawn). Não pode disparar 2 passes na mesma conta: o passe N+1 só é escolhido

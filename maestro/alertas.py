@@ -125,6 +125,23 @@ class Alertas:
         if self._enviar(texto):
             self._marcar_enviado(chave_dedup)
 
+    def maquina_sobrecarregada(self, motivo: str, *, essencial: bool = False,
+                               chave=None) -> None:
+        """Aviso AGREGADO do portão de carga (maestro.carga): disparos de captura ADIADOS
+        porque o Mac está sufocado. Adiamento é auto-tratado (retoma sozinho) => só-log
+        por default; o loop marca `essencial=True` só quando a sobrecarga PERSISTE
+        (ATHENA_CARGA_ALERTA_S) — aí o dono precisa saber que nada está sendo capturado.
+        `chave` dedupa dentro da janela (1 ping por janela, nunca 1 por curso)."""
+        texto = (f"🟠 Máquina sobrecarregada — {motivo}. Disparos de captura ADIADOS "
+                 f"(não é falha; retomo sozinho quando a carga baixar).")
+        if self._suprimido_nao_essencial(essencial, texto):
+            return
+        chave_dedup = ("maquina_sobrecarregada", chave) if chave is not None else None
+        if self._dedup_repetido(chave_dedup, texto):
+            return
+        if self._enviar(texto):
+            self._marcar_enviado(chave_dedup)
+
     def sessao_expirada(self, plataforma: str) -> None:
         # INVARIANTE: reseed é sempre essencial e NUNCA dedupado — só o humano
         # destrava, e engolir este alerta deixaria a conta parada em silêncio.

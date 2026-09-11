@@ -255,3 +255,56 @@ def test_ciclo_morte_colhida_na_passada_e_relancada_antes_da_autopsia(tmp_path, 
     assert "TimeoutError" in aut["stderr_tail"], aut["stderr_tail"]
     assert aut["acao"] == "relancar" and "timeout" in aut["motivo"], aut
     assert alertas.essenciais() == [], alertas.mortes
+
+
+# ==========================================================================
+# 3) PONTA A PONTA SEM DUBLÊ no caminho da evidência: `_spawn_popen` REAL (subprocesso
+#    python, tee REAL no .err da conta, truncamento REAL no 2º disparo). Um motor de
+#    brinquedo num dir temporário (nada de sessão/perfil/lock reais): o 1º run morre de
+#    TimeoutError (exit 1); o 2º imprime as linhas do run seguinte e fica vivo.
+# ==========================================================================
+def test_ponta_a_ponta_spawn_real_trunca_e_a_cauda_do_reap_sobrevive(tmp_path):
+    import sys
+    import time
+    motor = tmp_path / "motor"
+    (motor / "motor").mkdir(parents=True)
+    (motor / "motor" / "__init__.py").write_text("")
+    (motor / "motor" / "kiwify.py").write_text(
+        "import os, sys, time\n"
+        "marca = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ja_rodou')\n"
+        "if not os.path.exists(marca):\n"
+        "    open(marca, 'w').close()\n"
+        f"    sys.stderr.write({_RUN_MORREU_DE_TIMEOUT!r})\n"
+        "    sys.exit(1)\n"
+        f"sys.stdout.write({_RUN_SEGUINTE!r})\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n")
+    cursos = [captura.CursoLocal(KIWIFY, "kiwify-principal", "kiwify")]
+    ex = captura.LocalExecutor(cursos, motor_python=sys.executable, motor_dir=str(motor),
+                               lock_dir=str(tmp_path / "locks"),
+                               motor_log_dir=str(tmp_path / "logs"))   # spawn REAL
+    err = ex._stderr_path("kiwify-principal")
+    run2 = None
+    try:
+        ex.disparar(KIWIFY)
+        assert ex._procs[KIWIFY].wait(timeout=60) == 1         # 1º run morreu (exit 1)
+        assert "TimeoutError" in open(err).read()               # o tee real gravou
+        ex.disparar(KIWIFY)                                     # reap + relançamento REAL
+        run2 = ex._procs[KIWIFY]
+        limite = time.time() + 30
+        while "sessão Kiwify viva" not in open(err).read() and time.time() < limite:
+            time.sleep(0.05)
+        texto = open(err).read()
+        assert "sessão Kiwify viva" in texto and "TimeoutError" not in texto  # TRUNCOU
+        obitos = ex.drenar_obitos()
+        [ob] = vigia.autopsia(str(tmp_path / "locks"), obitos,
+                              autopsia_dir=str(tmp_path / "aut"),
+                              stderr_path_de=ex._stderr_path, boot_ts=0.0)
+        assert ob.exit_code == 1
+        # DENTES: o código antigo relia o path aqui -> linhas do run 2 -> desconhecida.
+        assert "TimeoutError: Page.goto: Timeout 30000ms exceeded" in ob.stderr_tail
+        assert causa.classificar(ob).acao == "relancar"
+    finally:
+        if run2 is not None and run2.poll() is None:
+            run2.kill()
+            run2.wait(timeout=10)

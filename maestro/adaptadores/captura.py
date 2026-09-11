@@ -1258,11 +1258,73 @@ class LocalExecutor:
         return data
 
     def _escrever_lock(self, conta, curso_url, pid):
+        """SOBRESCREVE o lock da conta (troca atômica, `os.replace`). NÃO é aquisição: no
+        `disparar` só serve para PROMOVER a intenção que JÁ é nossa (criada exclusiva por
+        `_criar_lock_exclusivo`) ao PID real. Adquirir com isto era o bug da corrida."""
         tmp = self._lock_path(conta) + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"pid": pid, "course_url": curso_url, "conta": str(conta),
                        "ts": time.time()}, f)
         os.replace(tmp, self._lock_path(conta))   # troca atômica
+
+    # --- AQUISIÇÃO EXCLUSIVA (achado p102b: corrida com a sonda/reseed/zelador) ------
+    # Outros processos abrem o perfil de uma conta FORA do daemon e seguram ESTE MESMO lock
+    # (a sonda de inspeção p102 — motor/lock_conta.py; o reseed/zelador do P7 — motor/
+    # conta_lock.py), criando-o de forma EXCLUSIVA (temp completo + `os.link`). Se o daemon
+    # adquirisse com `os.replace`, um lock deles criado entre o `_ler_lock` ("sem lock") e a
+    # intenção seria SOBRESCRITO — e o daemon ainda apagaria os Singleton* do perfil em uso:
+    # dois navegadores na MESMA conta (ban). Aqui a intenção só nasce se o arquivo NÃO existe.
+    def _criar_lock_exclusivo(self, conta, dados) -> bool:
+        """Cria o lock da conta com o conteúdo COMPLETO, ATOMICAMENTE e só se NÃO existir:
+        temp escrito por inteiro + `os.link` (falha com EEXIST sem tocar o destino; ninguém
+        jamais lê um lock pela metade). True = o lock agora é NOSSO. False = alguém já tem
+        um lock para a conta (vivo, de intenção ou de PID morto) e NADA foi tocado. Outro
+        OSError propaga: fail-closed (sem lock não há spawn). O temp não termina em `.lock`
+        (a varredura do vigia/controle e o nome do daemon nunca o confundem com um lock)."""
+        os.makedirs(self._lock_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self._lock_dir, prefix=".novo-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(dados, f)
+            try:
+                os.link(tmp, self._lock_path(conta))
+            except FileExistsError:
+                return False
+            return True
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _conteudo_do_lock(self, conta) -> dict:
+        """O conteúdo do lock da conta, SÓ LEITURA e sem julgar vida (para a mensagem de
+        quem venceu a corrida — inclusive um lock de PID morto, que fica como evidência).
+        {} se ausente/ilegível."""
+        try:
+            with open(self._lock_path(conta)) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _lock_e(self, conta, dados) -> bool:
+        """O lock da conta tem EXATAMENTE este conteúdo (é o nosso)?"""
+        try:
+            with open(self._lock_path(conta)) as f:
+                return json.load(f) == dados
+        except (OSError, ValueError):
+            return False
+
+    def _remover_lock_se_nosso(self, conta, dados) -> bool:
+        """Remove o lock da conta SÓ se ainda for o nosso (`dados`). Nunca o alheio."""
+        if not self._lock_e(conta, dados):
+            return False
+        try:
+            os.remove(self._lock_path(conta))
+        except OSError:
+            return False
+        return True
 
     def _remover_lock(self, path):
         try:
@@ -1404,49 +1466,8 @@ class LocalExecutor:
         except Exception:
             return None
 
-    # --- LOCK: criação EXCLUSIVA e troca/remoção só-se-for-o-nosso (M3 + zelador) -----
-    def _criar_lock_exclusivo(self, conta, token) -> bool:
-        """Cria o lock da conta com o conteúdo COMPLETO, só se não existir (temp escrito +
-        `os.link`, que falha com EEXIST). False = alguém já tem o lock (nada é tocado)."""
-        path = self._lock_path(conta)
-        fd, tmp = tempfile.mkstemp(dir=self._lock_dir, prefix=".novo-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(token, f)
-            try:
-                os.link(tmp, path)
-            except FileExistsError:
-                return False
-            except OSError:
-                # sistema de arquivos sem hard link: O_EXCL (conteúdo escrito logo depois;
-                # quem lê um lock vazio o trata como ocupado ou obsoleto, nunca como livre
-                # para sobrescrever — e o único leitor que APAGA é este mesmo processo).
-                try:
-                    fd2 = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                except FileExistsError:
-                    return False
-                with os.fdopen(fd2, "w") as f:
-                    json.dump(token, f)
-            return True
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-
-    def _lock_e(self, conta, token) -> bool:
-        try:
-            with open(self._lock_path(conta)) as f:
-                return json.load(f) == token
-        except (OSError, ValueError):
-            return False
-
-    def _remover_lock_se_nosso(self, conta, token) -> bool:
-        if not self._lock_e(conta, token):
-            return False
-        self._remover_lock(self._lock_path(conta))
-        return True
-
+    # --- LOCK: troca só-se-for-o-nosso (zelador). A CRIAÇÃO exclusiva, a leitura crua e a
+    # remoção só-se-for-o-nosso são as do r6-maestro (acima, junto do `_escrever_lock`).
     def _trocar_lock_se_nosso(self, conta, token, novo) -> bool:
         if not self._lock_e(conta, token):
             return False
@@ -1887,30 +1908,32 @@ class LocalExecutor:
         # O `_spawn_popen` POPA esta chave antes do exec — o motor não a herda. Spawns
         # injetados (testes) a ignoram (contrato `(cmd, *, env, cwd)` intacto).
         env[_ENV_STDERR_TEE] = self._stderr_path(meta.conta)
-        # TOCTOU (fix do achado MÉDIO): grava o lock de INTENÇÃO (pid=None) ANTES do spawn.
+        # TOCTOU (fix do achado MÉDIO): o lock de INTENÇÃO (pid=None) nasce ANTES do spawn.
         # Se o loop crashar na janela sub-ms entre o spawn e a escrita do PID, a captura
         # órfã (start_new_session) segue viva SEM que seu PID tenha sido registrado — mas o
         # lock de intenção JÁ está em disco e (via `_ler_lock` pid=None fail-closed) mantém
         # a conta OCUPADA no restart, de modo que NADA re-dispara. Gravar o lock só DEPOIS
         # do spawn (o bug) deixaria essa janela sem lock -> re-disparo -> ban + captura dupla.
-        # M3 (P7): a intenção é CRIADA DE FORMA EXCLUSIVA (só-se-não-existe), nunca por
-        # cima. Entre o `_ler_lock` lá em cima e aqui cabe a escolha do passe (SQLite, até
-        # ~10 s): se um dono EXTERNO (o reseed humano, `scripts/reseed.py`) pegou o lock
-        # nessa janela, sobrescrever subiria a captura por cima do login dele. O de fora
-        # vence: ContaOcupada, nada é aberto. E a intenção vem ANTES da limpeza de
-        # Singleton* abaixo — perdida a corrida, o SingletonLock do navegador dele fica.
+        # AQUISIÇÃO EXCLUSIVA (achado p102b): a intenção é CRIADA só-se-não-existe, nunca por
+        # cima. Entre o `_ler_lock` lá em cima e aqui cabem o portão de carga e a escolha do
+        # passe (SQLite, até ~10 s): se a sonda de inspeção p102 ou o reseed/zelador do P7
+        # criou o lock NESSA janela (eles também criam exclusivo, via os.link), o de fora
+        # VENCE — ContaOcupada, nada é aberto, nada é apagado. O lock presente (vivo, de
+        # intenção ou de PID MORTO — a evidência da autópsia) fica intacto: relido só-leitura.
         intencao = {"pid": None, "course_url": curso_url, "conta": str(meta.conta),
                     "ts": time.time()}
         if not self._criar_lock_exclusivo(meta.conta, intencao):
-            atual = self._ler_lock(meta.conta, limpar=False) or {}
+            atual = self._conteudo_do_lock(meta.conta)
             raise ContaOcupada(
-                f"conta {meta.conta!r} foi ocupada durante o disparo de {curso_url} "
-                f"({atual.get('course_url') or 'lock presente'}) — recuso, sem abrir nada")
+                f"conta {meta.conta!r} foi ocupada durante o disparo de {curso_url} (lock de "
+                f"{atual.get('course_url') or 'dono desconhecido'}, PID {atual.get('pid')}) "
+                f"— recuso, sem abrir navegador nem mexer no perfil (anti-ban: 1 por conta)")
         try:
             # SINGLETON ÓRFÃO: se um run anterior DESTA conta crashou, pode ter deixado o
             # SingletonLock no perfil — e o próximo run falharia na largada mesmo sem
-            # concorrência. O guard 1-por-conta já provou que nenhum motor da conta está
-            # vivo AGORA, então qualquer Singleton* no perfil dela é obsoleto: limpa.
+            # concorrência. SÓ AGORA, com o lock exclusivo NOSSO em disco, está provado que
+            # ninguém da conta (motor, sonda, reseed) está com o perfil: limpar ANTES da
+            # aquisição apagaria o SingletonLock do navegador de quem venceu a corrida.
             perfil = env.get("CHROME_USER_DATA_DIR")
             if perfil:
                 _limpar_singleton_orfao(perfil if os.path.isabs(perfil)
@@ -1922,15 +1945,17 @@ class LocalExecutor:
         except Exception:
             # o spawn FALHOU: a intenção não virou captura. Remove o lock de intenção para
             # não travar a conta para sempre por um disparo que nunca aconteceu (o processo
-            # não existe; manter o lock seria uma conta ocupada por nada). Só se ainda for
-            # a NOSSA intenção.
+            # não existe; manter o lock seria uma conta ocupada por nada) — SÓ se ainda for
+            # a NOSSA intenção: nunca apaga o lock de outro dono.
             self._remover_lock_se_nosso(meta.conta, intencao)
             self._disparo_ts.pop(curso_url, None)
             raise
         self._procs[curso_url] = proc
         # PROMOVE o lock de intenção a lock DEFINITIVO, com o PID real do processo de
         # captura — é o que um executor nascido pós-restart lerá (via `_pid_vivo`) para
-        # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada.
+        # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada. Troca
+        # atômica por cima da NOSSA intenção: ninguém mais cria lock enquanto ela existe
+        # (todos criam exclusivo) e ninguém apaga lock alheio de intenção.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
         # um motor SUBIU: conta na janela da rampa do portão (só pesa na saída da sobrecarga)
         self._avisar_portao("registrar_disparo")

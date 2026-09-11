@@ -55,6 +55,7 @@ import time
 from maestro import adaptador_pipeline, orquestrador
 from maestro.adaptadores import captura
 from maestro.playbook import Acao
+from maestro.rotulo import rotulo_seguro
 from maestro.sentinela import Problema
 from maestro.vigia import _FLAP_MIN as _FLAP_MIN_PADRAO
 
@@ -84,8 +85,9 @@ _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 # …/products/X/agent) torna a sonda inconclusiva PARA SEMPRE: cada disparo morre
 # exit-5, a causa diz `relancar`, e o curso flapa infinito. Após N mortes exit-5
 # SEGUIDAS no MESMO curso (mesma URL — o `st` é chaveado por URL), o curso é
-# BENCHED (irredutível: o disjuntor para de re-tentar SÓ este curso) + ALERTA com
-# a URL. INVIOLÁVEL ANTI-BAN: o bench NÃO é reseed nem relogin (sonda inconclusiva
+# BENCHED (irredutível: o disjuntor para de re-tentar SÓ este curso) + ALERTA ESSENCIAL
+# com a URL (dedup por curso; r6 — antes só-log, e o curso parava calado).
+# INVIOLÁVEL ANTI-BAN: o bench NÃO é reseed nem relogin (sonda inconclusiva
 # ≠ sessão morta confirmada — esta segue a escalada normal de reseed, que tem
 # precedência sobre o bench); e é POR-CURSO: os demais cursos, inclusive da MESMA
 # conta, seguem. N=3 espelha o _FLAP_MIN (1 exit-5 é transitório comum de rede;
@@ -244,6 +246,17 @@ def _aguardando_autopsia(executor, curso_url) -> bool:
         return False
 
 
+def _texto_bench(curso, n5) -> str:
+    """Motivo do alerta ESSENCIAL de bench exit-5. O que o dono precisa: QUAL curso parou,
+    POR QUÊ (sonda inconclusiva em série = provável URL malformada / adaptador) e O QUE
+    fazer (conferir a URL no YAML). Nenhuma frase de sessão morta nem de credencial: o
+    texto (e o rótulo do curso, via `rotulo_seguro`) nunca casa `_RE_SESSAO`/`_RE_TOKEN`."""
+    return (f"BENCH exit-5: {n5} sondas inconclusivas seguidas em "
+            f"{rotulo_seguro(curso)} — curso PARADO. Ação: confira a URL desse curso no "
+            f"YAML (provável malformada) ou o adaptador da plataforma. Não é o acesso da "
+            f"conta: os demais cursos dela seguem; avanço real no Notion reabre este")
+
+
 def _plataforma_de(curso_url, meta_por_curso) -> str:
     """Rótulo de plataforma para os alertas typados. Prefere a `plataforma` do CursoLocal;
     cai na inferência por URL; por fim, a própria URL (nunca vazio)."""
@@ -368,19 +381,22 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
             st["benched_exit5"] = True
             st["esgotado_avisado"] = True             # o alerta typado abaixo já cobre
             st["fase"] = FASE_NOVO
-            # SÓ-LOG por default (não-essencial): o bench é auto-contido (para SÓ
-            # este curso, sem reseed; avanço no Notion desbencha) — o /sitrepcaptura
-            # e o log mostram o curso benched quando o dono for olhar o YAML.
-            alertas.captura_morreu(
-                plat, f"BENCH exit-5: {n5} sondas de sessão INCONCLUSIVAS seguidas "
-                f"em {curso} — curso benched (cheque a URL no YAML: provável "
-                f"malformada). NÃO é sessão morta: sem reseed/relogin; os demais "
-                f"cursos da conta seguem. Avanço real no Notion desbencha.")
+            # ESSENCIAL (achado r6) + dedup POR CURSO: o bench PARA o curso até alguém
+            # corrigir a URL/o adaptador — num adaptador novo, um defeito PERMANENTE (a
+            # sonda inconclusiva para sempre) ficava CALADO no log. Só o dono destrava,
+            # então é essencial; a chave por curso deixa 1 ping por janela.
+            # SEM FRASE DE SESSÃO MORTA: nem o texto nem o rótulo do curso podem casar as
+            # âncoras de morte do classificador (o texto antigo tinha "sessão morta" e
+            # "relogin" — ambos casam `_RE_SESSAO`). O curso passa pelo `rotulo_seguro`
+            # (um slug/título da plataforma pode trazer um termo desses).
+            alertas.captura_morreu(plat, _texto_bench(curso, n5), essencial=True,
+                                   chave=("bench", curso))
             # E15: bench por exit-5 em série — irredutível POR-CURSO, anti-flap.
             _registrar(espinha, f"BENCH exit-5: travei {curso} após {n5} sondas "
                        f"inconclusivas seguidas",
-                       "exit-5 idêntico em série (URL provável malformada) — NÃO é "
-                       "sessão morta: sem reseed; avanço no Notion desbencha",
+                       "exit-5 idêntico em série (URL provável malformada) — sonda "
+                       "inconclusiva, não é veredito sobre o acesso da conta: sem "
+                       "reseed; avanço no Notion desbencha",
                        tipo="escalada", reversivel=True, escalada=True,
                        trava="bench-exit5", curso=curso, plataforma=plat,
                        fonte=fonte_causa, origem="athena-local/causa")

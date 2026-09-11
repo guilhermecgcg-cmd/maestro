@@ -89,7 +89,8 @@ def test_erro_de_envio_nao_propaga(caplog):
 # o Telegram; o resto vira SÓ-LOG (observabilidade intacta, canal limpo).
 # ===========================================================================
 def test_morte_nao_essencial_e_so_log_sem_telegram(caplog):
-    # FLAP/relancar/bench: o sistema auto-trata — NÃO pinga o dono (hoje pinga).
+    # FLAP/relancar: o sistema auto-trata — NÃO pinga o dono (o bench exit-5, que PARA o
+    # curso, é essencial desde a r6 — tests/test_bench_essencial.py).
     tg = _TG()
     with caplog.at_level(logging.WARNING, logger="athena.alertas"):
         Alertas(tg, [10]).captura_morreu(

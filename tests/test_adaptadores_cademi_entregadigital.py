@@ -600,3 +600,15 @@ def test_share_host_e_o_do_motor():
         pytest.skip("nenhuma árvore do motor com motor/entregadigital/enumerate.py")
     assert f'SHARE_HOST = "{captura._ED_SHARE_HOST}"' in fonte
     assert 'f"https://{tenant}.{SHARE_HOST}/products/' in fonte
+
+
+def test_main_fia_as_tres_leituras_por_plataforma():
+    # o main() é I/O real (sem cobertura de execução: tocaria ~/.athena-local, a chave do
+    # Groq e o Telegram). A fiação é conferida no FONTE: sem estas três linhas, as
+    # fábricas testadas acima existiriam e o daemon não as usaria.
+    import inspect
+    fonte = inspect.getsource(athena_local.main)
+    assert "pendencia_fn = _pendencia_de_producao(cursos, _motor_dir_do_curso)" in fonte
+    assert "reaper_fn = _reaper_de_boot(cursos, executor, _motor_dir_do_curso)" in fonte
+    assert "origem_por_curso=origem_notion_por_curso(cursos)" in fonte
+    assert "captura.pendencia_capturavel_local(url, _motor_dir_do_curso(url))" not in fonte

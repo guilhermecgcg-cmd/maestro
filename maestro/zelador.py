@@ -21,14 +21,17 @@ INVIOLÁVEIS (o que, relaxado, quebra o projeto):
     captura — o zelo é opcional).
   - O resultado do zelo NÃO é óbito de captura: nada de autópsia, disjuntor, flap, bench.
   - Morte PROVADA (exit 3 + linha `morta`) => `aguardando-humano` e o zelador PARA de tocar
-    na conta (zero navegação deslogada repetida) até alguém mexer na sessão (M4). Morte de
+    na conta (zero navegação deslogada repetida) até o CARIMBO de um reseed humano ou uma
+    mudança de CONTEÚDO do arquivo de sessão feita por outro (M4, abaixo). Morte de
     plataforma com PROVA FRACA (Stoa, Alpaclass, Hubla) exige uma 2ª morte, >= 30 min
     depois. Na Stoa e na Alpaclass cada morte só conta com `prova: positiva` (a sonda
     TRI-ESTADO do zelo leu a tela/código de login; rede/5xx = inconclusivo): a confirmação
     são DUAS provas positivas de login, nunca duas falhas de rede. Inconclusivo NUNCA vira
     morte (backoff).
   - A sonda usa a URL de um curso da unidade que a captura PODE rodar — nunca um travado,
-    benchado ou sem acesso (um 403 de um produto viraria "login necessário" da conta).
+    benchado ou sem acesso (um 403 de um produto viraria "login necessário" da conta) — e,
+    entre eles, a ÚLTIMA que provou viva (`url_sonda`, PERSISTIDA no status: o estado da
+    captura que exclui travados/benchados some num restart; a prova de vida não).
   - Status (`sessoes-status.json`) sem credencial: só rótulos, epochs e tipos de exceção;
     escrita atômica. É o insumo do /sitrep e do `reseed.py tudo-morto`.
   - Nunca loga, nunca digita, nunca aceita termo: quem prova é a sonda da plataforma com
@@ -41,9 +44,22 @@ zelo que prove a sessão viva. Rearma só os cursos travados ANTES do carimbo; u
 põe a unidade na frente da fila (zela já). O mtime do arquivo de sessão/perfil NÃO serve
 para rearmar: o próprio zelo re-persiste o arquivo num viva e o Chrome mexe na raiz do
 perfil (achado bloqueante da revisão: dois vivas seguidos rearmavam sem ninguém ter logado,
-reabrindo o laço captura-morre -> zelo-viva -> rearma). O mtime segue só como gatilho para
-RE-SONDAR uma conta aguardando-humano (1 zelo por mudança; nunca rearma).
+reabrindo o laço captura-morre -> zelo-viva -> rearma). Nem o mtime nem o conteúdo do
+arquivo rearmam: o conteúdo só RE-SONDA uma conta aguardando-humano (abaixo).
+
+RE-SONDA de conta aguardando-humano (achado bloqueante da rodada 8): o gatilho NÃO é mtime
+nenhum. O Chrome do zelo cria/apaga Singleton* e grava `Local State` na raiz do perfil em
+QUALQUER abertura (inclusive num zelo inconclusivo), então o mtime do perfil é o próprio
+zelador se lendo: cada zelo inconclusivo disparava o seguinte (4 zelos em 6 min, até o teto
+por hora). O gatilho é a IDENTIDADE (sha256 do conteúdo) do ARQUIVO DE SESSÃO — que só um
+login (reseed, `--reseed` avulso) ou uma sessão PROVADA viva (a captura de outro curso
+re-persistindo) reescrevem; o zelo que não prova viva nunca o grava. A identidade de
+referência é RELIDA depois de TODO zelo da conta aguardando (morta, inconclusiva, 5): nada
+que o próprio zelo tenha feito dispara o próximo. E a re-sonda respeita o espaçamento
+(`proximo_ts`: 30 min, 1 h, 2 h... até o intervalo) — um carimbo humano novo passa na
+frente.
 """
+import hashlib
 import json
 import logging
 import os
@@ -111,13 +127,15 @@ _DETALHES_FIXOS = frozenset({
     "sonda da plataforma provou", "interrompido", "Error",
     "watchdog", "sem linha do zelador", "detalhe descartado", "teto de tempo",
     "morte sem prova positiva",
+    # motor/zelador.py da Alpaclass (rodada 10): renovar como o app antes de sondar
+    "sem sonda de 3 estados", "renovacao do app nao recusada",
 })
 _RE_EXCECAO = re.compile(r"[A-Z][A-Za-z0-9]{0,47}(Error|Exception|Timeout|Interrupt|Exit)")
 
 # chaves do estado de máquina (`_t`) que vão para o disco e voltam no restart
 _T_PERSISTIDO = frozenset({
     "intervalo_s", "proximo_ts", "ultimo_zelo_ts", "provado_ts", "expira_ts",
-    "expira_prova_ts", "primeira_morte_ts", "morte_ts", "marca_na_morte",
+    "expira_prova_ts", "primeira_morte_ts", "morte_ts", "ident_na_morte",
     "ultima_captura_ts", "carimbo_visto",
 })
 
@@ -442,6 +460,7 @@ class Zelador:
         self._iniciados = []                  # epochs dos zelos iniciados (teto por hora)
         self._adiado_ate = 0.0
         self._em_curso = set()                # chaves com zelo desta encarnação no ar
+        self._url_do_zelo = {}                # chave -> URL com que o zelo no ar sonda
         self._decisao = {}
         self._cache_caminhos = {}
 
@@ -499,6 +518,9 @@ class Zelador:
                 if isinstance(c.get(k), int) and not isinstance(c.get(k), bool):
                     st[k] = c[k]
             st["detalhe"] = _detalhe_seguro(c.get("detalhe"))
+            u = self._por_chave[st["chave"]]
+            if isinstance(c.get("url_sonda"), str) and c["url_sonda"] in u.cursos:
+                st["url_sonda"] = c["url_sonda"]           # só uma URL DA unidade
             t = c.get("_t")
             if isinstance(t, dict):
                 for k, v in t.items():
@@ -566,22 +588,25 @@ class Zelador:
         self._cache_caminhos[chave] = par
         return par
 
-    def _marca(self, u, executor) -> float:
-        """A maior mtime entre o perfil e o arquivo de sessão da unidade (0 se nenhum). Serve
-        SÓ para RE-SONDAR uma conta aguardando-humano ("alguém mexeu": pode ser o próprio zelo
-        ou a captura de outro curso). NUNCA rearma a captura — isso é do `_carimbo`."""
+    def _identidade(self, u, executor) -> int:
+        """IDENTIDADE do arquivo de sessão da unidade: os 48 primeiros bits do sha256 do
+        CONTEÚDO (0 = ausente/ilegível). Só o ARQUIVO — nunca o perfil (o Chrome do próprio
+        zelo mexe na raiz dele em qualquer abertura) e nunca mtime (metadado que qualquer
+        toque muda). Quem reescreve o conteúdo: um login (reseed) ou uma sessão PROVADA viva
+        (a captura de outro curso). Serve SÓ para RE-SONDAR uma conta aguardando-humano;
+        NUNCA rearma a captura — isso é do `_carimbo`."""
         meta = self._meta.get(u.url)
         if meta is None:
-            return 0.0
-        m = 0.0
-        for p in self._caminhos(executor, meta):
-            if not p:
-                continue
-            try:
-                m = max(m, os.path.getmtime(p))
-            except OSError:
-                pass
-        return m
+            return 0
+        _, sessao = self._caminhos(executor, meta)
+        if not sessao:
+            return 0
+        try:
+            with open(sessao, "rb") as f:
+                dig = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return 0
+        return int(dig[:12], 16) or 1
 
     def _carimbo(self, u, executor) -> float:
         """epoch do último reseed HUMANO concluído da conta (0 se nenhum): o carimbo que o
@@ -603,8 +628,15 @@ class Zelador:
         do Hotmart lê como morte — a conta inteira viraria "login necessário") e sem bench
         de exit-5 (URL que o motor não abre) — o de captura limpa mais recente; empate, a
         ordem do cadastro. Sem nenhum assim: um curso travado SÓ por reseed (a conta inteira
-        morta — é justamente o zelo que prova o relogin, M4). None = nada sondável."""
+        morta — é justamente o zelo que prova o relogin, M4). None = nada sondável.
+
+        Achado da rodada 8: `irredutivel`/`benched_exit5`/`_saida_limpa_ciclo` moram no estado
+        EM MEMÓRIA da captura e somem num restart — depois dele todos os cursos empatavam e a
+        sonda voltava ao 1º do cadastro (no Hotmart, um produto sem acesso = 403 = "login
+        necessário" imediato). Por isso, entre os elegíveis, vence a URL que PROVOU viva no
+        último zelo viva (`url_sonda`, persistida no status); o estado em memória só EXCLUI."""
         est = estado_cursos if isinstance(estado_cursos, dict) else {}
+        provada = self._estado[u.chave].get("url_sonda")
         limpos, so_reseed = [], []
         for i, url in enumerate(u.cursos):
             if url not in self._meta or (ativos is not None and url not in ativos):
@@ -618,6 +650,8 @@ class Zelador:
                 continue
             limpos.append((-(_num(st.get("_saida_limpa_ciclo")) or 0.0), i, url))
         if limpos:
+            if provada in {url for _, _, url in limpos}:
+                return provada                             # a última que PROVOU viva (persistida)
             return min(limpos)[2]
         return so_reseed[0] if so_reseed else None
 
@@ -644,6 +678,7 @@ class Zelador:
         if u is None:
             return
         self._em_curso.discard(u.chave)
+        url_zelo = self._url_do_zelo.pop(u.chave, None)
         st = self._estado[u.chave]
         t = st["_t"]
         resultado = _interpretar(r, u.plataforma)
@@ -666,7 +701,9 @@ class Zelador:
             st["mortes_seguidas"] = 0
             st["inconclusivas_seguidas"] = 0
             t["provado_ts"] = agora
-            for k in ("primeira_morte_ts", "morte_ts", "marca_na_morte"):
+            if url_zelo in u.cursos:
+                st["url_sonda"] = url_zelo                 # a URL que PROVOU viva (persistida)
+            for k in ("primeira_morte_ts", "morte_ts", "ident_na_morte"):
                 t.pop(k, None)
             if estava == AGUARDANDO:
                 t.pop("expira_prova_ts", None)             # login novo: o relógio recomeça
@@ -698,8 +735,10 @@ class Zelador:
             novo = st["status"] != AGUARDANDO
             st["status"] = AGUARDANDO
             t["morte_ts"] = agora
-            t["marca_na_morte"] = self._marca(u, executor)  # DEPOIS do zelo (ele mexe no perfil)
-            t.pop("proximo_ts", None)
+            t["ident_na_morte"] = self._identidade(u, executor)  # a de DEPOIS do zelo
+            # espaçamento das RE-SONDAS por mudança do arquivo (o carimbo humano passa na frente)
+            t["proximo_ts"] = agora + min(cfg.confirmacao_s * 2 ** max(0, st["mortes_seguidas"] - 1),
+                                          float(t["intervalo_s"]))
             if novo:
                 _registrar(espinha, f"sessão de {u.chave} morta — aguardando login humano",
                            "morte PROVADA pela sonda da plataforma (zelador); paro de zelar "
@@ -707,6 +746,12 @@ class Zelador:
                            reversivel=True, escalada=True, trava="anti-ban",
                            plataforma=u.plataforma, fonte="deterministico")
             return
+
+        if st["status"] == AGUARDANDO:
+            # Achado bloqueante da rodada 8: o zelo que NÃO provou viva numa conta aguardando
+            # (inconclusivo, 5, watchdog, teto) também abriu o navegador — nada do que ele fez
+            # pode disparar o próximo. A referência é a identidade de DEPOIS dele.
+            t["ident_na_morte"] = self._identidade(u, executor)
 
         if resultado in _RESULTADOS_5:
             espera = cfg.ocupado_s if resultado == R_OCUPADO else float(t["intervalo_s"])
@@ -834,10 +879,19 @@ class Zelador:
         carimbo = self._carimbo(u, executor)
         humano = carimbo > (_num(t.get("carimbo_visto")) or 0.0)
         if st["status"] == AGUARDANDO:
-            marca = self._marca(u, executor)
-            if humano or marca > float(t.get("marca_na_morte") or 0) + 1:
+            if humano:
                 return (True, True, float(t.get("morte_ts") or 0), "")
-            return (False, False, 0, "aguardando-humano")
+            ident = self._identidade(u, executor)
+            base = t.get("ident_na_morte")
+            if not isinstance(base, int) or isinstance(base, bool):
+                t["ident_na_morte"] = ident                # sem referência: esta vira a base
+                return (False, False, 0, "aguardando-humano")
+            if ident == 0 or ident == base:
+                return (False, False, 0, "aguardando-humano")
+            prox = _num(t.get("proximo_ts"))
+            if prox is not None and agora < prox:
+                return (False, False, 0, "aguardando-espacamento")
+            return (True, True, float(t.get("morte_ts") or 0), "")
         if humano:
             # login humano NOVO (carimbo do reseed): prova JÁ — é o zelo viva que rearma a
             # captura travada (M4); esperar o intervalo deixaria a captura parada horas.
@@ -931,6 +985,7 @@ class Zelador:
             t = self._estado[u.chave]["_t"]
             self._iniciados.append(agora)
             self._em_curso.add(u.chave)
+            self._url_do_zelo[u.chave] = meta.url
             t["ultimo_zelo_ts"] = agora
             t["proximo_ts"] = agora + self.cfg.adiar_s     # guarda: resultado perdido num restart
             t["carimbo_visto"] = carimbo                   # este login humano já tem o seu zelo
@@ -956,6 +1011,7 @@ class Zelador:
                 "decisao": self._decisao.get(u.chave, ""),
                 "proximo_em": _iso(t.get("proximo_ts")),
                 "ultima_captura_em": _iso(t.get("ultima_captura_ts")),
+                "url_sonda": st.get("url_sonda"),
                 "_t": {k: v for k, v in t.items() if k in _T_PERSISTIDO},
             })
         dados = {"gerado_em": _iso(agora), "modo": self.modo, "contas": contas,

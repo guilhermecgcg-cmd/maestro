@@ -15,9 +15,11 @@ stdout+stderr). O executor é o REAL, com lock_dir/logs em tmp. Nada navega, nad
 
 Revisão do P7 — o dublê passou a modelar dois mecanismos que ele ignorava (e por isso a
 suíte deixou passar o rearme sem humano): num VIVA o motor real RE-PERSISTE o arquivo de
-sessão (`capture_state` do `ensure_session`) e o Chrome mexe na raiz do perfil — o mtime
-dos dois vai para a hora do zelo; e a linha de uma MORTE na Stoa/Alpaclass traz
-`prova: positiva` (a sonda tri-estado do motor novo).
+sessão (`capture_state` do `ensure_session`: conteúdo novo, mtime = a hora do zelo); e a
+linha de uma MORTE na Stoa/Alpaclass traz `prova: positiva` (a sonda tri-estado do motor).
+Rodada 10 — e o Chrome do zelo mexe na raiz do perfil (Singleton*, `Local State`) em
+QUALQUER abertura, não só num viva: morta, inconclusiva, teto, watchdog (o mecanismo que
+escondia o 2º achado bloqueante — o zelo inconclusivo re-disparando o seguinte).
 """
 import asyncio
 import json
@@ -104,20 +106,37 @@ class FakeSpawn:
     def _absol(p, cwd):
         return p if os.path.isabs(p) else os.path.join(cwd, p)
 
-    def _o_viva_mexe_no_disco(self, call):
-        """O MECANISMO do viva real: o `ensure_session` re-persiste o arquivo de sessão
-        (`capture_state`) e o Chrome cria/apaga Singleton* na raiz do perfil — mtime = a hora
-        do zelo (+30 s). Só o que existe (o zelador real nem abre perfil inexistente)."""
-        if call["t"] is None:
-            return
-        quando = call["t"] + 30
+    def _caminhos(self, call):
         env, cwd, plat = call["env"], call["cwd"], call["cmd"][3]
         spec = captura._PLATAFORMAS.get(plat)
         sess = (env.get(spec.session_env) if spec is not None and spec.session_env else "") \
             or zmod._SESSAO_PADRAO.get(plat, "")
-        for p in (env.get("CHROME_USER_DATA_DIR") or "", sess):
-            if p and os.path.exists(self._absol(p, cwd)):
-                os.utime(self._absol(p, cwd), (quando, quando))
+        perfil = env.get("CHROME_USER_DATA_DIR") or ""
+        return (self._absol(perfil, cwd) if perfil else ""), (self._absol(sess, cwd) if sess else "")
+
+    def _o_chrome_mexe_no_perfil(self, call):
+        """O MECANISMO de TODA abertura real: o Chrome cria/apaga Singleton* e grava `Local
+        State` na raiz do perfil — mtime da raiz = a hora do zelo (+30 s). Vale para qualquer
+        desfecho do navegador (viva, morta, inconclusiva, teto, watchdog)."""
+        if call["t"] is None:
+            return
+        quando = call["t"] + 30
+        perfil, _ = self._caminhos(call)
+        if perfil and os.path.isdir(perfil):
+            os.utime(perfil, (quando, quando))
+
+    def _o_viva_mexe_no_disco(self, call):
+        """O MECANISMO do viva real: além do perfil, o `ensure_session` RE-PERSISTE o arquivo
+        de sessão (`capture_state`: CONTEÚDO novo — cookies/tokens renovados — e mtime = a hora
+        do zelo). Só o que existe (o zelador real nem abre perfil inexistente)."""
+        if call["t"] is None:
+            return
+        quando = call["t"] + 30
+        _, sess = self._caminhos(call)
+        if sess and os.path.exists(sess):
+            with open(sess, "w") as f:
+                json.dump({"capture_state": quando}, f)
+            os.utime(sess, (quando, quando))
 
     def terminar(self, i, code, resultado=None, *, expira=None, detalhe="x", antes="",
                  prova=_AUTO):
@@ -139,6 +158,8 @@ class FakeSpawn:
                              "resultado": resultado, "detalhe": detalhe, "expira_em": expira,
                              "vence_em_h": None, "provado_em": None, "prova": prova}
                     f.write("ZELADOR " + json.dumps(linha) + "\n")
+        if plat == "" or resultado not in ("sem-perfil", "sem-sessao-salva", "ocupado"):
+            self._o_chrome_mexe_no_perfil(call)     # o motor abriu o navegador
         if resultado == "viva" and code == 0:
             self._o_viva_mexe_no_disco(call)
         call["proc"].encerrar(code)
@@ -865,17 +886,17 @@ def test_carimbo_do_reseed_apos_morte_dispara_zelar_e_viva_rearma_o_latch(tmp_pa
     assert estado[KIW2]["irredutivel"] is True               # bench de exit-5 não é do zelador
 
 
-def test_mtime_apos_morte_resonda_mas_sem_carimbo_humano_nunca_rearma(tmp_path):
-    """Um `--reseed` AVULSO (sem carimbo) ou a captura de outro curso mexe no arquivo: o
-    zelador RE-SONDA a conta aguardando-humano (a sessão pode ter voltado) e, viva, sai do
-    aguardando — mas a CAPTURA travada só rearma com o carimbo do reseed humano."""
+def test_arquivo_reescrito_apos_morte_resonda_mas_sem_carimbo_humano_nunca_rearma(tmp_path):
+    """Um `--reseed` AVULSO (sem carimbo) ou a captura de outro curso REESCREVE o arquivo de
+    sessão: o zelador RE-SONDA a conta aguardando-humano (a sessão pode ter voltado) e, viva,
+    sai do aguardando — mas a CAPTURA travada só rearma com o carimbo do reseed humano."""
     sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - 10 * H, T0 - 2 * DIA)
     ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
     _ocioso(ex, "kiwify-principal", T0 - DIA)
     _passo(z, ex, T0, estado=estado, alertas=al)
     ex.sp.terminar(0, 3, "morta")
     _passo(z, ex, T0 + 60, estado=estado, alertas=al)
-    os.utime(sess, (T0 + 6 * H, T0 + 6 * H))                  # mexeram, sem reseed.py
+    sess.write_text('{"cookies": ["login-novo"]}')           # relogaram, sem reseed.py
     _passo(z, ex, T0 + 6 * H + 60, estado=estado, alertas=al)
     assert len(ex.sp.zelos()) == 2                            # re-sonda já
     ex.sp.terminar(1, 0, "viva")
@@ -943,7 +964,7 @@ def test_carimbo_novo_poe_a_unidade_na_frente_mesmo_viva_e_so_uma_vez(tmp_path):
     assert len(ex.sp.zelos()) == 2                            # o carimbo já teve o seu zelo
 
 
-def test_mtime_mexido_mas_segue_morta_nao_vira_loop(tmp_path):
+def test_arquivo_reescrito_mas_segue_morta_nao_vira_loop(tmp_path):
     sess = tmp_path / "aula" / ".kiwify-session.json"
     sess.parent.mkdir(parents=True)
     sess.write_text("{}")
@@ -954,7 +975,7 @@ def test_mtime_mexido_mas_segue_morta_nao_vira_loop(tmp_path):
     _passo(z, ex, T0, alertas=al)
     ex.sp.terminar(0, 3, "morta")
     _passo(z, ex, T0 + 60, alertas=al)
-    os.utime(sess, (T0 + H, T0 + H))
+    sess.write_text('{"cookies": ["outro"]}')
     _passo(z, ex, T0 + H + 60, alertas=al)
     ex.sp.terminar(1, 3, "morta")
     for dt in (H + 120, 2 * H, 5 * H):
@@ -1568,3 +1589,164 @@ def test_curso_benchado_nunca_e_sondado_nem_como_ultimo_recurso(tmp_path):
     _ocioso(ex, "hotmart-principal", T0 - DIA)
     _passo(z, ex, T0, estado=estado)
     assert ex.sp.zelos() == []
+
+
+# ==========================================================================================
+# RODADA 10 — conta aguardando-humano: o zelo que não provou viva NUNCA dispara o próximo
+# (achado bloqueante da rodada 8); o gatilho é o CONTEÚDO do arquivo de sessão, não mtime
+# ==========================================================================================
+def _aguardando_kiwify(tmp_path):
+    """Kiwify morta PROVADA no 1º zelo (T0): conta aguardando-humano, perfil e arquivo reais
+    no disco (o dublê mexe na raiz do perfil em TODA abertura do navegador)."""
+    sess = tmp_path / "aula" / ".kiwify-session.json"
+    sess.parent.mkdir(parents=True, exist_ok=True)
+    sess.write_text("{}")
+    perfil = tmp_path / "aula" / ".chrome-profile-kiwify-principal"
+    perfil.mkdir(parents=True, exist_ok=True)
+    for p in (sess, perfil):
+        os.utime(p, (T0 - 2 * DIA, T0 - 2 * DIA))
+    cursos = [_c(KIW, "kiwify-principal", "kiwify", str(sess))]
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, alertas=al)
+    ex.sp.terminar(0, 3, "morta")
+    _passo(z, ex, T0 + 60, alertas=al)
+    assert z.estado["kiwify:kiwify-principal"]["status"] == "aguardando-humano"
+    return sess, perfil, ex, z, al
+
+
+@pytest.mark.parametrize("code,resultado,detalhe", [
+    (5, "inconclusiva", "SessionProbeInconclusiveError"),     # queda de rede / 5xx
+    (5, "inconclusiva", "teto de tempo"),                     # teto próprio do motor
+    (-15, None, ""),                                          # watchdog: TERM, sem linha
+    (5, "inconclusiva", "renovacao do app nao recusada"),     # a Alpaclass sem renovação
+])
+def test_aguardando_zelo_que_nao_prova_viva_nunca_dispara_o_proximo(tmp_path, code, resultado,
+                                                                    detalhe):
+    """O cenário do achado (reproduzido pelo revisor contra 020ca1a: 4 zelos em 6 min, até o
+    teto por hora): o arquivo foi reescrito por fora (1 re-sonda é o previsto), a re-sonda
+    cai num inconclusivo — e o Chrome dela mexeu no perfil. Nada mais pode sair sozinho."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    sess.write_text('{"cookies": ["relogin-avulso"]}')       # alguém mexeu DE VERDADE
+    t = T0 + 2 * H
+    _passo(z, ex, t, alertas=al)
+    assert len(ex.sp.zelos()) == 2
+    ex.sp.terminar(1, code, resultado, detalhe=detalhe)       # o dublê mexe no perfil (+30 s)
+    for k in range(1, 7):                                     # 6 ciclos de 2 min
+        _passo(z, ex, t + 120 * k, alertas=al)
+    for dt in (2 * H, 5 * H, DIA, 3 * DIA):                   # e dias depois, passado o backoff
+        _passo(z, ex, t + dt, alertas=al)
+    assert len(ex.sp.zelos()) == 2, z._decisao
+    assert z.estado["kiwify:kiwify-principal"]["status"] == "aguardando-humano"
+    assert z._decisao["kiwify:kiwify-principal"].startswith("aguardando")
+    assert len(al.logins) == 1
+
+
+def test_aguardando_mtime_do_perfil_ou_do_arquivo_nunca_resonda(tmp_path):
+    """O Chrome (do zelo ou de quem for) mexe na raiz do perfil; um `touch`/backup mexe no
+    mtime do arquivo: NENHUM é ação humana nem prova de sessão viva."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    for dt in (H, 6 * H, DIA, 2 * DIA):
+        os.utime(perfil, (T0 + dt, T0 + dt))
+        os.utime(sess, (T0 + dt, T0 + dt))
+        _passo(z, ex, T0 + dt + 60, alertas=al)
+    assert len(ex.sp.zelos()) == 1
+
+
+def test_aguardando_mesmo_se_o_zelo_regravasse_o_arquivo_nao_dispara_o_proximo(tmp_path):
+    """Defesa em profundidade: a referência é relida DEPOIS de todo zelo da conta aguardando —
+    se um motor um dia regravar o arquivo num desfecho que não é viva, isso não vira gatilho
+    (passado o backoff do inconclusivo, o zelo seguinte sairia sozinho)."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    sess.write_text('{"cookies": ["relogin-avulso"]}')
+    _passo(z, ex, T0 + 2 * H, alertas=al)
+    assert len(ex.sp.zelos()) == 2
+    sess.write_text('{"cookies": ["o proprio zelo regravou"]}')
+    ex.sp.terminar(1, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")
+    for dt in (2 * H + 60, 4 * H, 8 * H, 2 * DIA):
+        _passo(z, ex, T0 + dt, alertas=al)
+    assert len(ex.sp.zelos()) == 2
+
+
+def test_aguardando_reescritas_seguidas_resondam_espacado(tmp_path):
+    """O arquivo mudando a cada 10 min (a captura de outro curso re-persistindo) com o zelo
+    ainda lendo morte: as re-sondas vêm espaçadas (30 min, 1 h, 2 h...), nunca uma por
+    mudança — o teto de navegação numa conta dada como morta é o espaçamento, não o teto/h."""
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    t = T0 + 60
+    while t < T0 + 3 * H:
+        t += 600
+        sess.write_text(json.dumps({"cookies": [f"reescrita-{t}"]}))
+        _passo(z, ex, t, alertas=al)
+        n = len(ex.sp.zelos())
+        if ex.sp.calls[n - 1]["proc"].poll() is None:
+            ex.sp.terminar(n - 1, 3, "morta")
+    assert len(ex.sp.zelos()) == 3, [c["t"] - T0 for c in ex.sp.zelos()]   # T0, ~30 min, ~1h30
+
+
+def test_aguardando_carimbo_humano_passa_na_frente_do_espacamento(tmp_path):
+    sess, perfil, ex, z, al = _aguardando_kiwify(tmp_path)
+    _carimbar(ex, "kiwify-principal", T0 + 300)
+    _passo(z, ex, T0 + 360, alertas=al)                       # bem dentro dos 30 min
+    assert len(ex.sp.zelos()) == 2
+
+
+# ==========================================================================================
+# RODADA 10 — a URL da sonda não depende de estado que some no restart
+# ==========================================================================================
+def test_url_que_provou_viva_e_persistida_e_vence_depois_do_restart(tmp_path):
+    """O estado da captura (limpa recente, travado, benchado) mora em memória e some num
+    restart: a sonda voltava ao 1º curso do cadastro (no Hotmart, um produto sem acesso = 403
+    = 'login necessário' imediato). A URL que PROVOU viva vai para o status e vence depois."""
+    cursos = [_c(HOT, "hotmart-principal", "hotmart"), _c(HOT2, "hotmart-principal", "hotmart"),
+              _c(HOT3, "hotmart-principal", "hotmart")]
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hotmart-principal", T0 - DIA)
+    _passo(z, ex, T0, estado={HOT3: {"_saida_limpa_ciclo": T0 - DIA}})
+    assert ex.sp.zelos()[0]["cmd"][4] == HOT3
+    ex.sp.terminar(0, 0, "viva")
+    _passo(z, ex, T0 + 60, estado={HOT3: {"_saida_limpa_ciclo": T0 - DIA}})
+    assert _status(tmp_path)["contas"][0]["url_sonda"] == HOT3
+    z2 = _zel(tmp_path, cursos)                                # restart: estado da captura vazio
+    _passo(z2, ex, T0 + 13 * H, estado={})
+    assert len(ex.sp.zelos()) == 2 and ex.sp.zelos()[1]["cmd"][4] == HOT3
+    # travado NESTA encarnação, a provada sai da escolha (o estado em memória só EXCLUI)
+    ex.sp.terminar(1, 0, "viva")
+    _passo(z2, ex, T0 + 13 * H + 60, estado={})
+    z3 = _zel(tmp_path, cursos)
+    _passo(z3, ex, T0 + 26 * H, estado={HOT3: {"irredutivel": True, "benched_exit5": True}})
+    assert ex.sp.zelos()[2]["cmd"][4] == HOT
+
+
+def test_url_sonda_do_status_so_vale_se_for_da_unidade(tmp_path):
+    cursos = [_c(HOT, "hotmart-principal", "hotmart"), _c(HOT2, "hotmart-principal", "hotmart")]
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _passo(z, ex, T0 - 2 * DIA)                                # grava um status
+    dados = _status(tmp_path)
+    dados["contas"][0]["url_sonda"] = "https://evil.exemplo/products/9"
+    (tmp_path / "sessoes-status.json").write_text(json.dumps(dados))
+    z2 = _zel(tmp_path, cursos)
+    assert "url_sonda" not in z2.estado["hotmart:hotmart-principal"]
+
+
+# ==========================================================================================
+# RODADA 10 — lacuna de dente: o vigia PERSISTIDO não toca no zelo DESTA encarnação
+# ==========================================================================================
+def test_vigia_persistido_ignora_o_zelo_desta_encarnacao(tmp_path):
+    """O guarda `nossos.get(conta) == dados` é o único que separa o vigia persistido (zelos
+    de encarnações anteriores) do zelo que ESTA encarnação vigia em memória. Sem ele: TERM em
+    dobro e o lock regravado (a remoção só-se-for-o-nosso do fim do zelo falharia)."""
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    sinais = []
+    box = {}
+    ex = _exec(tmp_path, cursos, zelo_timeout_s=600, zelo_grace_s=60,
+               sinal_fn=lambda pid, sig, grupo: sinais.append((pid, sig, grupo)),
+               comando_fn=lambda pid: _CMD_ZELO.format(KIW) if pid == box.get("pid") else None)
+    z = _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    box["pid"] = ex.sp.calls[0]["proc"].pid
+    antes = _lock(ex, "kiwify-principal")
+    assert ex.vigiar_zelos_orfaos(T0 + 700) == []             # além do teto, com prova
+    assert sinais == []
+    assert _lock(ex, "kiwify-principal") == antes

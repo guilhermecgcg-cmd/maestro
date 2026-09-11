@@ -301,6 +301,29 @@ def test_mesmo_arquivo_de_sessao_em_dois_tenants_e_recusado():
     assert sp.calls == []
 
 
+def test_mesmo_arquivo_na_mesma_conta_em_dois_tenants_e_recusado():
+    # a MESMA conta em dois tenants com UM storage_state: cookies de dois hosts no mesmo
+    # arquivo e cada run regrava o do outro — a checagem é por (conta, HOST), não só conta.
+    sess = f"{DIR}/.cademi-session.json"
+    a = _c("cademi", ALFA, "cademi-unica", sess)
+    b = _c("cademi", VIRAL, "cademi-unica", sess)
+    sp = FakeSpawn()
+    with pytest.raises(RuntimeError):
+        _exec(a, b, spawn=sp).disparar(a.url)
+    assert sp.calls == []
+
+
+def test_mesma_conta_mesmo_host_mesmo_arquivo_dispara():
+    # controle: duas entradas do MESMO tenant e MESMA conta partilham legitimamente a
+    # sessão (a recusa acima não é por "arquivo repetido").
+    sess = f"{DIR}/.cademi-session-membros.alfaresearch.com.br.json"
+    a = _c("cademi", ALFA, "cademi-alfaresearch", sess)
+    b = _c("cademi", ALFA + "area/vitrine/home", "cademi-alfaresearch", sess)
+    sp = FakeSpawn()
+    _exec(a, b, spawn=sp).disparar(a.url)
+    assert [c["cmd"][2] for c in sp.calls] == ["motor.cademi"]
+
+
 def test_mesmo_arquivo_em_duas_contas_do_mesmo_host_e_recusado():
     sess = f"{DIR}/.cademi-session-membros.alfaresearch.com.br.json"
     a = _c("cademi", ALFA, "cademi-alfa-1", sess)

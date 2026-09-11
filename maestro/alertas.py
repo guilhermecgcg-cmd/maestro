@@ -9,11 +9,15 @@ ele próprio quem derruba o supervisor — por isso todo envio é best-effort e 
 exceção do Telegram é engolida (a ponte já tem retry para o hiccup transitório).
 
 GATE DE ESSENCIALIDADE (fix do ruído 22/07): o Telegram só recebe o que exige AÇÃO
-HUMANA ou é incidente real; todo o resto (flap que re-tenta sozinho, bench exit-5,
-morte transitória auto-tratada) vira SÓ-LOG — o arquivo de log continua registrando
+HUMANA ou é incidente real; todo o resto (flap que re-tenta sozinho, morte transitória
+auto-tratada) vira SÓ-LOG — o arquivo de log continua registrando
 TUDO, só o CANAL fica limpo. O call-site declara `essencial=True` no que pede humano;
 `ATHENA_ALERTA_NIVEL=tudo` restaura o comportamento antigo (debug). Regra fail-safe
 de classificação: pede ação humana => essencial; auto-tratado => só-log.
+
+O BENCH exit-5 SAIU do só-log (achado r6): ele PARA o curso até alguém corrigir a URL /
+o adaptador — num adaptador novo, um defeito permanente ficava calado. O loop o marca
+essencial com dedup por curso (`chave=("bench", curso)`).
 
 INVARIANTE (anti-ban): `sessao_expirada` (reseed) NUNCA passa pelo gate nem pelo
 dedup — é o único jeito de o dono saber que precisa refazer o login.
@@ -112,8 +116,8 @@ class Alertas:
     def captura_morreu(self, plataforma: str, motivo: str, *,
                        essencial: bool = False, chave=None) -> None:
         """Morte de captura/sistema. `essencial=True` SÓ quando o evento exige ação
-        humana (token/desconhecida/escalada) — flap/bench/transitório auto-tratados
-        ficam no default só-log. `chave` (hashable, ex.: ("humano", curso)) dedupa
+        humana (token/desconhecida/escalada/bench exit-5) — flap/transitório
+        auto-tratados ficam no default só-log. `chave` (hashable, ex.: ("humano", curso)) dedupa
         o MESMO alerta do MESMO curso dentro da janela."""
         texto = (f"🔴 Captura {plataforma} MORREU — {motivo}. "
                  f"Fila sem supervisão; retomar exige olhar humano.")

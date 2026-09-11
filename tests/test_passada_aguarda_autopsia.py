@@ -186,3 +186,141 @@ def test_executor_sem_ou_com_sonda_quebrada_nao_trava_a_passada(quebrado):
     athena_local.ciclo_local([_curso(K, total=40)], ex, _prog({K: (0, 40)}), FakeVoz(),
                              {}, estado, agora=1000.0)
     assert ex.disparos == [K]
+
+
+# ==========================================================================
+# ACHADO r6: a espera existia SÓ na passada. Um motor que morre DEPOIS do
+# `_aguardando_autopsia(C2)` e ANTES do `_reap` do `disparar(C2)` — a janela inclui a
+# leitura de pendência do tracker (SQLite, busy_timeout de até 5 s) e o disjuntor —
+# deixava C2 disparar na MESMA conta antes da autópsia (a sonda do revisor: C1 sai com
+# exit 3 durante o pendencia_fn(C2) e sai um 2º spawn na conta). Agora o `disparar`, o
+# ponto único de todo disparo, recusa a conta com óbito colhido e não autopsiado.
+# ==========================================================================
+def test_morte_na_janela_da_pendencia_nao_deixa_outro_curso_da_conta_disparar(tmp_path):
+    c1 = "https://hotmart.com/pt-br/club/x/products/111"
+    c2 = "https://hotmart.com/pt-br/club/y/products/222"
+    sp = _SpawnTee(["SESSÃO MORTA — LOGIN MANUAL NECESSÁRIO\n", ""])
+    cursos = [captura.CursoLocal(c1, "hotmart-principal", "hotmart", total_esperado=18),
+              captura.CursoLocal(c2, "hotmart-principal", "hotmart", total_esperado=18)]
+    ex = _executor(tmp_path, cursos, sp)
+    matar_na_pendencia = {}
+
+    def pendencia(curso):
+        # a leitura do tracker de C2 é lenta: C1 morre (exit 3) bem aqui — DEPOIS do
+        # `_aguardando_autopsia(C2)` da passada (que viu C1 ainda vivo)
+        alvo = matar_na_pendencia.pop(curso, None)
+        if alvo is not None:
+            sp.calls[0]["proc"].encerrar(alvo)
+        return None
+
+    alertas, estado = _Alertas(), {}
+    kw = dict(disjuntor=disjuntor, vigia=_VigiaNoMundo(sp.vivo), causa=causa,
+              alertas=alertas, lock_dir=str(tmp_path / "locks"),
+              autopsia_dir=str(tmp_path / "aut"), boot_ts=0.0, pendencia_fn=pendencia)
+    athena_local.ciclo_local(cursos, ex, lambda c: (0, 18), _Voz(), {}, estado,
+                             agora=1000.0, **kw)
+    assert len(sp.calls) == 1                              # C1 roda; C2 aguarda a conta
+    matar_na_pendencia[c2] = 3
+    athena_local.ciclo_local(cursos, ex, lambda c: (0, 18), _Voz(), {}, estado,
+                             agora=1200.0, **kw)
+    # DENTES: antes -> o `_reap` do disparar(C2) colhia C1 e soltava o lock: 2º spawn
+    # na conta com a sessão morta, antes de a autópsia classificar a morte.
+    assert len(sp.calls) == 1, "disparou na conta antes da autópsia da morte de C1"
+    assert estado[c2].get("disj_falhas", 0) == 0           # esperar não é falha
+    assert estado[c2].get("tentativas", 0) == 0
+    athena_local.ciclo_local(cursos, ex, lambda c: (0, 18), _Voz(), {}, estado,
+                             agora=1400.0, **kw)
+    assert estado[c1].get("irredutivel") is True           # a autópsia latchou o reseed
+    assert ("SESSAO", {"essencial": True}) in alertas.mortes
+    # a evidência lida foi a da MORTE (o .err não foi truncado por um run de C2)
+    [aut] = [json.load(open(p)) for p in glob.glob(str(tmp_path / "aut" / "*.json"))]
+    assert "SESSÃO MORTA" in aut["stderr_tail"] and aut["curso"] == c1
+
+
+def test_disparar_recusa_conta_com_obito_pendente_e_aceita_depois_da_drenagem(tmp_path):
+    c1 = "https://hotmart.com/pt-br/club/x/products/111"
+    c2 = "https://hotmart.com/pt-br/club/y/products/222"
+    sp = _SpawnTee([_RUN_MORREU_DE_TIMEOUT, _RUN_SEGUINTE])
+    ex = _executor(tmp_path, [captura.CursoLocal(c1, "a", "hotmart"),
+                              captura.CursoLocal(c2, "a", "hotmart")], sp)
+    ex.disparar(c1)
+    sp.calls[0]["proc"].encerrar(1)                        # morre; NINGUÉM consultou ainda
+    with pytest.raises(captura.AguardaAutopsia) as e:
+        ex.disparar(c2)                                    # o `_reap` do próprio disparar
+    assert "ainda não autopsiado" in e.value.args[0]
+    with pytest.raises(captura.AguardaAutopsia):
+        ex.disparar(c1)                                    # nem o mesmo curso relança
+    assert len(sp.calls) == 1
+    assert "TimeoutError" in open(ex._stderr_path("a")).read()   # .err intacto
+    ex.drenar_obitos()
+    assert ex.disparar(c2).startswith(f"local_iniciada:{c2}")
+
+
+def test_aguarda_autopsia_vem_antes_do_portao_de_carga(tmp_path):
+    # a causa de não disparar é a autópsia pendente — o log do adiamento não pode mentir
+    # "máquina sobrecarregada" (nem a rampa contar esse não-disparo).
+    from maestro import carga
+    c1 = "https://hotmart.com/pt-br/club/x/products/111"
+    sp = _SpawnTee([""])
+    ex = _executor(tmp_path, [captura.CursoLocal(c1, "a", "hotmart")], sp)
+    ex.disparar(c1)
+    sp.calls[0]["proc"].encerrar(1)
+    ex._portao_carga = carga.PortaoCarga(
+        sensor=lambda: carga.LeituraCarga(24.0, 8, 4.0))
+    with pytest.raises(captura.AguardaAutopsia) as e:
+        ex.disparar(c1)
+    assert not isinstance(e.value, captura.MaquinaSobrecarregada)
+
+
+def test_ponta_a_ponta_spawn_real_recusa_a_conta_ate_a_autopsia(tmp_path):
+    # SEM DUBLÊ no caminho do disparo: `_spawn_popen` REAL (subprocesso python, tee REAL,
+    # lock REAL em disco, `poll()` REAL no reap). Motor de brinquedo num dir temporário
+    # (nada de sessão/perfil/lock reais): o 1º run sai com exit 3 (sessão morta); o 2º
+    # curso da MESMA conta não pode subir antes da autópsia.
+    import sys
+    import time
+    motor = tmp_path / "motor"
+    (motor / "motor").mkdir(parents=True)
+    (motor / "motor" / "__init__.py").write_text("")
+    (motor / "motor" / "kiwify.py").write_text(
+        "import os, sys, time\n"
+        "marca = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ja_rodou')\n"
+        "if not os.path.exists(marca):\n"
+        "    open(marca, 'w').close()\n"
+        "    sys.stderr.write('SESSÃO MORTA — LOGIN MANUAL NECESSÁRIO\\n')\n"
+        "    sys.exit(3)\n"
+        "sys.stdout.write('run 2 vivo\\n'); sys.stdout.flush()\n"
+        "time.sleep(60)\n")
+    k1 = "https://dashboard.kiwify.com.br/courses/a"
+    k2 = "https://dashboard.kiwify.com.br/courses/b"
+    cursos = [captura.CursoLocal(k1, "kiwify-principal", "kiwify"),
+              captura.CursoLocal(k2, "kiwify-principal", "kiwify")]
+    ex = captura.LocalExecutor(cursos, motor_python=sys.executable, motor_dir=str(motor),
+                               lock_dir=str(tmp_path / "locks"),
+                               motor_log_dir=str(tmp_path / "logs"))    # spawn REAL
+    run2 = None
+    try:
+        ex.disparar(k1)
+        p1 = ex._procs[k1]
+        assert p1.wait(timeout=60) == 3                     # morreu de verdade (exit 3)
+        with pytest.raises(captura.AguardaAutopsia):
+            ex.disparar(k2)                                 # o reap REAL colheu k1 aqui
+        assert k2 not in ex._procs                          # nenhum 2º processo subiu
+        assert "SESSÃO MORTA" in open(ex._stderr_path("kiwify-principal")).read()
+        obitos = ex.drenar_obitos()                         # a autópsia do ciclo
+        assert obitos["kiwify-principal"]["exit_code"] == 3
+        assert "SESSÃO MORTA" in obitos["kiwify-principal"]["stderr_tail"]
+        assert ex.disparar(k2).startswith(f"local_iniciada:{k2}")
+        run2 = ex._procs[k2]
+        limite = time.time() + 30
+        while run2.poll() is None and time.time() < limite and "run 2 vivo" not in open(
+                ex._stderr_path("kiwify-principal")).read():
+            time.sleep(0.05)
+        assert run2.poll() is None                          # o 2º subiu depois da causa
+    finally:
+        # limpa QUALQUER processo que este executor subiu (inclusive o 2º indevido, se o
+        # guard regredir e o teste falhar antes de chegar ao run2)
+        for proc in list(ex._procs.values()) + ([run2] if run2 is not None else []):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)

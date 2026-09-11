@@ -253,11 +253,18 @@ def test_sobrecarregado_nenhum_disparo_nenhum_contador_de_falha(tmp_path):
     assert len(alertas.carga) == 5
     assert all(kw.get("chave") is not None for _m, kw in alertas.carga)
     assert "4 disparo(s)" in alertas.carga[0][0]
-    # volta ao normal => dispara (never-stop), 1 por conta
+    # volta ao normal => dispara (never-stop), 1 por conta — ESCALONADO (r6): no máx 2
+    # disparos novos por ciclo na saída da sobrecarga (o sensor demora a refletir os
+    # recém-lançados; soltar os 4 de uma vez era o padrão do incidente).
     ref[0] = _NORMAL
     ciclo(1000.0 + 120 * 5)
-    assert len(sp.calls) == 4
+    assert len(sp.calls) == 2                              # DENTES r6: antes eram 4
+    ciclo(1000.0 + 120 * 6)
+    assert len(sp.calls) == 4                              # o represamento foi servido
     assert all(estado[c.url]["tentativas"] == 1 for c in cursos)
+    for c in cursos:                                       # a rampa também NÃO é falha
+        assert estado[c.url].get("disj_falhas", 0) == 0
+    assert alertas.mortes == [] and voz.escaladas == []
 
 
 def test_adiamento_longo_nao_vira_estagnacao_por_curso_e_so_escala_agregado(tmp_path,
@@ -280,10 +287,13 @@ def test_adiamento_longo_nao_vira_estagnacao_por_curso_e_so_escala_agregado(tmp_
     assert len({kw["chave"] for kw in essenciais}) == 1    # chave ÚNICA (o Alertas dedupa)
     esc = [r for r in esp.regs if r[2].get("tipo") == "escalada"]
     assert len(esc) == 1 and "sobrecarregada" in esc[0][0]  # 1 escalada por episódio
-    # a sobrecarga passa: dispara e o episódio fecha
+    # a sobrecarga passa: dispara (escalonado) e o episódio FECHA já no 1º ciclo aliviado
+    # (o adiamento da rampa não é sobrecarga — não pode virar "sobrecarregada há 2 h")
     ref[0] = _NORMAL
     ciclo(t)
-    assert len(sp.calls) == 4 and "desde" not in estado_carga
+    assert len(sp.calls) == 2 and "desde" not in estado_carga
+    ciclo(t + 120.0)
+    assert len(sp.calls) == 4
 
 
 def test_sem_portao_o_loop_segue_identico(tmp_path):

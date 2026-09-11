@@ -673,7 +673,8 @@ def test_obito_fantasma_sem_exit_code_nao_zera_a_serie_do_bench(tmp_path):
 
 # ==========================================================================
 # GATE DE ESSENCIALIDADE no CANAL Telegram (fiação real): só o que exige AÇÃO
-# HUMANA pinga o dono; auto-tratado (flap/relancar/bench) vira SÓ-LOG. Estes
+# HUMANA pinga o dono; auto-tratado (flap/relancar) vira SÓ-LOG (o bench exit-5 PARA o
+# curso: essencial desde a r6 — tests/test_bench_essencial.py). Estes
 # dentes usam o Alertas REAL com dublê de TelegramClient — provam o fio inteiro
 # ciclo_local -> _aplicar_decisao -> Alertas -> Telegram.
 # ==========================================================================

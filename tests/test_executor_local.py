@@ -200,14 +200,35 @@ def test_contas_diferentes_capturam_em_paralelo():
     assert ex.conta_ocupada("conta-A") and ex.conta_ocupada("conta-B")
 
 
-def test_conta_libera_quando_o_processo_encerra():
+def test_conta_libera_quando_o_processo_encerra_e_a_morte_foi_autopsiada():
+    # r6: a conta só libera quando o motor encerrou E a morte foi DRENADA pela autópsia
+    # (o `drenar_obitos` do ciclo). Antes (o bug do achado r6), o `_reap` do próprio
+    # `disparar` colhia a morte e o 2º curso da MESMA conta subia antes da causa —
+    # inclusive sobre uma sessão morta.
     sp = FakeSpawn()
     ex = _exec(_hot(C1, "conta-A"), _hot(C2, "conta-A"), spawn=sp)
     ex.disparar(C1)
-    sp.procs[0].encerrar(0)                                # C1 terminou
+    sp.procs[0].encerrar(3)                                # C1 morreu (exit 3)
+    with pytest.raises(captura.AguardaAutopsia) as e:
+        ex.disparar(C2)                                    # DENTES: antes -> spawnava
+    assert isinstance(e.value, captura.ContaOcupada)       # "aguarda a vez" (não é falha)
+    assert len(sp.calls) == 1
+    assert ex.aguardando_autopsia(C2)
+    ex.drenar_obitos()                                     # a autópsia do ciclo classifica
     ex.disparar(C2)                                        # agora a conta está livre
     assert len(sp.calls) == 2
     assert not ex.curso_ativo(C1) and ex.curso_ativo(C2)
+
+
+def test_obito_pendente_de_outra_conta_nao_segura_esta():
+    # a espera é POR CONTA: a morte na conta-A não segura um disparo na conta-B.
+    sp = FakeSpawn()
+    ex = _exec(_hot(C1, "conta-A"), _hot(C2, "conta-B"), spawn=sp)
+    ex.disparar(C1)
+    sp.procs[0].encerrar(1)
+    assert ex.disparar(C2).startswith(f"local_iniciada:{C2}")
+    with pytest.raises(captura.AguardaAutopsia):
+        ex.disparar(C1)                                    # a própria conta-A espera
 
 
 # ==========================================================================
@@ -713,7 +734,7 @@ def test_rodizio_alterna_entre_passes_elegiveis_entre_ciclos():
         conf = ex.disparar(C1)
         escolhidos.append(conf.rsplit("=", 1)[1])
         sp.calls[-1]["proc"].encerrar(0)                  # encerra p/ liberar a conta
-        ex._reap()
+        ex.drenar_obitos()                                # a autópsia do ciclo (libera)
     assert escolhidos[0] != escolhidos[1]                 # alternou (anti-fome)
     assert set(escolhidos) <= {"base", "embed"}
 
@@ -858,7 +879,7 @@ def test_stoa_rodizio_alterna_entre_passes_elegiveis(monkeypatch):
         conf = ex.disparar(STOA)
         escolhidos.append(conf.rsplit("=", 1)[1])
         sp.calls[-1]["proc"].encerrar(0)                  # encerra p/ liberar a conta
-        ex._reap()
+        ex.drenar_obitos()                                # a autópsia do ciclo (libera)
     assert escolhidos[0] != escolhidos[1]                 # alternou (anti-fome)
     assert set(escolhidos) <= {"base", "embed"}
 

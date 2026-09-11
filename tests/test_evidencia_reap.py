@@ -115,11 +115,21 @@ def _executor(tmp_path, cursos, spawn):
         pid_vivo=spawn.vivo, pendencias_fn=lambda u, d: None)
 
 
+def _sem_guarda_de_autopsia(monkeypatch):
+    """ISOLA a cópia da cauda (defesa em profundidade): desde a r6 o próprio
+    `LocalExecutor.disparar` RECUSA relançar a conta com óbito não autopsiado
+    (`AguardaAutopsia`) — a sequência "relança antes da autópsia" deixou de acontecer por
+    ali. Estes testes a reproduzem de propósito para provar que, se ela voltar por qualquer
+    caminho, a evidência da morte ainda sobrevive ao truncamento."""
+    monkeypatch.setattr(captura.LocalExecutor, "_obito_pendente", lambda self, conta: None)
+
+
 # ==========================================================================
 # 1) NÍVEL EXECUTOR: reap -> relançamento trunca o .err -> a autópsia AINDA vê o
 #    TimeoutError da morte e a causa decide RELANÇAR (não "causa desconhecida").
 # ==========================================================================
-def test_reap_guarda_a_cauda_antes_do_relancamento_truncar_o_err(tmp_path):
+def test_reap_guarda_a_cauda_antes_do_relancamento_truncar_o_err(tmp_path, monkeypatch):
+    _sem_guarda_de_autopsia(monkeypatch)
     sp = _SpawnTee([_RUN_MORREU_DE_TIMEOUT, _RUN_SEGUINTE])
     ex = _executor(tmp_path, [captura.CursoLocal(KIWIFY, "kiwify-principal", "kiwify")],
                    sp)
@@ -166,9 +176,10 @@ def test_cauda_de_outro_run_nao_vira_evidencia_quando_o_tee_falhou(tmp_path):
     assert obitos["k"]["stderr_tail"] == ""               # não atribui o run de ontem
 
 
-def test_obito_de_saida_limpa_tambem_leva_a_cauda_do_proprio_run(tmp_path):
+def test_obito_de_saida_limpa_tambem_leva_a_cauda_do_proprio_run(tmp_path, monkeypatch):
     # exit 0: a cauda (o resumo final) também é capturada no reap — a causa usa a do
     # PRÓPRIO run mesmo que outro curso da conta já tenha truncado o .err.
+    _sem_guarda_de_autopsia(monkeypatch)
     sp = _SpawnTee(["Stats: total=2 ok=2 audio=0 falhou=0\n", _RUN_SEGUINTE])
     cursos = [captura.CursoLocal(C1, "a", "hotmart"), captura.CursoLocal(C2, "a", "hotmart")]
     ex = _executor(tmp_path, cursos, sp)
@@ -221,6 +232,7 @@ def test_ciclo_morte_colhida_na_passada_e_relancada_antes_da_autopsia(tmp_path, 
     # é desligada para reproduzir o loop do incidente, em que a conta ERA relançada antes
     # da autópsia: mesmo assim a evidência tem de sobreviver (dente só do item 1).
     monkeypatch.setattr(athena_local, "_aguardando_autopsia", lambda ex, curso: False)
+    _sem_guarda_de_autopsia(monkeypatch)                  # e a do executor (r6), idem
     sp = _SpawnTee([_RUN_MORREU_DE_TIMEOUT, _RUN_SEGUINTE])
     cursos = [captura.CursoLocal(C1, "hotmart-principal", "hotmart", total_esperado=18),
               captura.CursoLocal(C2, "hotmart-principal", "hotmart", total_esperado=18)]
@@ -263,9 +275,10 @@ def test_ciclo_morte_colhida_na_passada_e_relancada_antes_da_autopsia(tmp_path, 
 #    brinquedo num dir temporário (nada de sessão/perfil/lock reais): o 1º run morre de
 #    TimeoutError (exit 1); o 2º imprime as linhas do run seguinte e fica vivo.
 # ==========================================================================
-def test_ponta_a_ponta_spawn_real_trunca_e_a_cauda_do_reap_sobrevive(tmp_path):
+def test_ponta_a_ponta_spawn_real_trunca_e_a_cauda_do_reap_sobrevive(tmp_path, monkeypatch):
     import sys
     import time
+    _sem_guarda_de_autopsia(monkeypatch)
     motor = tmp_path / "motor"
     (motor / "motor").mkdir(parents=True)
     (motor / "motor" / "__init__.py").write_text("")

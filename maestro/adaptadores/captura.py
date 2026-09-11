@@ -1032,7 +1032,15 @@ DONOS_NAO_CAPTURA = ("reseed", "zelador")
 _ZELO_TIMEOUT_PADRAO_S = 600.0     # zelo travado: SIGTERM ao zelador (ele fecha o navegador)
 _ZELO_GRACE_PADRAO_S = 60.0        # ... e SIGKILL no grupo se não sair nesta janela
 _CAMPOS_LINHA_ZELADOR = frozenset({"plataforma", "conta", "resultado", "detalhe",
-                                   "expira_em", "vence_em_h", "provado_em"})
+                                   "expira_em", "vence_em_h", "provado_em", "prova"})
+# Teto de tempo PRÓPRIO do motor/zelador.py (env que ele lê): uma fração do watchdog, para o
+# zelo terminar sozinho (fechando o navegador) antes de o daemon precisar do SIGTERM.
+_ENV_TETO_ZELO = "ATHENA_ZELADOR_TETO_S"
+_TETO_ZELO_FRACAO = 0.8
+# CARIMBO DO RESEED HUMANO (M4): `scripts/reseed.py` do motor grava, depois de um login
+# concluído, `<lock_dir>/<sha256(conta)[:16]>.reseed.json` — ESPELHO de
+# motor/conta_lock.py::carimbo_path. Não termina em `.lock`: nenhum varredor de lock o lê.
+_CARIMBO_SUFIXO = ".reseed.json"
 
 
 def ler_linha_zelador(texto):
@@ -1050,6 +1058,24 @@ def ler_linha_zelador(texto):
             return None
         return {k: v for k, v in dados.items() if k in _CAMPOS_LINHA_ZELADOR}
     return None
+
+
+def _ts_num(v):
+    """float finito de um campo numérico de lock/carimbo, ou None (bool, NaN, lixo)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
+def _comando_e_zelo(comando) -> bool:
+    """A linha de comando é a de um `python -m motor.zelador` (a PROVA de que um PID vivo
+    de um lock `dono: zelador` ainda é o zelo, e não um PID reusado por outro processo)."""
+    try:
+        partes = shlex.split(comando or "")
+    except ValueError:
+        partes = (comando or "").split()
+    return any(a == "-m" and b == "motor.zelador" for a, b in zip(partes, partes[1:]))
 
 
 def _comando_cita_perfil(comando, perfil_abs) -> bool:
@@ -1457,6 +1483,29 @@ class LocalExecutor:
         except OSError:
             return None
 
+    def _carimbo_path(self, conta) -> str:
+        slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self._lock_dir, slug + _CARIMBO_SUFIXO)
+
+    def carimbo_reseed(self, conta):
+        """epoch do último reseed HUMANO concluído da conta — o carimbo que o
+        `scripts/reseed.py` do motor grava com o lock nas mãos (ESPELHO de
+        motor/conta_lock.py::carimbar_reseed) — ou None. Só leitura. Ilegível, de outra conta
+        ou sem `ts` numérico = None: na dúvida, NUNCA rearma."""
+        try:
+            with open(self._carimbo_path(conta), encoding="utf-8") as f:
+                dados = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(dados, dict) or str(dados.get("conta")) != str(conta):
+            return None
+        return _ts_num(dados.get("ts"))
+
+    def motor_dir_de(self, plataforma) -> str:
+        """A árvore do motor em que ESTE daemon roda a plataforma (o alerta monta o comando
+        exato do reseed com ela: a Stoa mora noutra árvore)."""
+        return self._motor_dir_de(plataforma)
+
     def contas_livres(self, contas) -> bool:
         """Nenhuma das contas tem lock em disco (vivo, intenção, PID morto ainda não
         autopsiado, ilegível). Só leitura."""
@@ -1546,12 +1595,19 @@ class LocalExecutor:
                "--conta", str(meta.conta)]
         log_path = self._zelo_log_path(meta.conta)
         env[_ENV_STDERR_TEE] = log_path
+        # teto PRÓPRIO do zelo (motor/zelador.py, asyncio.wait_for): termina sozinho, fechando
+        # o navegador, antes do SIGTERM deste watchdog.
+        env[_ENV_TETO_ZELO] = f"{max(30.0, _TETO_ZELO_FRACAO * self._zelo_timeout_s):.0f}"
         inicio = time.time() if agora is None else float(agora)
         feitos = []
         try:
             for c in contas:
+                # O LOCK carrega o que o vigia de uma encarnação FUTURA precisa para matar ou
+                # limpar este zelo se o daemon reiniciar no meio (`vigiar_zelos_orfaos`): o
+                # início (`ts`), o perfil (navegador órfão) e, depois, o `pid` e o `sinal`.
                 token = {"pid": None, "course_url": f"zelador:{meta.plataforma}",
-                         "conta": c, "ts": time.time(), "dono": "zelador", "zelo": chave}
+                         "conta": c, "ts": inicio, "dono": "zelador", "zelo": chave,
+                         "perfil": perfil_abs}
                 if not self._criar_lock_exclusivo(c, token):
                     raise ContaOcupada(f"conta {c!r} ocupada no mesmo instante — zelo desiste")
                 feitos.append((c, token))
@@ -1584,8 +1640,11 @@ class LocalExecutor:
             nav = self._navegador_no_perfil(z["perfil"])
             for c, token in z["tokens"].items():
                 if nav is not None:
-                    self._trocar_lock_se_nosso(c, token, dict(token, pid=nav[0],
-                                                              navegador_orfao=True))
+                    # `sinal` TERM com hora ainda desconhecida: o vigia persistido começa a
+                    # contar a carência na 1ª volta e escala para SIGKILL depois dela.
+                    self._trocar_lock_se_nosso(c, token, dict(
+                        token, pid=nav[0], navegador_orfao=True,
+                        sinal=["TERM", None] if nav[1] else None))
                 else:
                     self._remover_lock_se_nosso(c, token)
             if nav is not None and nav[1]:
@@ -1600,7 +1659,9 @@ class LocalExecutor:
         """Resultados dos zelos terminados desde a última drenagem (e zera). Também é o
         WATCHDOG: zelo vivo além de `zelo_timeout_s` leva SIGTERM (o zelador cancela e fecha
         o navegador normalmente); se não sair em `zelo_grace_s`, SIGKILL no grupo. O lock
-        só sai quando o processo sai (vivo = conta ocupada)."""
+        só sai quando o processo sai (vivo = conta ocupada). Cada sinal é GRAVADO no lock
+        (`sinal`): um restart do daemon no meio continua a escalada (`vigiar_zelos_orfaos`),
+        que também roda aqui para os zelos de encarnações anteriores."""
         agora = time.time() if agora is None else float(agora)
         self._reap()
         for z in self._zelos.values():
@@ -1611,11 +1672,141 @@ class LocalExecutor:
             if sinal is None and agora - z["inicio"] > self._zelo_timeout_s:
                 self._sinal_fn(pid, signal.SIGTERM, False)
                 z["sinal"] = ("TERM", agora)
+                self._gravar_sinal_do_zelo(z, ["TERM", agora])
             elif sinal is not None and sinal[0] == "TERM" and agora - sinal[1] > self._zelo_grace_s:
                 self._sinal_fn(pid, signal.SIGKILL, True)
                 z["sinal"] = ("KILL", agora)
+                self._gravar_sinal_do_zelo(z, ["KILL", agora])
+        self.vigiar_zelos_orfaos(agora)
         colhidos, self._zelos_colhidos = self._zelos_colhidos, []
         return colhidos
+
+    def _gravar_sinal_do_zelo(self, z, sinal):
+        for c, token in list(z["tokens"].items()):
+            novo = dict(token, sinal=list(sinal))
+            if self._trocar_lock_se_nosso(c, token, novo):
+                z["tokens"][c] = novo
+
+    def vigiar_zelos_orfaos(self, agora=None) -> list:
+        """WATCHDOG PERSISTIDO dos locks `dono: zelador` que NÃO são de um zelo desta
+        encarnação: o zelo de um daemon que reiniciou no meio (inclusive o rollback
+        `ATHENA_ZELADOR_ATIVO=0` + restart, quando nenhum zelador roda — por isso o loop
+        chama isto em TODO ciclo) e o lock que um zelo passou ao navegador órfão dele. Tudo o
+        que precisa está NO LOCK (`pid`, `ts` = início, `perfil`, `navegador_orfao`, `sinal`):
+
+          - PID vivo COM PROVA (a linha de comando é a do `python -m motor.zelador`, ou a do
+            navegador com o `--user-data-dir` do perfil): passado `zelo_timeout_s` do início,
+            SIGTERM; `zelo_grace_s` depois do TERM, SIGKILL (no grupo, se é o zelo). O sinal é
+            gravado no lock: outro restart continua a escalada, não a recomeça.
+          - PID vivo SEM prova (linha de comando ilegível): conservador — não mata; o lock fica.
+          - PID morto, ou vivo mas de OUTRO processo (PID reusado): o zelo acabou. Sem
+            navegador vivo no perfil, o lock SAI (numa conta ociosa ninguém mais o apagaria e
+            o zelador a veria ocupada para sempre); com navegador, passa ao PID dele.
+          - INTENÇÃO (`pid` None: crash entre criar o lock e promover o PID): só depois de
+            `zelo_timeout_s + zelo_grace_s` do início (o zelo que tenha subido já saiu pelo
+            teto próprio do motor), com a mesma checagem de navegador no perfil.
+        Devolve [(ação, conta)] (observabilidade/teste). Nunca levanta."""
+        agora = time.time() if agora is None else float(agora)
+        try:
+            self._reap()
+        except Exception:
+            pass
+        nossos = {}
+        for z in self._zelos.values():
+            for c, tok in z["tokens"].items():
+                nossos[c] = tok
+        try:
+            nomes = sorted(os.listdir(self._lock_dir))
+        except OSError:
+            return []
+        grupos = {}
+        for nome in nomes:
+            if not nome.endswith(".lock"):
+                continue
+            try:
+                with open(os.path.join(self._lock_dir, nome)) as f:
+                    dados = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(dados, dict) or dados.get("dono") != "zelador":
+                continue
+            conta = dados.get("conta")
+            if conta is None or nossos.get(str(conta)) == dados:
+                continue                                   # desta encarnação: vigia em memória
+            chave = ("intencao", str(conta)) if dados.get("pid") is None else dados.get("pid")
+            grupos.setdefault(chave, []).append((str(conta), dados))
+        acoes = []
+        for chave, locks in grupos.items():
+            try:
+                acoes.extend(self._vigiar_grupo_orfao(locks, agora))
+            except Exception:
+                pass                                       # vigia nunca derruba o chamador
+        return acoes
+
+    def _vigiar_grupo_orfao(self, locks, agora):
+        """Um zelo órfão = os locks (conta + parceiras) com o MESMO pid: decide UMA vez."""
+        conta0, d0 = locks[0]
+        pid = d0.get("pid")
+        perfil = d0.get("perfil") or ""
+        inicio = min((t for t in (_ts_num(d.get("ts")) for _, d in locks) if t is not None),
+                     default=None)
+        if pid is None:
+            if inicio is None or agora - inicio <= self._zelo_timeout_s + self._zelo_grace_s:
+                return [("intencao-aguarda", c) for c, _ in locks]
+            return self._encerrar_locks_orfaos(locks, perfil, agora)
+        orfao_nav = any(d.get("navegador_orfao") for _, d in locks)
+        vivo, prova = self._pid_vivo(pid), None
+        if vivo:
+            try:
+                comando = self._comando_fn(pid)
+            except Exception:
+                comando = None
+            if comando is not None:
+                prova = (_comando_cita_perfil(comando, perfil) if orfao_nav
+                         else _comando_e_zelo(comando))
+                if not prova:
+                    vivo = False                           # PID reusado: o zelo já acabou
+        if not vivo:
+            return self._encerrar_locks_orfaos(locks, perfil, agora)
+        if not prova:
+            return [("sem-prova", c) for c, _ in locks]    # ilegível: não mata, o lock fica
+        fases = {"KILL": 2, "TERM": 1}
+        sinal = max((d.get("sinal") for _, d in locks if isinstance(d.get("sinal"), list)
+                     and len(d.get("sinal")) == 2 and d["sinal"][0] in fases),
+                    key=lambda x: fases[x[0]], default=None)
+        novo = None
+        if sinal is None:
+            if inicio is not None and agora - inicio > self._zelo_timeout_s:
+                self._sinal_fn(pid, signal.SIGTERM, False)
+                novo = ["TERM", agora]
+        elif sinal[0] == "TERM" and _ts_num(sinal[1]) is None:
+            novo = ["TERM", agora]                         # TERM de hora desconhecida: conta daqui
+        elif sinal[0] == "TERM" and agora - _ts_num(sinal[1]) > self._zelo_grace_s:
+            self._sinal_fn(pid, signal.SIGKILL, not orfao_nav)
+            novo = ["KILL", agora]
+        if novo is None:
+            return [("aguarda", c) for c, _ in locks]
+        for c, d in locks:
+            self._trocar_lock_se_nosso(c, d, dict(d, sinal=novo))
+        return [(novo[0], c) for c, _ in locks]
+
+    def _encerrar_locks_orfaos(self, locks, perfil, agora):
+        """O zelo órfão acabou: sem navegador no perfil, os locks saem; com navegador, passam
+        ao PID dele (SIGTERM só com a prova de que é o navegador DESTE perfil)."""
+        nav = self._navegador_no_perfil(perfil) if perfil else None
+        acoes = []
+        for c, d in locks:
+            if nav is None:
+                if self._remover_lock_se_nosso(c, d):
+                    acoes.append(("solto", c))
+            elif d.get("pid") != nav[0]:
+                if self._trocar_lock_se_nosso(c, d, dict(
+                        d, pid=nav[0], navegador_orfao=True,
+                        sinal=["TERM", agora] if nav[1] else None)):
+                    acoes.append(("navegador-orfao", c))
+        if nav is not None and nav[1] and any(d.get("pid") != nav[0] for _, d in locks):
+            self._sinal_fn(nav[0], signal.SIGTERM, False)
+        return acoes
 
     def _avisar_portao(self, metodo):
         """Chama um gancho do portão de carga (novo_ciclo / registrar_disparo /

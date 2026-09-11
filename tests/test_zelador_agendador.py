@@ -12,6 +12,12 @@ processos do SO (o `pid_vivo` do executor consulta ela, e ela atravessa encarna�
 `FakeSpawn` registra cmd/env/cwd e, ao terminar um zelo, escreve a linha `ZELADOR {json}`
 no arquivo que o executor mandou o spawn tee'ar (é o que o `_spawn_popen` real faz com
 stdout+stderr). O executor é o REAL, com lock_dir/logs em tmp. Nada navega, nada loga.
+
+Revisão do P7 — o dublê passou a modelar dois mecanismos que ele ignorava (e por isso a
+suíte deixou passar o rearme sem humano): num VIVA o motor real RE-PERSISTE o arquivo de
+sessão (`capture_state` do `ensure_session`) e o Chrome mexe na raiz do perfil — o mtime
+dos dois vai para a hora do zelo; e a linha de uma MORTE na Stoa/Alpaclass traz
+`prova: positiva` (a sonda tri-estado do motor novo).
 """
 import asyncio
 import json
@@ -76,33 +82,65 @@ class Mundo:
         return p is not None and p.poll() is None
 
 
+_AUTO = object()
+
+
 class FakeSpawn:
     def __init__(self, mundo=None):
         self.mundo = mundo or Mundo()
         self.calls = []
+        self.agora = None                 # a hora (falsa) do passo em curso — `_passo` a põe
 
     def __call__(self, cmd, *, env, cwd):
         proc = self.mundo.novo()
-        self.calls.append({"cmd": list(cmd), "env": dict(env), "cwd": cwd, "proc": proc})
+        self.calls.append({"cmd": list(cmd), "env": dict(env), "cwd": cwd, "proc": proc,
+                           "t": self.agora})
         return proc
 
     def zelos(self):
         return [c for c in self.calls if c["cmd"][2] == "motor.zelador"]
 
-    def terminar(self, i, code, resultado=None, *, expira=None, detalhe="x", antes=""):
+    @staticmethod
+    def _absol(p, cwd):
+        return p if os.path.isabs(p) else os.path.join(cwd, p)
+
+    def _o_viva_mexe_no_disco(self, call):
+        """O MECANISMO do viva real: o `ensure_session` re-persiste o arquivo de sessão
+        (`capture_state`) e o Chrome cria/apaga Singleton* na raiz do perfil — mtime = a hora
+        do zelo (+30 s). Só o que existe (o zelador real nem abre perfil inexistente)."""
+        if call["t"] is None:
+            return
+        quando = call["t"] + 30
+        env, cwd, plat = call["env"], call["cwd"], call["cmd"][3]
+        spec = captura._PLATAFORMAS.get(plat)
+        sess = (env.get(spec.session_env) if spec is not None and spec.session_env else "") \
+            or zmod._SESSAO_PADRAO.get(plat, "")
+        for p in (env.get("CHROME_USER_DATA_DIR") or "", sess):
+            if p and os.path.exists(self._absol(p, cwd)):
+                os.utime(self._absol(p, cwd), (quando, quando))
+
+    def terminar(self, i, code, resultado=None, *, expira=None, detalhe="x", antes="",
+                 prova=_AUTO):
         """Encerra o i-ésimo spawn; se `resultado`, grava a linha ZELADOR no tee (como o
-        motor/zelador.py real imprime no stdout, que o `_spawn_popen` tee'a)."""
+        motor/zelador.py real imprime no stdout, que o `_spawn_popen` tee'a). `prova` (default)
+        = a do motor novo: "positiva" numa morte da Stoa/Alpaclass; None nas demais."""
         call = self.calls[i]
+        plat = call["cmd"][3] if len(call["cmd"]) > 3 else ""
+        if prova is _AUTO:
+            prova = "positiva" if (resultado == "morta" and plat in zmod.SONDA_TRI_ESTADO) \
+                else None
         path = call["env"].get("_ATHENA_MOTOR_STDERR")
         if path:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
                 f.write(antes)
                 if resultado is not None:
-                    linha = {"plataforma": call["cmd"][3], "conta": call["cmd"][6],
+                    linha = {"plataforma": plat, "conta": call["cmd"][6],
                              "resultado": resultado, "detalhe": detalhe, "expira_em": expira,
-                             "vence_em_h": None, "provado_em": None}
+                             "vence_em_h": None, "provado_em": None, "prova": prova}
                     f.write("ZELADOR " + json.dumps(linha) + "\n")
+        if resultado == "viva" and code == 0:
+            self._o_viva_mexe_no_disco(call)
         call["proc"].encerrar(code)
 
 
@@ -170,9 +208,19 @@ def _ocioso(ex, conta, desde):
     os.utime(p, (desde, desde))
 
 
-def _passo(z, ex, agora, *, estado=None, alertas=None):
+def _passo(z, ex, agora, *, estado=None, alertas=None, ativos=None):
+    ex.sp.agora = agora
     return z.passo(ex, {} if estado is None else estado, agora=agora,
-                   alertas=alertas if alertas is not None else FakeAlertas())
+                   alertas=alertas if alertas is not None else FakeAlertas(), ativos=ativos)
+
+
+def _carimbar(ex, conta, ts, plataforma="kiwify"):
+    """O que `scripts/reseed.py` (motor/conta_lock.py::carimbar_reseed) grava depois de um
+    login humano concluído — no formato do espelho."""
+    import hashlib
+    slug = hashlib.sha256(conta.encode("utf-8")).hexdigest()[:16]
+    with open(os.path.join(ex._lock_dir, slug + ".reseed.json"), "w") as f:
+        json.dump({"conta": conta, "plataforma": plataforma, "ts": ts, "dono": "reseed"}, f)
 
 
 def _lock(ex, conta):
@@ -774,21 +822,29 @@ def test_alertas_real_logins_e_preventivo_sao_essenciais_e_dizem_se_chegou():
 
 
 # ==========================================================================================
-# M4 — mtime da sessão depois da morte dispara o zelo; viva rearma o latch de reseed
+# M4 — o rearme exige o CARIMBO do reseed humano; o mtime só re-sonda (achado bloqueante)
 # ==========================================================================================
-def test_mtime_da_sessao_apos_morte_dispara_zelar_e_viva_rearma_o_latch(tmp_path):
+def _latch_kiwify(tmp_path, morte_ciclo, sess_mtime):
     sess = tmp_path / "aula" / ".kiwify-session.json"
-    sess.parent.mkdir(parents=True)
+    sess.parent.mkdir(parents=True, exist_ok=True)
     sess.write_text("{}")
-    os.utime(sess, (T0 - 2 * DIA, T0 - 2 * DIA))
+    os.utime(sess, (sess_mtime, sess_mtime))
+    perfil = tmp_path / "aula" / ".chrome-profile-kiwify-principal"
+    perfil.mkdir(parents=True, exist_ok=True)
+    os.utime(perfil, (sess_mtime, sess_mtime))
     cursos = [_c(KIW, "kiwify-principal", "kiwify", str(sess)),
               _c(KIW2, "kiwify-principal", "kiwify", str(sess))]
     estado = {
         KIW: {"irredutivel": True, "ultima_causa": "escalar_reseed", "esgotado_avisado": True,
-              "fase": captura.FASE_NOVO, "_morte_ciclo": T0 - 10 * H},
+              "fase": captura.FASE_NOVO, "_morte_ciclo": morte_ciclo},
         KIW2: {"irredutivel": True, "benched_exit5": True, "ultima_causa": "relancar",
                "fase": captura.FASE_NOVO},
     }
+    return sess, perfil, cursos, estado
+
+
+def test_carimbo_do_reseed_apos_morte_dispara_zelar_e_viva_rearma_o_latch(tmp_path):
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - 10 * H, T0 - 2 * DIA)
     ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
     _ocioso(ex, "kiwify-principal", T0 - DIA)
     _passo(z, ex, T0, estado=estado, alertas=al)
@@ -797,7 +853,8 @@ def test_mtime_da_sessao_apos_morte_dispara_zelar_e_viva_rearma_o_latch(tmp_path
     _passo(z, ex, T0 + 5 * H, estado=estado, alertas=al)
     assert len(ex.sp.zelos()) == 1                            # morta: parada
     assert estado[KIW]["irredutivel"] is True
-    os.utime(sess, (T0 + 6 * H, T0 + 6 * H))                  # o humano rodou o reseed
+    _carimbar(ex, "kiwify-principal", T0 + 6 * H)             # o humano rodou o reseed.py
+    os.utime(sess, (T0 + 6 * H, T0 + 6 * H))
     _passo(z, ex, T0 + 6 * H + 60, estado=estado, alertas=al)
     assert len(ex.sp.zelos()) == 2                            # zela JÁ (sem esperar intervalo)
     ex.sp.terminar(1, 0, "viva")
@@ -806,6 +863,84 @@ def test_mtime_da_sessao_apos_morte_dispara_zelar_e_viva_rearma_o_latch(tmp_path
     assert "irredutivel" not in estado[KIW] and "esgotado_avisado" not in estado[KIW]
     assert estado[KIW]["fase"] == captura.FASE_NOVO
     assert estado[KIW2]["irredutivel"] is True               # bench de exit-5 não é do zelador
+
+
+def test_mtime_apos_morte_resonda_mas_sem_carimbo_humano_nunca_rearma(tmp_path):
+    """Um `--reseed` AVULSO (sem carimbo) ou a captura de outro curso mexe no arquivo: o
+    zelador RE-SONDA a conta aguardando-humano (a sessão pode ter voltado) e, viva, sai do
+    aguardando — mas a CAPTURA travada só rearma com o carimbo do reseed humano."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - 10 * H, T0 - 2 * DIA)
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado, alertas=al)
+    ex.sp.terminar(0, 3, "morta")
+    _passo(z, ex, T0 + 60, estado=estado, alertas=al)
+    os.utime(sess, (T0 + 6 * H, T0 + 6 * H))                  # mexeram, sem reseed.py
+    _passo(z, ex, T0 + 6 * H + 60, estado=estado, alertas=al)
+    assert len(ex.sp.zelos()) == 2                            # re-sonda já
+    ex.sp.terminar(1, 0, "viva")
+    _passo(z, ex, T0 + 6 * H + 120, estado=estado, alertas=al)
+    assert z.estado["kiwify:kiwify-principal"]["status"] == "viva"
+    assert estado[KIW]["irredutivel"] is True                # sem carimbo: não rearma
+
+
+def test_vivas_seguidos_sem_humano_nunca_rearmam_mesmo_com_o_zelo_regravando_o_arquivo(
+        tmp_path):
+    """O achado BLOQUEANTE da revisão, com o dublê que modela o mecanismo: cada viva
+    re-persiste o arquivo de sessão e mexe no perfil (mtime = a hora do zelo), e a captura
+    de OUTRO curso da conta também mexe. Com a marca antiga (mtime), o 2º viva rearmava o
+    latch sem ninguém ter logado (e a captura morria de novo: um alerta por volta)."""
+    sess, perfil, cursos, estado = _latch_kiwify(tmp_path, T0 - H, T0 - 2 * DIA)
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    t = T0
+    for n in range(3):
+        _passo(z, ex, t, estado=estado)
+        assert len(ex.sp.zelos()) == n + 1
+        ex.sp.terminar(len(ex.sp.calls) - 1, 0, "viva")
+        _passo(z, ex, t + 60, estado=estado)
+        assert os.path.getmtime(sess) == t + 30               # o dublê regravou o arquivo
+        # a captura de outro curso da conta roda entre os zelos e mexe no perfil/arquivo
+        for p in (sess, perfil):
+            os.utime(p, (t + 2 * H, t + 2 * H))
+        t += 13 * H
+        assert estado[KIW].get("irredutivel") is True, f"rearmou sem humano no viva {n + 1}"
+
+
+def test_carimbo_anterior_ao_latch_nao_rearma_e_nao_vira_laco(tmp_path):
+    """O humano relogou (carimbo), a captura rearmou e MORREU DE NOVO depois do login: o
+    próximo viva NÃO rearma por aquele mesmo carimbo — senão: morre, rearma, morre..."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - H, T0 - 2 * DIA)
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _carimbar(ex, "kiwify-principal", T0 - 3 * H)             # login humano ANTES do latch
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado)
+    ex.sp.terminar(0, 0, "viva")
+    _passo(z, ex, T0 + 60, estado=estado)
+    assert estado[KIW]["irredutivel"] is True
+
+
+def test_carimbo_novo_poe_a_unidade_na_frente_mesmo_viva_e_so_uma_vez(tmp_path):
+    """A captura travou (sessão morta) sem o zelador ter visto; o humano rodou o reseed.py:
+    o zelo vem JÁ (não no fim do intervalo de 6–12 h), rearma, e o mesmo carimbo não dispara
+    outro zelo — nem depois de um restart (o `carimbo_visto` é persistido)."""
+    sess, _, cursos, estado = _latch_kiwify(tmp_path, T0 - H, T0 - 2 * DIA)
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado)
+    ex.sp.terminar(0, 0, "viva")                              # viva, sem humano: segue travado
+    _passo(z, ex, T0 + 60, estado=estado)
+    assert estado[KIW]["irredutivel"] is True
+    _carimbar(ex, "kiwify-principal", T0 + H)
+    _passo(z, ex, T0 + H + 60, estado=estado)                 # bem antes do intervalo (>= 6 h)
+    assert len(ex.sp.zelos()) == 2
+    ex.sp.terminar(1, 0, "viva")
+    _passo(z, ex, T0 + H + 120, estado=estado)
+    assert "irredutivel" not in estado[KIW]
+    z2 = _zel(tmp_path, cursos)                               # restart do daemon
+    for dt in (2 * H, 3 * H):
+        _passo(z2, ex, T0 + dt, estado=estado)
+    assert len(ex.sp.zelos()) == 2                            # o carimbo já teve o seu zelo
 
 
 def test_mtime_mexido_mas_segue_morta_nao_vira_loop(tmp_path):
@@ -991,28 +1126,9 @@ def test_watchdog_do_zelo_travado_sigterm_depois_sigkill_e_lock_so_sai_morto(tmp
     assert st["resultado"] == "inconclusiva" and st["status"] == "desconhecida"
 
 
-def test_viva_sem_acao_humana_depois_do_latch_nao_rearma(tmp_path):
-    """Latch de reseed com o arquivo de sessão MAIS VELHO que ele: ninguém relogou. Rearmar
-    num viva desses abriria um laço (captura morre -> latch -> zelo viva -> rearma -> ...),
-    com um `sessao_expirada` por volta. O rearme exige a marca de ação humana."""
-    sess = tmp_path / "aula" / ".kiwify-session.json"
-    sess.parent.mkdir(parents=True)
-    sess.write_text("{}")
-    os.utime(sess, (T0 - 2 * DIA, T0 - 2 * DIA))
-    cursos = [_c(KIW, "kiwify-principal", "kiwify", str(sess))]
-    estado = {KIW: {"irredutivel": True, "ultima_causa": "escalar_reseed",
-                    "fase": captura.FASE_NOVO, "_morte_ciclo": T0 - H}}
-    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
-    _ocioso(ex, "kiwify-principal", T0 - DIA)
-    _passo(z, ex, T0, estado=estado)
-    ex.sp.terminar(0, 0, "viva")
-    _passo(z, ex, T0 + 60, estado=estado)
-    assert estado[KIW]["irredutivel"] is True
-
-
 def test_viva_depois_de_reseed_humano_rearma_mesmo_sem_o_zelador_ter_visto_a_morte(tmp_path):
-    """A captura morreu (latch) e o humano relogou (arquivo mais novo que o latch) sem o
-    zelador ter provado a morte: o próximo zelo viva rearma — sem esperar restart."""
+    """A captura morreu (latch) e o humano relogou pelo reseed.py (carimbo mais novo que o
+    latch) sem o zelador ter provado a morte: o próximo zelo viva rearma — sem restart."""
     sess = tmp_path / "aula" / ".kiwify-session.json"
     sess.parent.mkdir(parents=True)
     sess.write_text("{}")
@@ -1022,11 +1138,35 @@ def test_viva_depois_de_reseed_humano_rearma_mesmo_sem_o_zelador_ter_visto_a_mor
                     "esgotado_avisado": True, "fase": captura.FASE_NOVO,
                     "_morte_ciclo": T0 - H}}
     ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _carimbar(ex, "kiwify-principal", T0 - 30 * 60)
     _ocioso(ex, "kiwify-principal", T0 - DIA)
     _passo(z, ex, T0, estado=estado)
     ex.sp.terminar(0, 0, "viva")
     _passo(z, ex, T0 + 60, estado=estado)
     assert "irredutivel" not in estado[KIW]
+
+
+def test_executor_le_o_carimbo_no_formato_do_motor_e_nada_mais(tmp_path):
+    """ESPELHO de motor/conta_lock.py::carimbar_reseed: `<lock_dir>/<sha256[:16]>.reseed.json`
+    com `ts`. Ilegível, de outra conta ou sem `ts` numérico = None (na dúvida, não rearma);
+    e o carimbo NUNCA é lido como lock (a conta não fica ocupada por ele)."""
+    import hashlib
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    ex = _exec(tmp_path, cursos)
+    assert ex.carimbo_reseed("kiwify-principal") is None
+    _carimbar(ex, "kiwify-principal", T0)
+    slug = hashlib.sha256(b"kiwify-principal").hexdigest()[:16]
+    assert os.path.exists(os.path.join(ex._lock_dir, slug + ".reseed.json"))
+    assert ex.carimbo_reseed("kiwify-principal") == T0
+    assert ex.conta_ocupada("kiwify-principal") is False
+    assert ex.contas_livres(["kiwify-principal"]) is True
+    assert ex.zelo_em_curso() is False
+    for lixo in ("{", json.dumps({"conta": "outra", "ts": T0}),
+                 json.dumps({"conta": "kiwify-principal", "ts": "ontem"}),
+                 json.dumps({"conta": "kiwify-principal", "ts": True})):
+        with open(os.path.join(ex._lock_dir, slug + ".reseed.json"), "w") as f:
+            f.write(lixo)
+        assert ex.carimbo_reseed("kiwify-principal") is None
 
 
 def test_zelador_so_zela_o_que_a_captura_pode_rodar(tmp_path):
@@ -1052,3 +1192,367 @@ def test_executor_recusa_segundo_zelo_mesmo_de_outra_conta(tmp_path):
         ex.disparar_zelo("curseduca:curseduca-segueadi", cursos[1], agora=T0)
     assert len(ex.sp.calls) == 1
     assert not os.path.exists(ex._lock_path("curseduca-segueadi"))
+
+
+# ==========================================================================================
+# REVISÃO DO P7 — item 2: queda de rede nunca vira morte (Stoa/Alpaclass exigem prova positiva)
+# ==========================================================================================
+@pytest.mark.parametrize("plat,url,conta", [(STOA, None, "stoa-principal"),
+                                            ("https://fsp.alpaclass.com/", None,
+                                             "alpaclass-principal")])
+def test_morte_sem_prova_positiva_na_stoa_e_alpaclass_e_inconclusiva(tmp_path, plat, url, conta):
+    """Um motor/árvore ANTIGO (sem a sonda tri-estado) diz "morta" numa queda de internet.
+    Sem `prova: positiva` o daemon não conta: nem suspeita, nem alerta."""
+    p = "stoa" if plat == STOA else "alpaclass"
+    cursos = [_c(plat, conta, p)]
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, conta, T0 - DIA)
+    _passo(z, ex, T0, alertas=al)
+    ex.sp.terminar(0, 3, "morta", detalhe="SessionDeadError", prova=None)
+    _passo(z, ex, T0 + 60, alertas=al)
+    st = z.estado[f"{p}:{conta}"]
+    assert st["resultado"] == "inconclusiva" and st["mortes_seguidas"] == 0
+    assert st["status"] == "desconhecida" and st["detalhe"] == "morte sem prova positiva"
+    assert al.logins == []
+
+
+def test_confirmacao_da_stoa_exige_duas_provas_positivas_nunca_falhas_de_rede(tmp_path):
+    cursos = [_c(STOA, "stoa-principal", "stoa")]
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "stoa-principal", T0 - DIA)
+    _passo(z, ex, T0, alertas=al)
+    ex.sp.terminar(0, 3, "morta")                               # 1ª prova POSITIVA
+    _passo(z, ex, T0 + 60, alertas=al)
+    st = z.estado["stoa:stoa-principal"]
+    assert st["status"] == "morte-suspeita"
+    _passo(z, ex, T0 + 31 * 60, alertas=al)
+    ex.sp.terminar(1, 5, "inconclusiva", detalhe="SessionProbeInconclusiveError")  # rede caiu
+    _passo(z, ex, T0 + 32 * 60, alertas=al)
+    assert st["status"] == "morte-suspeita" and al.logins == []
+    _passo(z, ex, T0 + 32 * 60 + H, alertas=al)
+    ex.sp.terminar(2, 3, "morta", prova=None)                   # "morta" sem prova: não conta
+    _passo(z, ex, T0 + 32 * 60 + H + 60, alertas=al)
+    assert st["status"] == "morte-suspeita" and al.logins == []
+    _passo(z, ex, T0 + 32 * 60 + 3 * H + 120, alertas=al)
+    ex.sp.terminar(3, 3, "morta")                               # 2ª prova POSITIVA
+    _passo(z, ex, T0 + 32 * 60 + 3 * H + 180, alertas=al)
+    assert st["status"] == "aguardando-humano"
+    assert [a for a, _ in al.logins] == [("stoa:stoa-principal",)]
+
+
+def test_hubla_sem_sonda_tri_estado_segue_a_confirmacao_de_antes(tmp_path):
+    """A Hubla não tem a sonda tri-estado (a rede dela já sobe inconclusiva): a morte dela
+    não carrega `prova` e continua contando para a confirmação espaçada."""
+    cursos = [_c(HUB, "hubla-principal", "hubla")]
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hubla-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    ex.sp.terminar(0, 3, "morta")
+    _passo(z, ex, T0 + 60)
+    assert z.estado["hubla:hubla-principal"]["status"] == "morte-suspeita"
+
+
+def test_a_linha_do_zelador_traz_a_prova_e_nada_fora_da_lista():
+    linha = captura.ler_linha_zelador('ZELADOR {"resultado": "morta", "prova": "positiva", '
+                                      '"cookie": "x"}')
+    assert linha == {"resultado": "morta", "prova": "positiva"}
+
+
+# ==========================================================================================
+# REVISÃO DO P7 — item 3: o vigia do zelo travado sobrevive ao restart do daemon
+# ==========================================================================================
+_CMD_ZELO = "/opt/aula/.venv/bin/python -m motor.zelador kiwify {} --conta kiwify-principal"
+
+
+def _zelo_e_restart(tmp_path, comando_fn=None, **kw):
+    """Um zelo disparado por um daemon que REINICIOU no meio (o `_zelos` em memória morreu
+    com ele): devolve (ex2, proc do zelo, sinais) — ex2 é a encarnação nova."""
+    import signal as _s  # noqa: F401
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    sinais = []
+    ex = _exec(tmp_path, cursos, zelo_timeout_s=600, zelo_grace_s=60,
+               sinal_fn=lambda pid, sig, grupo: sinais.append((pid, sig, grupo)), **kw)
+    z = _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    proc = ex.sp.calls[0]["proc"]
+    cmd = comando_fn or (lambda pid: _CMD_ZELO.format(KIW) if pid == proc.pid else None)
+    ex2 = _exec(tmp_path, cursos, sp=ex.sp, zelo_timeout_s=600, zelo_grace_s=60,
+                sinal_fn=lambda pid, sig, grupo: sinais.append((pid, sig, grupo)),
+                comando_fn=cmd)
+    return ex2, proc, sinais
+
+
+def test_zelo_orfao_travado_depois_do_restart_leva_sigterm_e_sigkill_pelo_lock(tmp_path):
+    import signal
+    ex2, proc, sinais = _zelo_e_restart(tmp_path)
+    ex2.vigiar_zelos_orfaos(T0 + 300)
+    assert sinais == []                                        # dentro do teto: nada
+    assert _lock(ex2, "kiwify-principal")["pid"] == proc.pid
+    ex2.vigiar_zelos_orfaos(T0 + 601)
+    assert sinais == [(proc.pid, signal.SIGTERM, False)]
+    assert _lock(ex2, "kiwify-principal")["sinal"] == ["TERM", T0 + 601]   # gravado no lock
+    ex2.vigiar_zelos_orfaos(T0 + 630)
+    assert len(sinais) == 1                                    # carência: não repete o TERM
+    ex2.vigiar_zelos_orfaos(T0 + 662)
+    assert sinais[-1] == (proc.pid, signal.SIGKILL, True)      # o GRUPO do zelo
+    assert _lock(ex2, "kiwify-principal")["pid"] == proc.pid   # vivo => o lock fica
+    proc.encerrar(-9)
+    ex2.vigiar_zelos_orfaos(T0 + 700)
+    assert not os.path.exists(ex2._lock_path("kiwify-principal"))   # morto: a conta volta
+
+
+def test_sinal_gravado_continua_a_escalada_depois_de_outro_restart(tmp_path):
+    """O TERM foi mandado pela encarnação ANTERIOR (em memória) e gravado no lock: a nova
+    não recomeça do zero — espera a carência e manda o KILL."""
+    import signal
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    sinais = []
+    ex = _exec(tmp_path, cursos, zelo_timeout_s=600, zelo_grace_s=60,
+               sinal_fn=lambda pid, sig, grupo: sinais.append((pid, sig, grupo)))
+    z = _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    proc = ex.sp.calls[0]["proc"]
+    _passo(z, ex, T0 + 601)                                    # watchdog em memória: TERM
+    assert sinais == [(proc.pid, signal.SIGTERM, False)]
+    assert _lock(ex, "kiwify-principal")["sinal"] == ["TERM", T0 + 601]
+    ex2 = _exec(tmp_path, cursos, sp=ex.sp, zelo_timeout_s=600, zelo_grace_s=60,
+                sinal_fn=lambda pid, sig, grupo: sinais.append((pid, sig, grupo)),
+                comando_fn=lambda pid: _CMD_ZELO.format(KIW))
+    ex2.vigiar_zelos_orfaos(T0 + 620)
+    assert len(sinais) == 1                                    # sem 2º TERM
+    ex2.vigiar_zelos_orfaos(T0 + 662)
+    assert sinais[-1] == (proc.pid, signal.SIGKILL, True)
+
+
+def test_zelo_orfao_que_ja_saiu_solta_o_lock_para_a_conta_voltar_a_ser_zelada(tmp_path):
+    """Sem este vigia, o lock de PID morto de um zelo órfão ficava para sempre numa conta
+    ociosa (nenhuma captura o apagava) e o zelador a veria "ocupada" eternamente."""
+    ex2, proc, sinais = _zelo_e_restart(tmp_path)
+    proc.encerrar(0)
+    assert ex2.contas_livres(["kiwify-principal"]) is False
+    ex2.vigiar_zelos_orfaos(T0 + 120)
+    assert ex2.contas_livres(["kiwify-principal"]) is True
+    assert sinais == []
+
+
+def test_pid_reusado_nao_leva_sinal_e_o_lock_sai(tmp_path):
+    """O zelo morreu e o PID foi reusado por OUTRO processo (a linha de comando não é a do
+    motor.zelador): matar seria matar um inocente; o zelo acabou — o lock sai."""
+    ex2, proc, sinais = _zelo_e_restart(tmp_path, comando_fn=lambda pid: "/usr/bin/vim notas.txt")
+    ex2.vigiar_zelos_orfaos(T0 + 2000)
+    assert sinais == []
+    assert not os.path.exists(ex2._lock_path("kiwify-principal"))
+
+
+def test_zelo_orfao_sem_prova_nao_leva_sinal_e_o_lock_fica(tmp_path):
+    ex2, proc, sinais = _zelo_e_restart(tmp_path, comando_fn=lambda pid: None)
+    ex2.vigiar_zelos_orfaos(T0 + 5000)
+    assert sinais == []
+    assert _lock(ex2, "kiwify-principal")["pid"] == proc.pid
+
+
+def test_intencao_orfa_do_zelador_sai_so_depois_do_teto_e_sem_navegador(tmp_path):
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    ex = _exec(tmp_path, cursos, zelo_timeout_s=600, zelo_grace_s=60)
+    perfil = tmp_path / "aula" / ".chrome-profile-kiwify-principal"
+    perfil.mkdir(parents=True)
+    intencao = {"pid": None, "course_url": "zelador:kiwify", "conta": "kiwify-principal",
+                "ts": T0, "dono": "zelador", "zelo": "kiwify:kiwify-principal",
+                "perfil": str(perfil)}
+    with open(ex._lock_path("kiwify-principal"), "w") as f:
+        json.dump(intencao, f)
+    assert ex.zelo_em_curso() is True                          # bloqueia todos os zelos
+    ex.vigiar_zelos_orfaos(T0 + 600)
+    assert _lock(ex, "kiwify-principal") == intencao           # dentro do teto: fica
+    chrome = ex.sp.mundo.novo()                                # o zelo subiu e deixou Chrome
+    (perfil / "SingletonLock").symlink_to(f"host-{chrome.pid}")
+    ex.vigiar_zelos_orfaos(T0 + 661)
+    lk = _lock(ex, "kiwify-principal")
+    assert lk["pid"] == chrome.pid and lk["navegador_orfao"]  # passa ao navegador
+    chrome.encerrar(0)
+    ex.vigiar_zelos_orfaos(T0 + 700)
+    assert not os.path.exists(ex._lock_path("kiwify-principal"))
+    assert ex.zelo_em_curso() is False
+
+
+def test_navegador_orfao_com_prova_escala_para_sigkill_depois_da_carencia(tmp_path):
+    import signal
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    perfil = tmp_path / "aula" / ".chrome-profile-kiwify-principal"
+    perfil.mkdir(parents=True)
+    sinais = []
+    ex = _exec(tmp_path, cursos, zelo_grace_s=60,
+               sinal_fn=lambda pid, sig, grupo: sinais.append((pid, sig, grupo)),
+               comando_fn=lambda pid: f"/Applications/Chrome --user-data-dir={perfil} --x")
+    z = _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    chrome = ex.sp.mundo.novo()
+    (perfil / "SingletonLock").symlink_to(f"host-{chrome.pid}")
+    ex.sp.terminar(0, 0, "viva")
+    _passo(z, ex, T0 + 60)
+    assert sinais == [(chrome.pid, signal.SIGTERM, False)]
+    _passo(z, ex, T0 + 100)
+    assert len(sinais) == 1                                    # a carência começa a contar
+    _passo(z, ex, T0 + 200)
+    assert sinais[-1] == (chrome.pid, signal.SIGKILL, False)   # o navegador, sem grupo
+
+
+def test_rollback_flag_desligada_o_ciclo_ainda_vigia_o_zelo_orfao(tmp_path):
+    """ATHENA_ZELADOR_ATIVO=0 + restart no meio de um zelo: não há zelador (None), mas o
+    ciclo roda o vigia persistido — o zelo pendurado não segura a conta para sempre."""
+    import signal
+    ex2, proc, sinais = _zelo_e_restart(tmp_path)
+    athena_local.ciclo_local([_c(KIW, "kiwify-principal", "kiwify")], ex2, lambda c: (10, 10),
+                             _Voz(), {}, {}, agora=T0 + 601, zelador=None)
+    assert (proc.pid, signal.SIGTERM, False) in sinais
+
+
+def test_o_zelo_recebe_o_teto_proprio_do_motor_no_env(tmp_path):
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    ex = _exec(tmp_path, cursos, zelo_timeout_s=600)
+    ex.disparar_zelo("kiwify:kiwify-principal", cursos[0], agora=T0)
+    env = ex.sp.calls[0]["env"]
+    assert float(env["ATHENA_ZELADOR_TETO_S"]) < 600          # termina antes do SIGTERM
+    assert float(env["ATHENA_ZELADOR_TETO_S"]) == 480
+    lk = _lock(ex, "kiwify-principal")
+    assert lk["ts"] == T0 and lk["perfil"].endswith(".chrome-profile-kiwify-principal")
+
+
+# ==========================================================================================
+# REVISÃO DO P7 — item 4: a sonda escolhe um curso que a captura PODE rodar
+# ==========================================================================================
+HOT2 = "https://hotmart.com/pt-br/club/x/products/2"
+HOT3 = "https://hotmart.com/pt-br/club/x/products/3"
+
+
+def test_sonda_nao_usa_curso_travado_benchado_nem_fora_do_gate(tmp_path):
+    cursos = [_c(HOT, "hotmart-principal", "hotmart"), _c(HOT2, "hotmart-principal", "hotmart"),
+              _c(HOT3, "hotmart-principal", "hotmart"),
+              _c("https://hotmart.com/pt-br/club/x/products/4", "hotmart-principal", "hotmart")]
+    estado = {HOT: {"irredutivel": True, "ultima_causa": "escalar_reseed",   # 403 de 1 produto
+                    "_morte_ciclo": T0 - H},
+              HOT2: {"irredutivel": True, "benched_exit5": True, "ultima_causa": "relancar"},
+              HOT3: {"_saida_limpa_ciclo": T0 - 2 * DIA},
+              "https://hotmart.com/pt-br/club/x/products/4": {"_saida_limpa_ciclo": T0 - DIA}}
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hotmart-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado,
+           ativos=frozenset({HOT, HOT2, HOT3}))                # o 4º ficou fora do gate
+    assert ex.sp.zelos()[0]["cmd"][4] == HOT3
+
+
+def test_sonda_prefere_o_curso_de_captura_limpa_mais_recente(tmp_path):
+    cursos = [_c(HOT, "hotmart-principal", "hotmart"), _c(HOT2, "hotmart-principal", "hotmart"),
+              _c(HOT3, "hotmart-principal", "hotmart")]
+    estado = {HOT2: {"_saida_limpa_ciclo": T0 - DIA}, HOT3: {"_saida_limpa_ciclo": T0 - 3 * DIA}}
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hotmart-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado)
+    assert ex.sp.zelos()[0]["cmd"][4] == HOT2
+
+
+def test_conta_inteira_travada_por_reseed_ainda_e_sondada_para_o_M4(tmp_path):
+    cursos = [_c(HOT, "hotmart-principal", "hotmart"), _c(HOT2, "hotmart-principal", "hotmart")]
+    estado = {HOT: {"irredutivel": True, "benched_exit5": True},
+              HOT2: {"irredutivel": True, "ultima_causa": "escalar_reseed", "_morte_ciclo": T0}}
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hotmart-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado)
+    assert ex.sp.zelos()[0]["cmd"][4] == HOT2
+
+
+def test_nada_sondavel_nao_zela_e_diz_por_que(tmp_path):
+    cursos = [_c(HOT, "hotmart-principal", "hotmart")]
+    estado = {HOT: {"irredutivel": True, "benched_exit5": True, "ultima_causa": "relancar"}}
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "hotmart-principal", T0 - DIA)
+    _passo(z, ex, T0, estado=estado)
+    assert ex.sp.zelos() == []
+    assert _status(tmp_path)["contas"][0]["decisao"] == "sem-curso-sondavel"
+
+
+# ==========================================================================================
+# REVISÃO DO P7 — item 5: o comando exato do alerta roda também para a Stoa
+# ==========================================================================================
+def test_comando_do_alerta_da_stoa_leva_a_arvore_dela(tmp_path):
+    cursos = [_c(STOA, "stoa-principal", "stoa"), _c(KIW, "kiwify-principal", "kiwify")]
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    for c in ("stoa-principal", "kiwify-principal"):
+        _ocioso(ex, c, T0 - DIA)
+    for st in z.estado.values():
+        st["status"] = "aguardando-humano"
+    _passo(z, ex, T0, alertas=al)
+    (alvos, comando), = al.logins
+    assert alvos == ("kiwify:kiwify-principal", "stoa:stoa-principal")
+    assert comando == (f"ATHENA_MOTOR_DIR_STOA={tmp_path / 'stoa'} uv run scripts/reseed.py "
+                       "kiwify:kiwify-principal stoa:stoa-principal")
+
+
+def test_comando_reseed_so_prefixa_com_stoa_e_protege_o_caminho():
+    assert zmod.comando_reseed(["kiwify:k"], motor_dir_stoa="/x/stoa") == \
+        "uv run scripts/reseed.py kiwify:k"
+    assert zmod.comando_reseed(["stoa:stoa-principal"], motor_dir_stoa="/a b/stoa") == \
+        "ATHENA_MOTOR_DIR_STOA='/a b/stoa' uv run scripts/reseed.py stoa:stoa-principal"
+    assert zmod.comando_reseed(["stoa:stoa-principal"]) == \
+        "uv run scripts/reseed.py stoa:stoa-principal"
+
+
+def test_alerta_preventivo_da_stoa_tambem_leva_a_arvore(tmp_path):
+    cursos = [_c(STOA, "stoa-principal", "stoa")]
+    ex, z, al = _exec(tmp_path, cursos), _zel(tmp_path, cursos), FakeAlertas()
+    _ocioso(ex, "stoa-principal", T0 - DIA)
+    st = z.estado["stoa:stoa-principal"]
+    st["status"], st["relogio"] = "viva", "duro"
+    st["_t"]["expira_ts"] = T0 + DIA
+    _passo(z, ex, T0, alertas=al)
+    assert al.vence and al.vence[0][3].startswith(f"ATHENA_MOTOR_DIR_STOA={tmp_path / 'stoa'} ")
+
+
+# ==========================================================================================
+# REVISÃO DO P7 — item 6: cada camada de defesa com o seu dente
+# ==========================================================================================
+def test_zelo_em_curso_vale_pela_memoria_mesmo_sem_o_lock_em_disco(tmp_path):
+    """Camada 1 do 1-por-vez: o zelo que ESTA encarnação spawnou conta mesmo que o lock
+    dele tenha sumido do disco (apagado por fora) — senão um 2º navegador de zelo subiria."""
+    cursos = [_c(KIW, "kiwify-principal", "kiwify"), _c(CUR, "curseduca-segueadi", "curseduca")]
+    ex = _exec(tmp_path, cursos)
+    ex.disparar_zelo("kiwify:kiwify-principal", cursos[0], agora=T0)
+    os.remove(ex._lock_path("kiwify-principal"))
+    assert ex.zelo_em_curso() is True
+    with pytest.raises(captura.ContaOcupada):
+        ex.disparar_zelo("curseduca:curseduca-segueadi", cursos[1], agora=T0)
+    assert len(ex.sp.calls) == 1
+
+
+def test_disparar_zelo_com_lock_de_captura_diz_a_verdade_no_motivo(tmp_path):
+    """Camada `contas_livres`: com a CAPTURA da conta rodando (lock + Chrome dela no perfil),
+    o motivo é o lock — não "navegador vivo sem lock de ninguém" (o log não mente)."""
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    ex = _exec(tmp_path, cursos)
+    perfil = tmp_path / "aula" / ".chrome-profile-kiwify-principal"
+    perfil.mkdir(parents=True)
+    ex.disparar(KIW)
+    captura_proc = ex.sp.calls[0]["proc"]
+    (perfil / "SingletonLock").symlink_to(f"host-{captura_proc.pid}")
+    with pytest.raises(captura.ContaOcupada) as exc:
+        ex.disparar_zelo("kiwify:kiwify-principal", cursos[0], agora=T0)
+    assert "com lock" in str(exc.value) and "sem lock de ninguém" not in str(exc.value)
+    assert len(ex.sp.calls) == 1
+
+
+def test_o_lock_do_proprio_zelo_nao_conta_como_atividade_de_captura(tmp_path):
+    cursos = [_c(KIW, "kiwify-principal", "kiwify")]
+    ex, z = _exec(tmp_path, cursos), _zel(tmp_path, cursos)
+    _ocioso(ex, "kiwify-principal", T0 - DIA)
+    _passo(z, ex, T0)
+    assert ex.captura_viva("kiwify-principal") is False
+    _passo(z, ex, T0 + 120)                                    # zelo ainda rodando
+    st = z.estado["kiwify:kiwify-principal"]
+    assert st["_t"]["ultima_captura_ts"] == pytest.approx(T0 - DIA)
+    ex.sp.terminar(0, 0, "viva")
+    _passo(z, ex, T0 + 180)
+    ex.disparar(KIW)                                           # a captura, ao contrário, conta
+    assert ex.captura_viva("kiwify-principal") is True

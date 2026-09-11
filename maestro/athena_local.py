@@ -1701,6 +1701,17 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
                        estado_carga=estado_carga if estado_carga is not None else {},
                        episodio_path=carga_episodio_path)
 
+    # (4a) VIGIA PERSISTIDO DOS ZELOS ÓRFÃOS (P7): roda em TODO ciclo, com o zelador ligado
+    # ou não — um restart no meio de um zelo (inclusive o rollback ATHENA_ZELADOR_ATIVO=0 +
+    # restart) deixa um lock `dono: zelador` que só este vigia mata/limpa (o do executor é
+    # em memória). Best-effort: nunca derruba o ciclo.
+    vigiar_orfaos = getattr(executor, "vigiar_zelos_orfaos", None)
+    if callable(vigiar_orfaos):
+        try:
+            vigiar_orfaos(agora)
+        except Exception:
+            pass
+
     # (4b) ZELADOR DE SESSÃO (P7): contas OCIOSAS têm a sessão provada pela sonda da própria
     # plataforma, segurando o MESMO lock durável da conta (nunca junto de captura). Depois
     # da passada: quem disparou captura neste ciclo já está com a conta travada.

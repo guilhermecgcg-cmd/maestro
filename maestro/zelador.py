@@ -9,8 +9,9 @@ descobre é a captura, que falha e escala. O zelador faz duas coisas, e só elas
    abre toda captura: injeta, sonda, re-persiste quando é seguro), com o mesmo navegador e
    o mesmo perfil da captura, SEGURANDO o mesmo lock durável da conta.
 2. Quando SÓ O HUMANO resolve, avisar UMA vez, agregado, com o comando exato
-   (`uv run scripts/reseed.py plat:conta ...`) — e com antecedência quando o relógio da
-   sessão é DURO (não avança com o uso) e vence em menos de N dias.
+   (`uv run scripts/reseed.py plat:conta ...`; com a Stoa, prefixado pela árvore dela em
+   `ATHENA_MOTOR_DIR_STOA=`) — e com antecedência quando o relógio da sessão é DURO (não
+   avança com o uso) e vence em menos de N dias.
 
 INVIOLÁVEIS (o que, relaxado, quebra o projeto):
   - DESLIGADO por padrão (ATHENA_ZELADOR_ATIVO): "seco" só grava o status; "1" zela.
@@ -21,23 +22,34 @@ INVIOLÁVEIS (o que, relaxado, quebra o projeto):
   - O resultado do zelo NÃO é óbito de captura: nada de autópsia, disjuntor, flap, bench.
   - Morte PROVADA (exit 3 + linha `morta`) => `aguardando-humano` e o zelador PARA de tocar
     na conta (zero navegação deslogada repetida) até alguém mexer na sessão (M4). Morte de
-    plataforma com PROVA FRACA (Stoa, Alpaclass, Hubla: "morte" = ausência de sinal) exige
-    uma 2ª morte, >= 30 min depois. Inconclusivo NUNCA vira morte (backoff).
+    plataforma com PROVA FRACA (Stoa, Alpaclass, Hubla) exige uma 2ª morte, >= 30 min
+    depois. Na Stoa e na Alpaclass cada morte só conta com `prova: positiva` (a sonda
+    TRI-ESTADO do zelo leu a tela/código de login; rede/5xx = inconclusivo): a confirmação
+    são DUAS provas positivas de login, nunca duas falhas de rede. Inconclusivo NUNCA vira
+    morte (backoff).
+  - A sonda usa a URL de um curso da unidade que a captura PODE rodar — nunca um travado,
+    benchado ou sem acesso (um 403 de um produto viraria "login necessário" da conta).
   - Status (`sessoes-status.json`) sem credencial: só rótulos, epochs e tipos de exceção;
     escrita atômica. É o insumo do /sitrep e do `reseed.py tudo-morto`.
   - Nunca loga, nunca digita, nunca aceita termo: quem prova é a sonda da plataforma com
     `allow_reseed=False` (motor/zelador.py).
 
-M4 (rearme): um zelo `viva` rearma o latch de reseed dos cursos da unidade quando a sessão
-foi MEXIDA depois do latch (a marca — mtime do arquivo de sessão/perfil — lida no DISPARO
-do zelo, antes de ele próprio tocar no perfil, é mais nova que a morte). Sem essa marca de
-ação humana não rearma: rearmar em todo viva abriria o laço captura-morre / zelo-viva.
+M4 (rearme): o latch de reseed de um curso só sai com AÇÃO HUMANA PROVADA — o CARIMBO que
+`scripts/reseed.py` (motor) grava depois de um login concluído, com o lock nas mãos
+(`<lock_dir>/<sha256(conta)[:16]>.reseed.json`, `LocalExecutor.carimbo_reseed`) — MAIS um
+zelo que prove a sessão viva. Rearma só os cursos travados ANTES do carimbo; um carimbo novo
+põe a unidade na frente da fila (zela já). O mtime do arquivo de sessão/perfil NÃO serve
+para rearmar: o próprio zelo re-persiste o arquivo num viva e o Chrome mexe na raiz do
+perfil (achado bloqueante da revisão: dois vivas seguidos rearmavam sem ninguém ter logado,
+reabrindo o laço captura-morre -> zelo-viva -> rearma). O mtime segue só como gatilho para
+RE-SONDAR uma conta aguardando-humano (1 zelo por mudança; nunca rearma).
 """
 import json
 import logging
 import os
 import random
 import re
+import shlex
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -70,6 +82,13 @@ _RESULTADOS_5 = frozenset({R_SEM_PERFIL, R_SEM_SESSAO, R_OCUPADO})
 # Bearer em 25 s". Até virarem tri-estado, a 1ª morte é só suspeita.
 PROVA_FRACA = frozenset({"stoa", "alpaclass", "hubla"})
 
+# Plataformas cujo motor tem a SONDA TRI-ESTADO do zelo (`sonda_zelador` do módulo de sessão:
+# rede/5xx/429 = inconclusivo; só a tela/código de login = morta). Nelas uma morte só conta
+# com `prova: positiva` na linha ZELADOR — um motor ou uma árvore da Stoa ANTIGOS (sem a
+# sonda) que digam "morta" podem estar lendo uma queda de internet: INCONCLUSIVO.
+SONDA_TRI_ESTADO = frozenset({"stoa", "alpaclass"})
+PROVA_POSITIVA = "positiva"
+
 # Arquivo de sessão DEFAULT do CLI de cada plataforma (relativo ao cwd do motor dela) —
 # ESPELHO de motor/profiles.py::PLATAFORMAS[*].state_default. Só vale onde o daemon NÃO
 # injeta o session_path (hotmart/stoa/kajabi, ou conta sem session_path no YAML). É a
@@ -90,7 +109,8 @@ _DETALHES_FIXOS = frozenset({
     "perfil da conta inexistente", "arquivo de sessao ausente", "perfil em uso",
     "modulo da plataforma ausente nesta arvore", "sonda sem prova",
     "sonda da plataforma provou", "interrompido", "Error",
-    "watchdog", "sem linha do zelador", "detalhe descartado",
+    "watchdog", "sem linha do zelador", "detalhe descartado", "teto de tempo",
+    "morte sem prova positiva",
 })
 _RE_EXCECAO = re.compile(r"[A-Z][A-Za-z0-9]{0,47}(Error|Exception|Timeout|Interrupt|Exit)")
 
@@ -98,7 +118,7 @@ _RE_EXCECAO = re.compile(r"[A-Z][A-Za-z0-9]{0,47}(Error|Exception|Timeout|Interr
 _T_PERSISTIDO = frozenset({
     "intervalo_s", "proximo_ts", "ultimo_zelo_ts", "provado_ts", "expira_ts",
     "expira_prova_ts", "primeira_morte_ts", "morte_ts", "marca_na_morte",
-    "ultima_captura_ts",
+    "ultima_captura_ts", "carimbo_visto",
 })
 
 _H = 3600.0
@@ -263,7 +283,8 @@ class Unidade:
     """Um LOGIN a manter vivo: (plataforma, conta, arquivo de sessão que o daemon injeta).
     Uma conta com DOIS arquivos (a Greenn: dois clubs) vira DUAS unidades — zeladas em série,
     cada uma com o seu arquivo, as duas sob o lock da mesma conta. `cursos` = os cursos da
-    unidade (o rearme M4 mexe só neles); `url` = a do 1º (é a que a captura passa)."""
+    unidade (o rearme M4 mexe só neles; a sonda escolhe entre eles a cada zelo — ver
+    `Zelador._url_da_sonda`); `url` = a do 1º (a identidade estável da unidade no status)."""
     chave: str
     plataforma: str
     conta: str
@@ -302,9 +323,15 @@ def unidades_de(cursos) -> list:
     return out
 
 
-def comando_reseed(alvos) -> str:
-    """O comando EXATO que o alerta manda colar (no checkout do motor)."""
-    return "uv run scripts/reseed.py " + " ".join(sorted(dict.fromkeys(alvos)))
+def comando_reseed(alvos, *, motor_dir_stoa=None) -> str:
+    """O comando EXATO que o alerta manda colar (no checkout do motor). Com alvo da Stoa,
+    prefixado por `ATHENA_MOTOR_DIR_STOA=<árvore>` — a MESMA árvore em que o daemon roda a
+    Stoa: o reseed é fail-closed sem ela (a Stoa mora noutra árvore) e recusaria."""
+    lista = sorted(dict.fromkeys(alvos))
+    cmd = "uv run scripts/reseed.py " + " ".join(lista)
+    if motor_dir_stoa and any(str(a).split(":", 1)[0] == "stoa" for a in lista):
+        cmd = f"ATHENA_MOTOR_DIR_STOA={shlex.quote(str(motor_dir_stoa))} " + cmd
+    return cmd
 
 
 # --- helpers -------------------------------------------------------------------------------------
@@ -330,13 +357,23 @@ def _detalhe_seguro(d) -> str:
     return "detalhe descartado" if d else ""
 
 
-def _interpretar(r) -> str:
-    """Exit code e linha ZELADOR têm de CONCORDAR — senão é inconclusivo (nunca prova)."""
+def _sem_prova_positiva(r, plataforma) -> bool:
+    """Morte (exit 3 + `morta`) numa plataforma de sonda tri-estado SEM `prova: positiva`."""
+    linha = r.get("linha") or {}
+    return (plataforma in SONDA_TRI_ESTADO and r.get("exit_code") == 3
+            and linha.get("resultado") == R_MORTA and linha.get("prova") != PROVA_POSITIVA)
+
+
+def _interpretar(r, plataforma=None) -> str:
+    """Exit code e linha ZELADOR têm de CONCORDAR — senão é inconclusivo (nunca prova). Na
+    Stoa/Alpaclass a morte ainda precisa da `prova: positiva` da sonda tri-estado."""
     code = r.get("exit_code")
     res = (r.get("linha") or {}).get("resultado")
     if code == 0 and res == R_VIVA:
         return R_VIVA
     if code == 3 and res == R_MORTA:
+        if _sem_prova_positiva(r, plataforma):
+            return R_INCONCLUSIVA
         return R_MORTA
     if code == 5 and res in _RESULTADOS_5:
         return res
@@ -492,8 +529,8 @@ class Zelador:
                     log.exception("zelador: falha ao aplicar o resultado de %s", r.get("chave"))
         self._observar_capturas(executor, agora)
         if self.modo == LIGADO:
-            self._alertar(alertas, agora, espinha)
-        self._agendar(executor, agora, ativos, espinha)
+            self._alertar(alertas, agora, espinha, executor)
+        self._agendar(executor, agora, ativos, espinha, estado_cursos)
         try:
             self._gravar_status(agora)
         except Exception as e:
@@ -530,7 +567,9 @@ class Zelador:
         return par
 
     def _marca(self, u, executor) -> float:
-        """A maior mtime entre o perfil e o arquivo de sessão da unidade (0 se nenhum)."""
+        """A maior mtime entre o perfil e o arquivo de sessão da unidade (0 se nenhum). Serve
+        SÓ para RE-SONDAR uma conta aguardando-humano ("alguém mexeu": pode ser o próprio zelo
+        ou a captura de outro curso). NUNCA rearma a captura — isso é do `_carimbo`."""
         meta = self._meta.get(u.url)
         if meta is None:
             return 0.0
@@ -543,6 +582,44 @@ class Zelador:
             except OSError:
                 pass
         return m
+
+    def _carimbo(self, u, executor) -> float:
+        """epoch do último reseed HUMANO concluído da conta (0 se nenhum): o carimbo que o
+        `scripts/reseed.py` do motor grava com o lock nas mãos — a ÚNICA marca que o zelador
+        aceita para rearmar a captura (o zelo e a captura nunca o produzem)."""
+        fn = getattr(executor, "carimbo_reseed", None)
+        if not callable(fn):
+            return 0.0
+        try:
+            v = _num(fn(u.conta))
+        except Exception:
+            return 0.0
+        return v or 0.0
+
+    def _url_da_sonda(self, u, estado_cursos, ativos):
+        """A URL com que o zelo prova a sessão da unidade (achado da revisão: era sempre a do
+        1º curso do cadastro). Um curso da unidade que a captura PODE rodar neste ciclo
+        (gate/controle), sem latch nenhum (um produto sem acesso responde 403, que a sonda
+        do Hotmart lê como morte — a conta inteira viraria "login necessário") e sem bench
+        de exit-5 (URL que o motor não abre) — o de captura limpa mais recente; empate, a
+        ordem do cadastro. Sem nenhum assim: um curso travado SÓ por reseed (a conta inteira
+        morta — é justamente o zelo que prova o relogin, M4). None = nada sondável."""
+        est = estado_cursos if isinstance(estado_cursos, dict) else {}
+        limpos, so_reseed = [], []
+        for i, url in enumerate(u.cursos):
+            if url not in self._meta or (ativos is not None and url not in ativos):
+                continue
+            st = est.get(url) if isinstance(est.get(url), dict) else {}
+            if st.get("benched_exit5"):
+                continue
+            if st.get("irredutivel"):
+                if st.get("ultima_causa") == "escalar_reseed":
+                    so_reseed.append(url)
+                continue
+            limpos.append((-(_num(st.get("_saida_limpa_ciclo")) or 0.0), i, url))
+        if limpos:
+            return min(limpos)[2]
+        return so_reseed[0] if so_reseed else None
 
     def _parceiras(self, u, executor):
         """Contas (de QUALQUER curso do cadastro) que partilham o perfil ou o arquivo de
@@ -569,17 +646,18 @@ class Zelador:
         self._em_curso.discard(u.chave)
         st = self._estado[u.chave]
         t = st["_t"]
-        resultado = _interpretar(r)
+        resultado = _interpretar(r, u.plataforma)
         linha = r.get("linha") or {}
         st["resultado"] = resultado
         if r.get("watchdog"):
             st["detalhe"] = "watchdog"
         elif not linha:
             st["detalhe"] = "sem linha do zelador"
+        elif _sem_prova_positiva(r, u.plataforma):
+            st["detalhe"] = "morte sem prova positiva"
         else:
             st["detalhe"] = _detalhe_seguro(linha.get("detalhe"))
         exp = _num(linha.get("expira_em")) if resultado in (R_VIVA, R_MORTA) else None
-        marca_no_disparo = t.pop("marca_no_disparo", None)
         cfg = self.cfg
 
         if resultado == R_VIVA:
@@ -595,7 +673,7 @@ class Zelador:
             self._classificar_relogio(st, exp)
             t["intervalo_s"] = self._sortear(u.plataforma)
             t["proximo_ts"] = agora + t["intervalo_s"]
-            self._rearmar(u, estado_cursos, marca_no_disparo, espinha)
+            self._rearmar(u, estado_cursos, self._carimbo(u, executor), espinha)
             if estava in (AGUARDANDO, SUSPEITA):
                 _registrar(espinha, f"sessão de {u.chave} viva de novo",
                            "o zelador provou pela sonda da plataforma", reversivel=True,
@@ -660,11 +738,12 @@ class Zelador:
         t["expira_prova_ts"] = exp
         t["expira_ts"] = exp
 
-    def _rearmar(self, u, estado_cursos, marca_no_disparo, espinha):
-        """M4: tira o latch de RESEED dos cursos da unidade quando a sessão foi MEXIDA depois
-        do latch (a marca lida no disparo do zelo é mais nova que a morte do curso) e o zelo
-        provou viva. Só o latch de reseed (`escalar_reseed`), nunca o bench de exit-5."""
-        if not marca_no_disparo or not isinstance(estado_cursos, dict):
+    def _rearmar(self, u, estado_cursos, carimbo, espinha):
+        """M4: o zelo provou viva E há um reseed HUMANO (o carimbo) POSTERIOR ao latch do curso
+        -> tira o latch de RESEED. Latch posterior ao carimbo (a captura morreu de novo depois
+        do login) fica: rearmar por ele reabriria o laço. Só o latch de reseed
+        (`escalar_reseed`), nunca o bench de exit-5."""
+        if not carimbo or not isinstance(estado_cursos, dict):
             return
         for url in u.cursos:
             st = estado_cursos.get(url)
@@ -673,8 +752,8 @@ class Zelador:
             if not (st.get("irredutivel") and st.get("ultima_causa") == "escalar_reseed"
                     and not st.get("benched_exit5")):
                 continue
-            if float(marca_no_disparo) <= float(st.get("_morte_ciclo") or 0):
-                continue                                   # ninguém mexeu depois do latch
+            if float(carimbo) <= float(st.get("_morte_ciclo") or 0):
+                continue                                   # ninguém relogou depois do latch
             st.pop("irredutivel", None)
             st.pop("esgotado_avisado", None)
             st["fase"] = captura.FASE_NOVO
@@ -709,13 +788,24 @@ class Zelador:
                 t["ultima_captura_ts"] = saida
 
     # --- alertas -------------------------------------------------------------------------------------
-    def _alertar(self, alertas, agora, espinha):
+    def _alertar(self, alertas, agora, espinha, executor=None):
+        stoa_dir = None
+        fn = getattr(executor, "motor_dir_de", None)
+        if callable(fn):
+            try:
+                stoa_dir = fn("stoa") or None
+            except Exception:
+                stoa_dir = None
+
+        def comando(alvos):
+            return comando_reseed(alvos, motor_dir_stoa=stoa_dir)
+
         alvos = sorted({u.alvo for u in self.unidades
                         if self._estado[u.chave]["status"] == AGUARDANDO})
         if not alvos:
             self._alertas["logins_avisados"] = None        # reset: a próxima morte alerta
         elif alvos != self._alertas["logins_avisados"]:
-            if _avisar(alertas, "logins_pendentes", alvos, comando_reseed(alvos)):
+            if _avisar(alertas, "logins_pendentes", alvos, comando(alvos)):
                 self._alertas["logins_avisados"] = alvos
         for u in self.unidades:
             st = self._estado[u.chave]
@@ -728,7 +818,7 @@ class Zelador:
                 continue                                   # dedup pelo VALOR do relógio
             quando = _iso(exp).replace("T", " ")[:16] if _iso(exp) else "?"
             if _avisar(alertas, "sessao_vence", u.alvo, quando, (exp - agora) / _DIA,
-                       comando_reseed([u.alvo])):
+                       comando([u.alvo])):
                 self._alertas["preventivos_avisados"][u.chave] = exp
                 _registrar(espinha, f"alertei vencimento da sessão de {u.chave}",
                            f"relógio duro vence em {quando}", reversivel=True,
@@ -741,11 +831,17 @@ class Zelador:
         t = st["_t"]
         if u.chave in self._em_curso:
             return (False, False, 0, "zelando")
+        carimbo = self._carimbo(u, executor)
+        humano = carimbo > (_num(t.get("carimbo_visto")) or 0.0)
         if st["status"] == AGUARDANDO:
             marca = self._marca(u, executor)
-            if marca > float(t.get("marca_na_morte") or 0) + 1:
+            if humano or marca > float(t.get("marca_na_morte") or 0) + 1:
                 return (True, True, float(t.get("morte_ts") or 0), "")
             return (False, False, 0, "aguardando-humano")
+        if humano:
+            # login humano NOVO (carimbo do reseed): prova JÁ — é o zelo viva que rearma a
+            # captura travada (M4); esperar o intervalo deixaria a captura parada horas.
+            return (True, True, carimbo, "")
         prox = _num(t.get("proximo_ts"))
         if prox is not None and agora < prox:
             return (False, False, 0, "agendada")
@@ -755,8 +851,9 @@ class Zelador:
         ref = prox if prox is not None else (ultima or 0.0)
         return (True, False, ref, "")
 
-    def _agendar(self, executor, agora, ativos, espinha):
+    def _agendar(self, executor, agora, ativos, espinha, estado_cursos=None):
         candidatas = []
+        urls = {}
         for u in self.unidades:
             if ativos is not None and not (set(u.cursos) & set(ativos)):
                 self._decisao[u.chave] = "fora-do-gate"
@@ -765,6 +862,11 @@ class Zelador:
             if not ok:
                 self._decisao[u.chave] = dec
                 continue
+            url = self._url_da_sonda(u, estado_cursos, ativos)
+            if url is None:
+                self._decisao[u.chave] = "sem-curso-sondavel"
+                continue
+            urls[u.chave] = url
             candidatas.append((0 if urgente else 1, ref, u.chave, u))
         candidatas.sort(key=lambda x: x[:3])
         if not candidatas:
@@ -811,11 +913,11 @@ class Zelador:
                 return marcar("adiada-carga")
 
         for _, _, _, u in candidatas:
-            meta = self._meta.get(u.url)
+            meta = self._meta.get(urls[u.chave])
             if meta is None:
                 self._decisao[u.chave] = "sem-cadastro"
                 continue
-            marca = self._marca(u, executor)               # ANTES do zelo mexer no perfil
+            carimbo = self._carimbo(u, executor)
             try:
                 executor.disparar_zelo(u.chave, meta, parceiras=self._parceiras(u, executor),
                                        agora=agora)
@@ -831,7 +933,7 @@ class Zelador:
             self._em_curso.add(u.chave)
             t["ultimo_zelo_ts"] = agora
             t["proximo_ts"] = agora + self.cfg.adiar_s     # guarda: resultado perdido num restart
-            t["marca_no_disparo"] = marca
+            t["carimbo_visto"] = carimbo                   # este login humano já tem o seu zelo
             self._decisao[u.chave] = "zelando"
             break
         marcar("espera-outro-zelo")

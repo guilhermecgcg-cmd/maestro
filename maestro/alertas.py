@@ -146,6 +146,39 @@ class Alertas:
         if self._enviar(texto):
             self._marcar_enviado(chave_dedup)
 
+    def _enviar_ou_so_log(self, texto: str) -> bool:
+        """Envio SEM dedup local (o dedup destes é do zelador, PERSISTIDO no status dele).
+        True = entregue OU não há canal (só-log: nada a re-tentar); False = havia canal e
+        falhou (o zelador re-tenta no próximo ciclo em vez de armar o dedup)."""
+        if self._tg is None or not self._chats:
+            log.warning("alerta sem canal Telegram (só-log): %s", texto)
+            return True
+        return self._enviar(texto)
+
+    def logins_pendentes(self, alvos, comando: str) -> bool:
+        """P7 — UM alerta com TODAS as contas cuja sessão o ZELADOR provou morta (`alvos` =
+        `plataforma:conta`, a sintaxe do reseed) e o COMANDO EXATO que as resolve numa
+        sentada. Essencial por natureza (só o humano loga) e fora do gate: o zelador já
+        dedupa pelo CONJUNTO, e o dedup dele sobrevive a restart."""
+        alvos = list(alvos)
+        n = len(alvos)
+        texto = (f"🔑 login necessário: {', '.join(alvos)} — sessão morta (provado pela "
+                 f"sonda da plataforma). No Mac, no checkout do motor, rode `{comando}` "
+                 f"e resolva {'as ' + str(n) + ' contas' if n > 1 else 'a conta'} numa "
+                 f"sentada. Até lá o zelador não toca {'nelas' if n > 1 else 'nela'}.")
+        return self._enviar_ou_so_log(texto)
+
+    def sessao_vence(self, alvo: str, quando: str, dias: float, comando: str) -> bool:
+        """P7 — alerta PREVENTIVO: o relógio da sessão é DURO (não avançou depois de uma
+        prova de vida) e vence em menos de N dias. Dedup pelo VALOR do relógio, no zelador."""
+        if dias > 0:
+            prazo = f"vence em ~{f'{dias:.1f}'.replace('.', ',')} dia(s) ({quando})"
+        else:
+            prazo = f"venceu em {quando}"
+        texto = (f"⏳ Sessão {alvo} {prazo} e não se renova sozinha — faça o login antes "
+                 f"de ela cair: `{comando}` (no Mac, no checkout do motor).")
+        return self._enviar_ou_so_log(texto)
+
     def sessao_expirada(self, plataforma: str) -> None:
         # INVARIANTE: reseed é sempre essencial e NUNCA dedupado — só o humano
         # destrava, e engolir este alerta deixaria a conta parada em silêncio.

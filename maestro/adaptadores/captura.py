@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sqlite3
 import tempfile
 import time
@@ -1298,6 +1299,97 @@ def _limpar_singleton_orfao(profile_dir):  # pragma: no cover — I/O de arquivo
             pass
 
 
+# --- ZELADOR DE SESSÃO (P7) --------------------------------------------------------------
+# Donos de lock que NÃO são captura: o reseed humano (`scripts/reseed.py` do motor, espelho
+# em motor/conta_lock.py) e o zelador. O vigia os ignora (M2): o fim deles não é óbito de
+# captura (sem autópsia, sem flap). `course_url` deles é "<dono>:<plataforma>" — nunca
+# casa um curso, então a captura da conta vê ContaOcupada ("aguarda a vez").
+DONOS_NAO_CAPTURA = ("reseed", "zelador")
+_ZELO_TIMEOUT_PADRAO_S = 600.0     # zelo travado: SIGTERM ao zelador (ele fecha o navegador)
+_ZELO_GRACE_PADRAO_S = 60.0        # ... e SIGKILL no grupo se não sair nesta janela
+_CAMPOS_LINHA_ZELADOR = frozenset({"plataforma", "conta", "resultado", "detalhe",
+                                   "expira_em", "vence_em_h", "provado_em", "prova"})
+# Teto de tempo PRÓPRIO do motor/zelador.py (env que ele lê): uma fração do watchdog, para o
+# zelo terminar sozinho (fechando o navegador) antes de o daemon precisar do SIGTERM.
+_ENV_TETO_ZELO = "ATHENA_ZELADOR_TETO_S"
+_TETO_ZELO_FRACAO = 0.8
+# CARIMBO DO RESEED HUMANO (M4): `scripts/reseed.py` do motor grava, depois de um login
+# concluído, `<lock_dir>/<sha256(conta)[:16]>.reseed.json` — ESPELHO de
+# motor/conta_lock.py::carimbo_path. Não termina em `.lock`: nenhum varredor de lock o lê.
+_CARIMBO_SUFIXO = ".reseed.json"
+
+
+def ler_linha_zelador(texto):
+    """A ÚLTIMA linha `ZELADOR {json}` que o `motor/zelador.py` imprime (contrato
+    motor→daemon), só com os campos da lista branca. None quando não há (tee falhou, módulo
+    ausente na árvore, crash antes do fim): aí o resultado nunca é prova de nada."""
+    for linha in reversed((texto or "").splitlines()):
+        if not linha.startswith("ZELADOR "):
+            continue
+        try:
+            dados = json.loads(linha[len("ZELADOR "):])
+        except ValueError:
+            return None
+        if not isinstance(dados, dict):
+            return None
+        return {k: v for k, v in dados.items() if k in _CAMPOS_LINHA_ZELADOR}
+    return None
+
+
+def _ts_num(v):
+    """float finito de um campo numérico de lock/carimbo, ou None (bool, NaN, lixo)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
+def _comando_e_zelo(comando) -> bool:
+    """A linha de comando é a de um `python -m motor.zelador` (a PROVA de que um PID vivo
+    de um lock `dono: zelador` ainda é o zelo, e não um PID reusado por outro processo)."""
+    try:
+        partes = shlex.split(comando or "")
+    except ValueError:
+        partes = (comando or "").split()
+    return any(a == "-m" and b == "motor.zelador" for a, b in zip(partes, partes[1:]))
+
+
+def _comando_cita_perfil(comando, perfil_abs) -> bool:
+    """ESPELHO de motor/profiles.py::comando_cita_perfil (a parte absoluta): a linha de
+    comando é de um navegador aberto NESTE perfil? O motor lança o navegador com o caminho
+    ABSOLUTO (conferido num Chrome do daemon); comparado inteiro, então caminho com espaço
+    casa."""
+    comando = comando or ""
+    marca = f"--user-data-dir={perfil_abs}"
+    i = comando.find(marca)
+    while i != -1:
+        fim = i + len(marca)
+        if fim == len(comando) or comando[fim] in " \t\"'":
+            return True
+        i = comando.find(marca, i + 1)
+    return False
+
+
+def _comando_do_processo(pid):  # pragma: no cover — subprocesso real (ps), só leitura
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
+def _sinalizar(pid, sig, grupo):  # pragma: no cover — sinal real
+    try:
+        if grupo:
+            os.killpg(int(pid), sig)
+        else:
+            os.kill(int(pid), sig)
+    except (OSError, ValueError):
+        pass
+
+
 class LocalExecutor:
     """Executor DOMÉSTICO: CHAMA O MOTOR DIRETO no Mac (subprocesso), em vez de
     enfileirar. Mesmo contrato do FilaExecutor: `disparar(url) -> confirmação truthy`,
@@ -1338,8 +1430,18 @@ class LocalExecutor:
     def __init__(self, cursos, *, motor_python, motor_dir, spawn=None, groq_key=None,
                  extra_env=None, lock_dir=None, pid_vivo=None,
                  motor_dir_por_plataforma=None, motor_log_dir=None, pendencias_fn=None,
-                 portao_carga=None):
+                 portao_carga=None, zelo_timeout_s=_ZELO_TIMEOUT_PADRAO_S,
+                 zelo_grace_s=_ZELO_GRACE_PADRAO_S, sinal_fn=None, comando_fn=None):
         self._meta = {c.url: c for c in cursos}
+        # ZELADOR DE SESSÃO (P7): zelos que ESTA encarnação spawnou, POR CHAVE de unidade —
+        # separados de `_procs` DE PROPÓSITO: o fim de um zelo NUNCA vira óbito de captura
+        # (sem autópsia, sem disjuntor, sem flap). `drenar_zelos` os colhe.
+        self._zelos = {}
+        self._zelos_colhidos = []
+        self._zelo_timeout_s = float(zelo_timeout_s)
+        self._zelo_grace_s = float(zelo_grace_s)
+        self._sinal_fn = sinal_fn or _sinalizar
+        self._comando_fn = comando_fn or _comando_do_processo
         # PORTÃO DE CARGA (maestro.carga.PortaoCarga | None): consultado em `disparar`
         # depois do guard anti-ban e antes de qualquer spawn. None (default) = sem portão —
         # os testes nunca leem a carga REAL desta máquina; o `main()` liga o do ambiente.
@@ -1432,11 +1534,73 @@ class LocalExecutor:
         return data
 
     def _escrever_lock(self, conta, curso_url, pid):
+        """SOBRESCREVE o lock da conta (troca atômica, `os.replace`). NÃO é aquisição: no
+        `disparar` só serve para PROMOVER a intenção que JÁ é nossa (criada exclusiva por
+        `_criar_lock_exclusivo`) ao PID real. Adquirir com isto era o bug da corrida."""
         tmp = self._lock_path(conta) + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"pid": pid, "course_url": curso_url, "conta": str(conta),
                        "ts": time.time()}, f)
         os.replace(tmp, self._lock_path(conta))   # troca atômica
+
+    # --- AQUISIÇÃO EXCLUSIVA (achado p102b: corrida com a sonda/reseed/zelador) ------
+    # Outros processos abrem o perfil de uma conta FORA do daemon e seguram ESTE MESMO lock
+    # (a sonda de inspeção p102 — motor/lock_conta.py; o reseed/zelador do P7 — motor/
+    # conta_lock.py), criando-o de forma EXCLUSIVA (temp completo + `os.link`). Se o daemon
+    # adquirisse com `os.replace`, um lock deles criado entre o `_ler_lock` ("sem lock") e a
+    # intenção seria SOBRESCRITO — e o daemon ainda apagaria os Singleton* do perfil em uso:
+    # dois navegadores na MESMA conta (ban). Aqui a intenção só nasce se o arquivo NÃO existe.
+    def _criar_lock_exclusivo(self, conta, dados) -> bool:
+        """Cria o lock da conta com o conteúdo COMPLETO, ATOMICAMENTE e só se NÃO existir:
+        temp escrito por inteiro + `os.link` (falha com EEXIST sem tocar o destino; ninguém
+        jamais lê um lock pela metade). True = o lock agora é NOSSO. False = alguém já tem
+        um lock para a conta (vivo, de intenção ou de PID morto) e NADA foi tocado. Outro
+        OSError propaga: fail-closed (sem lock não há spawn). O temp não termina em `.lock`
+        (a varredura do vigia/controle e o nome do daemon nunca o confundem com um lock)."""
+        os.makedirs(self._lock_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self._lock_dir, prefix=".novo-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(dados, f)
+            try:
+                os.link(tmp, self._lock_path(conta))
+            except FileExistsError:
+                return False
+            return True
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _conteudo_do_lock(self, conta) -> dict:
+        """O conteúdo do lock da conta, SÓ LEITURA e sem julgar vida (para a mensagem de
+        quem venceu a corrida — inclusive um lock de PID morto, que fica como evidência).
+        {} se ausente/ilegível."""
+        try:
+            with open(self._lock_path(conta)) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _lock_e(self, conta, dados) -> bool:
+        """O lock da conta tem EXATAMENTE este conteúdo (é o nosso)?"""
+        try:
+            with open(self._lock_path(conta)) as f:
+                return json.load(f) == dados
+        except (OSError, ValueError):
+            return False
+
+    def _remover_lock_se_nosso(self, conta, dados) -> bool:
+        """Remove o lock da conta SÓ se ainda for o nosso (`dados`). Nunca o alheio."""
+        if not self._lock_e(conta, dados):
+            return False
+        try:
+            os.remove(self._lock_path(conta))
+        except OSError:
+            return False
+        return True
 
     def _remover_lock(self, path):
         try:
@@ -1449,7 +1613,12 @@ class LocalExecutor:
         tira do dict e REMOVE o lock durável da conta (se ainda for deste curso), para
         que a próxima captura da conta possa disparar. Sem isso a conta ficaria 'ocupada'
         para sempre. poll() reapa o zumbi do próprio filho — essencial: um filho encerrado
-        e não-colhido continuaria 'vivo' para `os.kill(pid, 0)`."""
+        e não-colhido continuaria 'vivo' para `os.kill(pid, 0)`.
+
+        ZELOS (P7) são colhidos PRIMEIRO, à parte (`_colher_zelos`): o fim de um zelo não
+        vira óbito de captura, e soltá-lo aqui garante que nenhuma decisão de lock (a
+        passada, o `disparar`) aconteça antes da checagem do navegador órfão."""
+        self._colher_zelos()
         for url in [u for u, p in self._procs.items() if p.poll() is not None]:
             proc = self._procs.pop(url)
             disparo_ts = self._disparo_ts.pop(url, None)
@@ -1573,6 +1742,369 @@ class LocalExecutor:
         except Exception:
             return None
 
+    # --- LOCK: troca só-se-for-o-nosso (zelador). A CRIAÇÃO exclusiva, a leitura crua e a
+    # remoção só-se-for-o-nosso são as do r6-maestro (acima, junto do `_escrever_lock`).
+    def _trocar_lock_se_nosso(self, conta, token, novo) -> bool:
+        if not self._lock_e(conta, token):
+            return False
+        tmp = self._lock_path(conta) + ".troca.tmp"
+        with open(tmp, "w") as f:
+            json.dump(novo, f)
+        os.replace(tmp, self._lock_path(conta))
+        return True
+
+    # --- ZELADOR DE SESSÃO (P7): o zelo segura o MESMO lock durável da conta ---------------
+    def _zelo_log_path(self, conta) -> str:
+        """Onde o zelador desta conta tee'a stdout+stderr — NUNCA o .err da captura (que é
+        a evidência da autópsia dela, e o mtime dele é o sinal de atividade da conta)."""
+        slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self._motor_log_dir, slug + ".zelo.log")
+
+    def ambiente_de(self, meta):
+        """(env, cwd) com que o motor desta conta roda — o MESMO `_montar` da captura."""
+        _, env, cwd = self._montar(meta)
+        return env, cwd
+
+    def captura_viva(self, conta) -> bool:
+        """A conta tem CAPTURA viva agora (lock de PID vivo ou de intenção, sem dono de
+        fora)? Só leitura: não apaga lock de PID morto (a autópsia precisa dele)."""
+        self._reap()
+        lock = self._ler_lock(conta, limpar=False)
+        return lock is not None and lock.get("dono") not in DONOS_NAO_CAPTURA
+
+    def ultima_saida_captura(self, conta):
+        """mtime do .err da captura da conta (o motor escreve nele até o fim do run): o sinal
+        de atividade que atravessa restart do daemon. None se nunca houve captura."""
+        try:
+            return os.path.getmtime(self._stderr_path(conta))
+        except OSError:
+            return None
+
+    def _carimbo_path(self, conta) -> str:
+        slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self._lock_dir, slug + _CARIMBO_SUFIXO)
+
+    def carimbo_reseed(self, conta):
+        """epoch do último reseed HUMANO concluído da conta — o carimbo que o
+        `scripts/reseed.py` do motor grava com o lock nas mãos (ESPELHO de
+        motor/conta_lock.py::carimbar_reseed) — ou None. Só leitura. Ilegível, de outra conta
+        ou sem `ts` numérico = None: na dúvida, NUNCA rearma."""
+        try:
+            with open(self._carimbo_path(conta), encoding="utf-8") as f:
+                dados = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(dados, dict) or str(dados.get("conta")) != str(conta):
+            return None
+        return _ts_num(dados.get("ts"))
+
+    def motor_dir_de(self, plataforma) -> str:
+        """A árvore do motor em que ESTE daemon roda a plataforma (o alerta monta o comando
+        exato do reseed com ela: a Stoa mora noutra árvore)."""
+        return self._motor_dir_de(plataforma)
+
+    def contas_livres(self, contas) -> bool:
+        """Nenhuma das contas tem lock em disco (vivo, intenção, PID morto ainda não
+        autopsiado, ilegível). Só leitura."""
+        return not any(os.path.lexists(self._lock_path(c)) for c in contas)
+
+    def zelo_em_curso(self) -> bool:
+        """Há zelo rodando — desta encarnação ou de uma anterior (lock de dono zelador com
+        PID vivo, inclusive o de um navegador órfão que o zelo deixou)? 1 por vez, global."""
+        self._reap()
+        if self._zelos:
+            return True
+        try:
+            nomes = os.listdir(self._lock_dir)
+        except OSError:
+            return False
+        for nome in nomes:
+            if not nome.endswith(".lock"):
+                continue
+            try:
+                with open(os.path.join(self._lock_dir, nome)) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("dono") == "zelador":
+                pid = data.get("pid")
+                if pid is None or self._pid_vivo(pid):
+                    return True
+        return False
+
+    def _navegador_no_perfil(self, perfil):
+        """(pid, com_prova) do navegador que SEGURA o perfil agora, ou None. O Chrome aponta
+        `SingletonLock` para `<host>-<pid>`: PID morto = resíduo. PID vivo cuja linha de
+        comando NÃO cita este perfil = PID reusado = resíduo. Linha de comando ilegível =
+        conservador: conta como vivo, mas SEM prova (quem mata exige a prova)."""
+        if not perfil:
+            return None
+        try:
+            alvo = os.readlink(os.path.join(perfil, "SingletonLock"))
+        except OSError:
+            return None
+        try:
+            pid = int(alvo.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        if not self._pid_vivo(pid):
+            return None
+        try:
+            comando = self._comando_fn(pid)
+        except Exception:
+            comando = None
+        if comando is None:
+            return (pid, False)
+        if _comando_cita_perfil(comando, perfil):
+            return (pid, True)
+        return None
+
+    def disparar_zelo(self, chave, meta, *, parceiras=(), agora=None):
+        """Dispara UM zelo: `python -m motor.zelador <plat> <url> --conta <conta>` com o
+        `_montar` da captura (perfil, canal, headless, sessão, árvore — a Stoa na dela).
+
+        Anti-ban, igual ou mais estrito que a captura:
+          - 1 zelo por vez (global); nunca junto de captura da conta NEM das PARCEIRAS
+            (contas que partilham o arquivo de sessão ou o perfil): TODAS as contas precisam
+            estar SEM lock nenhum, e o zelo cria o lock de cada uma de forma EXCLUSIVA
+            (todas ou nenhuma) — `dono: zelador`, `course_url: zelador:<plat>`;
+          - navegador vivo no perfil sem lock de ninguém (um `--reseed` avulso) => não abre;
+          - Singleton* de crash é limpo só com os locks nas mãos (a premissa do `disparar`).
+        O fim do processo NÃO é óbito de captura: fica em `_zelos`, fora de `_procs`.
+        LEVANTA ContaOcupada (aguarda a vez) ou RuntimeError (plataforma sem motor)."""
+        self._reap()
+        if _PLATAFORMAS.get(meta.plataforma) is None:
+            raise RuntimeError(
+                f"plataforma {meta.plataforma!r} sem motor conhecido — não zelo {meta.url}")
+        if self.zelo_em_curso():
+            raise ContaOcupada("já há um zelo em curso (1 por vez, nunca em paralelo)")
+        contas = [str(meta.conta)] + sorted({str(c) for c in parceiras} - {str(meta.conta)})
+        if not self.contas_livres(contas):
+            raise ContaOcupada(f"conta(s) {', '.join(contas)} com lock — o zelo espera a vez")
+        _, env, cwd = self._montar(meta)
+        perfil = env.get("CHROME_USER_DATA_DIR") or ""
+        perfil_abs = perfil if (not perfil or os.path.isabs(perfil)) else os.path.join(cwd, perfil)
+        nav = self._navegador_no_perfil(perfil_abs)
+        if nav is not None:
+            raise ContaOcupada(f"navegador vivo (PID {nav[0]}) no perfil de {meta.conta!r} "
+                               f"sem lock de ninguém — não abro outro por cima")
+        cmd = [self._motor_python, "-m", "motor.zelador", meta.plataforma, meta.url,
+               "--conta", str(meta.conta)]
+        log_path = self._zelo_log_path(meta.conta)
+        env[_ENV_STDERR_TEE] = log_path
+        # teto PRÓPRIO do zelo (motor/zelador.py, asyncio.wait_for): termina sozinho, fechando
+        # o navegador, antes do SIGTERM deste watchdog.
+        env[_ENV_TETO_ZELO] = f"{max(30.0, _TETO_ZELO_FRACAO * self._zelo_timeout_s):.0f}"
+        inicio = time.time() if agora is None else float(agora)
+        feitos = []
+        try:
+            for c in contas:
+                # O LOCK carrega o que o vigia de uma encarnação FUTURA precisa para matar ou
+                # limpar este zelo se o daemon reiniciar no meio (`vigiar_zelos_orfaos`): o
+                # início (`ts`), o perfil (navegador órfão) e, depois, o `pid` e o `sinal`.
+                token = {"pid": None, "course_url": f"zelador:{meta.plataforma}",
+                         "conta": c, "ts": inicio, "dono": "zelador", "zelo": chave,
+                         "perfil": perfil_abs}
+                if not self._criar_lock_exclusivo(c, token):
+                    raise ContaOcupada(f"conta {c!r} ocupada no mesmo instante — zelo desiste")
+                feitos.append((c, token))
+            _limpar_singleton_orfao(perfil_abs)
+            inicio_wall = time.time()
+            proc = self._spawn(cmd, env=env, cwd=cwd)
+        except BaseException:
+            for c, token in feitos:
+                self._remover_lock_se_nosso(c, token)
+            raise
+        pid = getattr(proc, "pid", None)
+        tokens = {}
+        for c, token in feitos:
+            novo = dict(token, pid=pid)
+            tokens[c] = novo if self._trocar_lock_se_nosso(c, token, novo) else token
+        self._zelos[chave] = {"proc": proc, "chave": chave, "conta": str(meta.conta),
+                              "plataforma": meta.plataforma, "tokens": tokens,
+                              "inicio": inicio, "inicio_wall": inicio_wall, "log": log_path,
+                              "perfil": perfil_abs, "sinal": None}
+        return f"zelo_iniciado:{chave}"
+
+    def _colher_zelos(self):
+        """Colhe os zelos que terminaram (chamado por `_reap`, ANTES de qualquer decisão
+        de lock): lê a linha ZELADOR, solta os locks — ou, se ficou navegador vivo no
+        perfil, os passa para o PID DELE (a captura espera ele morrer; com prova de que é
+        o navegador do perfil, leva SIGTERM) — e guarda o resultado para `drenar_zelos`."""
+        for chave in [k for k, z in self._zelos.items() if z["proc"].poll() is not None]:
+            z = self._zelos.pop(chave)
+            linha = ler_linha_zelador(_cauda_do_err(z["log"], desde=z["inicio_wall"]))
+            nav = self._navegador_no_perfil(z["perfil"])
+            for c, token in z["tokens"].items():
+                if nav is not None:
+                    # `sinal` TERM com hora ainda desconhecida: o vigia persistido começa a
+                    # contar a carência na 1ª volta e escala para SIGKILL depois dela.
+                    self._trocar_lock_se_nosso(c, token, dict(
+                        token, pid=nav[0], navegador_orfao=True,
+                        sinal=["TERM", None] if nav[1] else None))
+                else:
+                    self._remover_lock_se_nosso(c, token)
+            if nav is not None and nav[1]:
+                self._sinal_fn(nav[0], signal.SIGTERM, False)
+            self._zelos_colhidos.append({
+                "chave": chave, "conta": z["conta"], "plataforma": z["plataforma"],
+                "exit_code": getattr(z["proc"], "returncode", None), "linha": linha,
+                "log": z["log"], "watchdog": z["sinal"] is not None,
+                "navegador_orfao": nav is not None})
+
+    def drenar_zelos(self, agora=None) -> list:
+        """Resultados dos zelos terminados desde a última drenagem (e zera). Também é o
+        WATCHDOG: zelo vivo além de `zelo_timeout_s` leva SIGTERM (o zelador cancela e fecha
+        o navegador normalmente); se não sair em `zelo_grace_s`, SIGKILL no grupo. O lock
+        só sai quando o processo sai (vivo = conta ocupada). Cada sinal é GRAVADO no lock
+        (`sinal`): um restart do daemon no meio continua a escalada (`vigiar_zelos_orfaos`),
+        que também roda aqui para os zelos de encarnações anteriores."""
+        agora = time.time() if agora is None else float(agora)
+        self._reap()
+        for z in self._zelos.values():
+            pid = getattr(z["proc"], "pid", None)
+            if pid is None:
+                continue
+            sinal = z["sinal"]
+            if sinal is None and agora - z["inicio"] > self._zelo_timeout_s:
+                self._sinal_fn(pid, signal.SIGTERM, False)
+                z["sinal"] = ("TERM", agora)
+                self._gravar_sinal_do_zelo(z, ["TERM", agora])
+            elif sinal is not None and sinal[0] == "TERM" and agora - sinal[1] > self._zelo_grace_s:
+                self._sinal_fn(pid, signal.SIGKILL, True)
+                z["sinal"] = ("KILL", agora)
+                self._gravar_sinal_do_zelo(z, ["KILL", agora])
+        self.vigiar_zelos_orfaos(agora)
+        colhidos, self._zelos_colhidos = self._zelos_colhidos, []
+        return colhidos
+
+    def _gravar_sinal_do_zelo(self, z, sinal):
+        for c, token in list(z["tokens"].items()):
+            novo = dict(token, sinal=list(sinal))
+            if self._trocar_lock_se_nosso(c, token, novo):
+                z["tokens"][c] = novo
+
+    def vigiar_zelos_orfaos(self, agora=None) -> list:
+        """WATCHDOG PERSISTIDO dos locks `dono: zelador` que NÃO são de um zelo desta
+        encarnação: o zelo de um daemon que reiniciou no meio (inclusive o rollback
+        `ATHENA_ZELADOR_ATIVO=0` + restart, quando nenhum zelador roda — por isso o loop
+        chama isto em TODO ciclo) e o lock que um zelo passou ao navegador órfão dele. Tudo o
+        que precisa está NO LOCK (`pid`, `ts` = início, `perfil`, `navegador_orfao`, `sinal`):
+
+          - PID vivo COM PROVA (a linha de comando é a do `python -m motor.zelador`, ou a do
+            navegador com o `--user-data-dir` do perfil): passado `zelo_timeout_s` do início,
+            SIGTERM; `zelo_grace_s` depois do TERM, SIGKILL (no grupo, se é o zelo). O sinal é
+            gravado no lock: outro restart continua a escalada, não a recomeça.
+          - PID vivo SEM prova (linha de comando ilegível): conservador — não mata; o lock fica.
+          - PID morto, ou vivo mas de OUTRO processo (PID reusado): o zelo acabou. Sem
+            navegador vivo no perfil, o lock SAI (numa conta ociosa ninguém mais o apagaria e
+            o zelador a veria ocupada para sempre); com navegador, passa ao PID dele.
+          - INTENÇÃO (`pid` None: crash entre criar o lock e promover o PID): só depois de
+            `zelo_timeout_s + zelo_grace_s` do início (o zelo que tenha subido já saiu pelo
+            teto próprio do motor), com a mesma checagem de navegador no perfil.
+        Devolve [(ação, conta)] (observabilidade/teste). Nunca levanta."""
+        agora = time.time() if agora is None else float(agora)
+        try:
+            self._reap()
+        except Exception:
+            pass
+        nossos = {}
+        for z in self._zelos.values():
+            for c, tok in z["tokens"].items():
+                nossos[c] = tok
+        try:
+            nomes = sorted(os.listdir(self._lock_dir))
+        except OSError:
+            return []
+        grupos = {}
+        for nome in nomes:
+            if not nome.endswith(".lock"):
+                continue
+            try:
+                with open(os.path.join(self._lock_dir, nome)) as f:
+                    dados = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(dados, dict) or dados.get("dono") != "zelador":
+                continue
+            conta = dados.get("conta")
+            if conta is None or nossos.get(str(conta)) == dados:
+                continue                                   # desta encarnação: vigia em memória
+            chave = ("intencao", str(conta)) if dados.get("pid") is None else dados.get("pid")
+            grupos.setdefault(chave, []).append((str(conta), dados))
+        acoes = []
+        for chave, locks in grupos.items():
+            try:
+                acoes.extend(self._vigiar_grupo_orfao(locks, agora))
+            except Exception:
+                pass                                       # vigia nunca derruba o chamador
+        return acoes
+
+    def _vigiar_grupo_orfao(self, locks, agora):
+        """Um zelo órfão = os locks (conta + parceiras) com o MESMO pid: decide UMA vez."""
+        conta0, d0 = locks[0]
+        pid = d0.get("pid")
+        perfil = d0.get("perfil") or ""
+        inicio = min((t for t in (_ts_num(d.get("ts")) for _, d in locks) if t is not None),
+                     default=None)
+        if pid is None:
+            if inicio is None or agora - inicio <= self._zelo_timeout_s + self._zelo_grace_s:
+                return [("intencao-aguarda", c) for c, _ in locks]
+            return self._encerrar_locks_orfaos(locks, perfil, agora)
+        orfao_nav = any(d.get("navegador_orfao") for _, d in locks)
+        vivo, prova = self._pid_vivo(pid), None
+        if vivo:
+            try:
+                comando = self._comando_fn(pid)
+            except Exception:
+                comando = None
+            if comando is not None:
+                prova = (_comando_cita_perfil(comando, perfil) if orfao_nav
+                         else _comando_e_zelo(comando))
+                if not prova:
+                    vivo = False                           # PID reusado: o zelo já acabou
+        if not vivo:
+            return self._encerrar_locks_orfaos(locks, perfil, agora)
+        if not prova:
+            return [("sem-prova", c) for c, _ in locks]    # ilegível: não mata, o lock fica
+        fases = {"KILL": 2, "TERM": 1}
+        sinal = max((d.get("sinal") for _, d in locks if isinstance(d.get("sinal"), list)
+                     and len(d.get("sinal")) == 2 and d["sinal"][0] in fases),
+                    key=lambda x: fases[x[0]], default=None)
+        novo = None
+        if sinal is None:
+            if inicio is not None and agora - inicio > self._zelo_timeout_s:
+                self._sinal_fn(pid, signal.SIGTERM, False)
+                novo = ["TERM", agora]
+        elif sinal[0] == "TERM" and _ts_num(sinal[1]) is None:
+            novo = ["TERM", agora]                         # TERM de hora desconhecida: conta daqui
+        elif sinal[0] == "TERM" and agora - _ts_num(sinal[1]) > self._zelo_grace_s:
+            self._sinal_fn(pid, signal.SIGKILL, not orfao_nav)
+            novo = ["KILL", agora]
+        if novo is None:
+            return [("aguarda", c) for c, _ in locks]
+        for c, d in locks:
+            self._trocar_lock_se_nosso(c, d, dict(d, sinal=novo))
+        return [(novo[0], c) for c, _ in locks]
+
+    def _encerrar_locks_orfaos(self, locks, perfil, agora):
+        """O zelo órfão acabou: sem navegador no perfil, os locks saem; com navegador, passam
+        ao PID dele (SIGTERM só com a prova de que é o navegador DESTE perfil)."""
+        nav = self._navegador_no_perfil(perfil) if perfil else None
+        acoes = []
+        for c, d in locks:
+            if nav is None:
+                if self._remover_lock_se_nosso(c, d):
+                    acoes.append(("solto", c))
+            elif d.get("pid") != nav[0]:
+                if self._trocar_lock_se_nosso(c, d, dict(
+                        d, pid=nav[0], navegador_orfao=True,
+                        sinal=["TERM", agora] if nav[1] else None)):
+                    acoes.append(("navegador-orfao", c))
+        if nav is not None and nav[1] and any(d.get("pid") != nav[0] for _, d in locks):
+            self._sinal_fn(nav[0], signal.SIGTERM, False)
+        return acoes
+
     def _avisar_portao(self, metodo):
         """Chama um gancho do portão de carga (novo_ciclo / registrar_disparo /
         retomar_sobrecarga) sem NUNCA derrubar o chamador (observabilidade/rampa não param
@@ -1652,37 +2184,54 @@ class LocalExecutor:
         # O `_spawn_popen` POPA esta chave antes do exec — o motor não a herda. Spawns
         # injetados (testes) a ignoram (contrato `(cmd, *, env, cwd)` intacto).
         env[_ENV_STDERR_TEE] = self._stderr_path(meta.conta)
-        # SINGLETON ÓRFÃO: se um run anterior DESTA conta crashou, pode ter deixado o
-        # SingletonLock no perfil — e o próximo run falharia na largada mesmo sem
-        # concorrência. O guard 1-por-conta já provou que nenhum motor da conta está vivo
-        # AGORA, então qualquer Singleton* no perfil dela é obsoleto: limpa antes de subir.
-        perfil = env.get("CHROME_USER_DATA_DIR")
-        if perfil:
-            _limpar_singleton_orfao(perfil if os.path.isabs(perfil)
-                                    else os.path.join(cwd, perfil))
-        # TOCTOU (fix do achado MÉDIO): grava o lock de INTENÇÃO (pid=None) ANTES do spawn.
+        # TOCTOU (fix do achado MÉDIO): o lock de INTENÇÃO (pid=None) nasce ANTES do spawn.
         # Se o loop crashar na janela sub-ms entre o spawn e a escrita do PID, a captura
         # órfã (start_new_session) segue viva SEM que seu PID tenha sido registrado — mas o
         # lock de intenção JÁ está em disco e (via `_ler_lock` pid=None fail-closed) mantém
         # a conta OCUPADA no restart, de modo que NADA re-dispara. Gravar o lock só DEPOIS
         # do spawn (o bug) deixaria essa janela sem lock -> re-disparo -> ban + captura dupla.
-        self._escrever_lock(meta.conta, curso_url, None)
-        # carimbo do disparo ANTES do spawn (que trunca o .err): o reap só aceita como
-        # evidência deste run um .err que não seja mais velho que isto (`_cauda_do_err`).
-        self._disparo_ts[curso_url] = time.time()
+        # AQUISIÇÃO EXCLUSIVA (achado p102b): a intenção é CRIADA só-se-não-existe, nunca por
+        # cima. Entre o `_ler_lock` lá em cima e aqui cabem o portão de carga e a escolha do
+        # passe (SQLite, até ~10 s): se a sonda de inspeção p102 ou o reseed/zelador do P7
+        # criou o lock NESSA janela (eles também criam exclusivo, via os.link), o de fora
+        # VENCE — ContaOcupada, nada é aberto, nada é apagado. O lock presente (vivo, de
+        # intenção ou de PID MORTO — a evidência da autópsia) fica intacto: relido só-leitura.
+        intencao = {"pid": None, "course_url": curso_url, "conta": str(meta.conta),
+                    "ts": time.time()}
+        if not self._criar_lock_exclusivo(meta.conta, intencao):
+            atual = self._conteudo_do_lock(meta.conta)
+            raise ContaOcupada(
+                f"conta {meta.conta!r} foi ocupada durante o disparo de {curso_url} (lock de "
+                f"{atual.get('course_url') or 'dono desconhecido'}, PID {atual.get('pid')}) "
+                f"— recuso, sem abrir navegador nem mexer no perfil (anti-ban: 1 por conta)")
         try:
+            # SINGLETON ÓRFÃO: se um run anterior DESTA conta crashou, pode ter deixado o
+            # SingletonLock no perfil — e o próximo run falharia na largada mesmo sem
+            # concorrência. SÓ AGORA, com o lock exclusivo NOSSO em disco, está provado que
+            # ninguém da conta (motor, sonda, reseed) está com o perfil: limpar ANTES da
+            # aquisição apagaria o SingletonLock do navegador de quem venceu a corrida.
+            perfil = env.get("CHROME_USER_DATA_DIR")
+            if perfil:
+                _limpar_singleton_orfao(perfil if os.path.isabs(perfil)
+                                        else os.path.join(cwd, perfil))
+            # carimbo do disparo ANTES do spawn (que trunca o .err): o reap só aceita como
+            # evidência deste run um .err que não seja mais velho que isto (`_cauda_do_err`).
+            self._disparo_ts[curso_url] = time.time()
             proc = self._spawn(cmd, env=env, cwd=cwd)
         except Exception:
             # o spawn FALHOU: a intenção não virou captura. Remove o lock de intenção para
             # não travar a conta para sempre por um disparo que nunca aconteceu (o processo
-            # não existe; manter o lock seria uma conta ocupada por nada).
-            self._remover_lock(self._lock_path(meta.conta))
+            # não existe; manter o lock seria uma conta ocupada por nada) — SÓ se ainda for
+            # a NOSSA intenção: nunca apaga o lock de outro dono.
+            self._remover_lock_se_nosso(meta.conta, intencao)
             self._disparo_ts.pop(curso_url, None)
             raise
         self._procs[curso_url] = proc
         # PROMOVE o lock de intenção a lock DEFINITIVO, com o PID real do processo de
         # captura — é o que um executor nascido pós-restart lerá (via `_pid_vivo`) para
-        # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada.
+        # decidir se a conta ainda está ocupada ou já pode ser liberada/retomada. Troca
+        # atômica por cima da NOSSA intenção: ninguém mais cria lock enquanto ela existe
+        # (todos criam exclusivo) e ninguém apaga lock alheio de intenção.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
         # um motor SUBIU: conta na janela da rampa do portão (só pesa na saída da sobrecarga)
         self._avisar_portao("registrar_disparo")

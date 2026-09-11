@@ -10,9 +10,12 @@ MundoProc modela a TABELA DE PROCESSOS DO SO — quais PIDs estão vivos AGORA �
 do LocalExecutor: é isso que dá DENTES ao teste de RESTART (um executor novo, com o
 processo antigo AINDA vivo na tabela, lê o lock DURÁVEL em disco e NÃO re-dispara)."""
 import glob
+import hashlib
 import json
 import os
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -458,6 +461,182 @@ def test_spawn_falho_remove_o_lock_de_intencao(tmp_path):
     ex2 = _exec(_hot(C1, "conta-A"), spawn=sp_ok, lock_dir=lock, pid_vivo=sp_ok.mundo.vivo)
     assert ex2.disparar(C1).startswith(f"local_iniciada:{C1}")
     assert len(sp_ok.calls) == 1
+
+
+# ==========================================================================
+# AQUISIÇÃO EXCLUSIVA (achado p102b, item da sonda). Entre o `_ler_lock` ("sem lock") e a
+# intenção cabem o portão de carga e a escolha do passe (SQLite, até ~10 s). A sonda de
+# inspeção p102 (motor/lock_conta.py) e o reseed/zelador do P7 (motor/conta_lock.py)
+# criam o MESMO lock com criação exclusiva (temp completo + os.link). Se o lock deles
+# nasce NESSA janela, o daemon não pode sobrescrevê-lo (os.replace era o bug) nem apagar
+# os Singleton* do perfil que o navegador deles está usando — seriam dois navegadores na
+# MESMA conta (ban). A janela é reproduzida DE VERDADE: o dono externo cria o lock de
+# dentro da `pendencias_fn`, que o `disparar` chama exatamente nesse intervalo.
+# ==========================================================================
+def _lock_de_fora(lock_dir, conta, *, pid, course_url, dono="sonda-p102"):
+    """Cria o lock da conta como a sonda/reseed fazem: temp COMPLETO + os.link
+    (exclusivo, falha se já existe). Devolve (path, conteúdo gravado)."""
+    slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(lock_dir, slug + ".lock")
+    dados = {"pid": pid, "course_url": course_url, "conta": str(conta),
+             "ts": time.time(), "dono": dono, "token": "tok-" + dono}
+    tmp = os.path.join(lock_dir, "." + slug + ".lock." + dono + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(dados, f)
+    try:
+        os.link(tmp, path)
+    finally:
+        os.remove(tmp)
+    return path, dados
+
+
+def _pend_com_corrida(acao):
+    """pendencias_fn que, no MEIO do disparo (depois do `_ler_lock`), executa `acao` — o
+    outro processo pegando a conta — e devolve pendência só no passe base."""
+    def fn(url, motor_dir):
+        acao()
+        return {"base": 1, "audio": 0, "embed": 0, "nao-video": 0}
+    return fn
+
+
+def _hotmart_com_perfil(tmp_path, spawn, pendencias_fn, pid_vivo, conta="hotmart-principal"):
+    motor_dir = tmp_path / "aula"
+    perfil = motor_dir / ".chrome-profile"
+    perfil.mkdir(parents=True, exist_ok=True)
+    singleton = perfil / "SingletonLock"
+    singleton.write_text("navegador da sonda")
+    lock_dir = str(tmp_path / "locks")
+    ex = captura.LocalExecutor(
+        [_hot(C1, conta)], motor_python=PY, motor_dir=str(motor_dir), spawn=spawn,
+        lock_dir=lock_dir, pid_vivo=pid_vivo, motor_log_dir=str(tmp_path / "logs"),
+        pendencias_fn=pendencias_fn)
+    return ex, lock_dir, singleton
+
+
+def test_lock_da_sonda_criado_na_janela_do_disparo_vence_sem_sobrescrita(tmp_path):
+    SONDA_PID = 77001
+    sp = FakeSpawn()
+    pego = {}
+
+    def sonda_pega_a_conta():
+        pego["path"], pego["dados"] = _lock_de_fora(
+            lock_dir, "hotmart-principal", pid=SONDA_PID, course_url="sonda-p102:inspecao")
+
+    ex, lock_dir, singleton = _hotmart_com_perfil(
+        tmp_path, sp, _pend_com_corrida(sonda_pega_a_conta),
+        pid_vivo=lambda p: p == SONDA_PID or sp.mundo.vivo(p))
+    with pytest.raises(captura.ContaOcupada) as info:
+        ex.disparar(C1)
+    # DENTES (o bug: os.replace por cima + Singleton* apagados + motor subindo):
+    assert sp.calls == []                                  # nenhum 2º navegador na conta
+    with open(pego["path"]) as f:
+        assert json.load(f) == pego["dados"]               # lock da sonda INTACTO
+    assert singleton.exists()                              # perfil em uso NÃO foi mexido
+    assert "sonda-p102:inspecao" in str(info.value)
+    # sem temp sobrando (nem arquivo .lock extra que o vigia/controle varreriam)
+    assert os.listdir(lock_dir) == [os.path.basename(pego["path"])]
+    # e a conta segue ocupada pela sonda (o próximo ciclo também não dispara)
+    assert ex.conta_ocupada("hotmart-principal") is True
+
+
+def test_lock_de_pid_morto_criado_na_janela_fica_intacto_como_evidencia(tmp_path):
+    # Um lock que aparece na janela e cujo PID já morreu (ex.: um reseed morto por SIGKILL)
+    # é EVIDÊNCIA para a autópsia: a aquisição que perde a corrida não o apaga (releitura
+    # só-leitura) e não dispara neste ciclo por cima dele.
+    MORTO = 77002
+    sp = FakeSpawn()
+    pego = {}
+
+    def reseed_pega_e_morre():
+        pego["path"], pego["dados"] = _lock_de_fora(
+            lock_dir, "hotmart-principal", pid=MORTO, course_url="reseed:hotmart",
+            dono="reseed")
+
+    ex, lock_dir, singleton = _hotmart_com_perfil(
+        tmp_path, sp, _pend_com_corrida(reseed_pega_e_morre), pid_vivo=sp.mundo.vivo)
+    with pytest.raises(captura.ContaOcupada) as info:
+        ex.disparar(C1)
+    assert sp.calls == []
+    with open(pego["path"]) as f:
+        assert json.load(f) == pego["dados"]               # evidência preservada
+    assert singleton.exists()
+    assert "reseed:hotmart" in str(info.value) and str(MORTO) in str(info.value)
+
+
+def test_spawn_falho_nao_apaga_lock_que_deixou_de_ser_nosso(tmp_path):
+    # Se, quando o spawn falha, o lock já NÃO é a nossa intenção (outro dono o tomou —
+    # violação de protocolo simulada), a limpeza do spawn falho não pode apagá-lo: só a
+    # NOSSA intenção sai. (O bug: `_remover_lock(path)` incondicional.)
+    lock_dir = str(tmp_path / "locks")
+    alheio = {}
+
+    def spawn_quebra_depois_de_outro_tomar(cmd, *, env, cwd):
+        path = ex._lock_path("conta-A")
+        alheio["dados"] = {"pid": 77003, "course_url": "zelador:hotmart", "conta": "conta-A",
+                           "ts": time.time(), "dono": "zelador"}
+        with open(path + ".x", "w") as f:
+            json.dump(alheio["dados"], f)
+        os.replace(path + ".x", path)
+        raise OSError("spawn falhou")
+
+    ex = captura.LocalExecutor([_hot(C1, "conta-A")], motor_python=PY, motor_dir=DIR,
+                               spawn=spawn_quebra_depois_de_outro_tomar, lock_dir=lock_dir,
+                               pid_vivo=lambda p: True, motor_log_dir=str(tmp_path / "logs"))
+    with pytest.raises(OSError):
+        ex.disparar(C1)
+    with open(ex._lock_path("conta-A")) as f:
+        assert json.load(f) == alheio["dados"]             # DENTES: o alheio ficou
+
+
+def test_varios_disparadores_na_mesma_conta_ao_mesmo_tempo_so_um_sobe(tmp_path):
+    # A corrida CRUA: N encarnações (processos do daemon, ou daemon + sonda) leem "sem
+    # lock" ANTES de qualquer uma gravar (a barreira segura todas dentro da janela) e
+    # depois correm para adquirir. Com os.replace, TODAS sobem (N navegadores na mesma
+    # conta); com a criação exclusiva, exatamente UMA sobe e as outras recebem ContaOcupada.
+    N = 6
+    lock_dir = str(tmp_path / "locks")
+    barreira = threading.Barrier(N, timeout=20)
+    subiu, ocupada, outros = [], [], []
+    trava = threading.Lock()
+    seq = [80000]
+
+    def spawn(cmd, *, env, cwd):
+        with trava:
+            seq[0] += 1
+            proc = FakeProc()
+            proc.pid = seq[0]
+            subiu.append(proc)
+        return proc
+
+    def pend(url, motor_dir):
+        barreira.wait()                                    # todas já leram "sem lock"
+        return {"base": 1, "audio": 0, "embed": 0, "nao-video": 0}
+
+    def rodar(i):
+        ex = captura.LocalExecutor(
+            [_hot(C1, "conta-A")], motor_python=PY, motor_dir=DIR, spawn=spawn,
+            lock_dir=lock_dir, pid_vivo=lambda p: True, pendencias_fn=pend,
+            motor_log_dir=str(tmp_path / "logs"))
+        try:
+            ex.disparar(C1)
+        except captura.ContaOcupada:
+            with trava:
+                ocupada.append(i)
+        except Exception as e:                             # pragma: no cover — diagnóstico
+            with trava:
+                outros.append(repr(e))
+
+    ths = [threading.Thread(target=rodar, args=(i,)) for i in range(N)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(30)
+    assert outros == []
+    assert len(subiu) == 1, f"{len(subiu)} motores subiram na MESMA conta"
+    assert len(ocupada) == N - 1
+    with open(os.path.join(lock_dir, os.listdir(lock_dir)[0])) as f:
+        assert json.load(f)["pid"] == subiu[0].pid         # o lock é do único que subiu
+    assert len(os.listdir(lock_dir)) == 1                  # nenhum temp órfão
 
 
 # ==========================================================================

@@ -14,7 +14,7 @@ uma âncora nova, o rótulo passa a mascará-la sem ninguém lembrar de atualiza
 conferência é na forma CRUA (sem remover negações como a `causa` faz) — mais estrita que o
 classificador, de propósito.
 """
-from maestro.causa import _RE_SESSAO, _RE_TOKEN
+from maestro.causa import _RE_SESSAO, _RE_TOKEN, _RE_TOKEN_FORTE
 
 ROTULO_MAX = 200                     # URLs de curso são longas; o do motor corta em 70
 MASCARA = "«…»"
@@ -23,7 +23,16 @@ _MAX_MASCARAS = 16
 
 
 def _ancora(texto):
-    return _RE_SESSAO.search(texto) or _RE_TOKEN.search(texto)
+    # `_RE_TOKEN_FORTE` entra JUNTO (r16) para a invariante que dá sentido a este módulo
+    # voltar a valer: a máscara tem de ser SUPERCONJUNTO do que o classificador aceita.
+    # `_RE_TOKEN` (a âncora larga, ainda idêntica à do daemon vivo) não cobre o
+    # vocabulário que a camada (A) ganhou — "no api key provided", "authentication_error",
+    # "bad api key" —, então um TÍTULO de aula com essas palavras sairia CRU no alerta,
+    # o motor o ecoaria na cauda do próximo run e ele decidiria a causa ("troque o
+    # token") sem ninguém ter falhado. Mascarar demais aqui é barato: sai «…» e o dono
+    # ainda reconhece o curso.
+    return (_RE_SESSAO.search(texto) or _RE_TOKEN.search(texto)
+            or _RE_TOKEN_FORTE.search(texto))
 
 
 def casa_ancora_de_morte(texto) -> bool:

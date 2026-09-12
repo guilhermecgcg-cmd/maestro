@@ -172,6 +172,108 @@ def test_o_rotulo_continua_mascarando_de_forma_conservadora():
         assert not casa_ancora_de_morte(r), r
 
 
+# --------------------------------------------------------------------------
+# 1-bis (r16) — "Permission denied" NU do SISTEMA OPERACIONAL não é chave de API.
+#
+# A 2ª rodada apertou a âncora e, no mesmo movimento, abriu `permission[_\s]denied
+# (error)?` — que casa o "Permission denied" do SO. Caudas REAIS de falha de DISCO/
+# PERMISSÃO viravam "troque o token": alerta ESSENCIAL mandando o dono mexer numa
+# chave boa enquanto a causa real (pasta sem permissão de escrita) fica escondida.
+# --------------------------------------------------------------------------
+# Cauda REAL do yt-dlp quando a pasta de áudio fica sem permissão de escrita.
+_CAUDA_YTDLP_SEM_PERMISSAO = (
+    "[download] Destination: /Users/guilhermerodrigues/teste/aula/audio/aula-12.m4a\n"
+    "ERROR: unable to open for writing: [Errno 13] Permission denied: "
+    "'/Users/guilhermerodrigues/teste/aula/audio/aula-12.m4a.part'\n"
+    "⛔ RUN INTERROMPIDO POR EXCESSO DE FALHAS: 22 aulas processadas e NENHUMA "
+    "funcionou. Algo está sistematicamente errado do lado da Hotmart. Parando com "
+    "ok=0 audio=0 falhou=22 de 207.\n"
+)
+# ffmpeg sem bit de execução — e a linha SEGUINTE começa com "ERROR:". É a armadilha
+# do separador: com `[_\s]` (que inclui \n) "Permission denied" + "\nERROR" colariam
+# numa âncora "permission denied error" que NINGUÉM escreveu.
+_CAUDA_FFMPEG_SEM_PERMISSAO = (
+    "/bin/sh: ffmpeg: Permission denied\n"
+    "ERROR: Postprocessing: ffmpeg exited with code 126\n"
+)
+_CAUDA_DOCKER_SEM_PERMISSAO = (
+    "docker: Got permission denied while trying to connect to the Docker daemon "
+    "socket at unix:///var/run/docker.sock\n"
+)
+# O título da AULA, ecoado pelo motor na cauda (formato real do corpus).
+_CAUDA_TITULO_DE_AULA = (
+    "motor.kiwify.enumerate: aula já conhecida — CURSO › Aula 7 - Permission denied: "
+    "como resolver\n"
+)
+
+
+@pytest.mark.parametrize("cauda,rotulo", [
+    (_CAUDA_YTDLP_SEM_PERMISSAO, "yt-dlp: pasta de áudio sem permissão de escrita"),
+    (_CAUDA_FFMPEG_SEM_PERMISSAO, "ffmpeg sem permissão de execução"),
+    (_CAUDA_DOCKER_SEM_PERMISSAO, "socket do docker sem permissão"),
+    (_CAUDA_TITULO_DE_AULA, "título de aula com 'Permission denied' no nome"),
+])
+def test_permission_denied_NU_do_SO_nao_manda_trocar_o_token(cauda, rotulo):
+    r"""DENTES: reintroduzir `permission[_\s]denied(error)?` em `_RE_TOKEN_FORTE` faz
+    os QUATRO falharem — é exatamente o que a r15 tinha."""
+    assert not causa._sinal_de_credencial(cauda), rotulo
+    d = _classificar(cauda, exit_code=4)
+    assert d.acao == "escalar_humano", (rotulo, d)      # a causa honesta do exit 4
+    assert "token" not in d.motivo, (rotulo, d.motivo)
+
+
+def test_permission_denied_NU_nao_sequestra_o_contrato_de_exit_code():
+    """O ramo de credencial tem PRECEDÊNCIA sobre o exit code: enquanto ele casava o
+    "Permission denied" nu, um exit 3 (sessão morta declarada pelo MOTOR) virava
+    "troque o token" e o reseed NUNCA acontecia. DENTES: com a regex da r15 este
+    assert vira escalar_token."""
+    for code in (2, 3):
+        d = _classificar(_CAUDA_FFMPEG_SEM_PERMISSAO, exit_code=code)
+        assert d.acao == "escalar_reseed", (code, d)
+    # e o exit 5 continua sendo transitório, não "troque o token"
+    assert _classificar(_CAUDA_YTDLP_SEM_PERMISSAO, exit_code=5).acao != "escalar_token"
+
+
+@pytest.mark.parametrize("cauda", [
+    "/bin/sh: ffmpeg: Permission denied\nERROR: ffmpeg exited with code 126",
+    "motor.stoa: falha de authentication\nError: timeout ao abrir a página",
+])
+def test_ancora_de_credencial_nunca_atravessa_quebra_de_linha(cauda):
+    r"""A cauda é multilinha por construção (40 linhas do stderr). Uma âncora cujo
+    separador seja `\s` (que inclui \n) cola DUAS LINHAS SEM RELAÇÃO numa frase que
+    ninguém escreveu. DENTES: trocar `_SEP` por `[_\s]` faz os dois falharem."""
+    assert not causa._sinal_de_credencial(cauda), cauda
+
+
+def test_a_forma_Error_do_SDK_continua_sendo_pega():
+    """O outro lado: apertar não pode perder o `PermissionDeniedError` real, que é o
+    caso que a alternativa existia para cobrir — nem as variações com separador."""
+    for cauda in ("anthropic.PermissionDeniedError: Error code: 403",
+                  "{'type': 'permission_denied_error', 'message': 'bad key'}",
+                  "AuthenticationError: 401",
+                  "{'type': 'authentication_error', 'message': 'invalid x-api-key'}"):
+        assert causa._sinal_de_credencial(cauda), cauda
+        assert _classificar(cauda, exit_code=4).acao == "escalar_token", cauda
+
+
+def test_mascara_do_rotulo_e_superconjunto_da_camada_A_do_classificador():
+    """DEFESA EM PROFUNDIDADE com a invariante de volta: todo texto que a camada (A)
+    aceitaria como falha de credencial é MASCARADO por `rotulo_seguro` antes de sair
+    num alerta. Sem isso, um título de aula vindo da plataforma viaja cru, o motor o
+    ecoa na cauda e ele decide a causa. DENTES: tirar `_RE_TOKEN_FORTE` de
+    `maestro.rotulo._ancora` faz "no api key provided" e "authentication_error"
+    falharem (o `_RE_TOKEN` de mascaramento não os tem)."""
+    from maestro.rotulo import MASCARA, casa_ancora_de_morte, rotulo_seguro
+    for texto in ("Aula 9 — no api key provided, e agora?",
+                  "authentication_error na prática",
+                  "Curso: bad API key para iniciantes",
+                  "PermissionDeniedError explicado"):
+        assert causa._RE_TOKEN_FORTE.search(texto), texto   # a camada (A) aceitaria
+        assert casa_ancora_de_morte(texto), texto
+        r = rotulo_seguro(texto)
+        assert MASCARA in r and not causa._sinal_de_credencial(r), (texto, r)
+
+
 @pytest.mark.skipif(not os.path.isdir(AUTOPSIAS), reason="sem autópsias reais nesta máquina")
 def test_corpus_real_nenhuma_autopsia_do_disco_vira_troca_de_token():
     """PROVA COM O DISCO (só leitura): roda o classificador contra TODAS as autópsias

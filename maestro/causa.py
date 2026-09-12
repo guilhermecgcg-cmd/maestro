@@ -181,6 +181,23 @@ _LINHA_TRUNCA = 300                  # a última linha do stderr vai pro alerta/
 #   (A) _RE_TOKEN_FORTE — a frase, sozinha, DECLARA a falha de credencial
 #       (AuthenticationError, PermissionDeniedError, invalid_api_key,
 #       "Incorrect API key provided", "API_KEY invalid", "insufficient permissions").
+#       Em (A) a forma `...Error` é OBRIGATÓRIA em `permission denied` e em
+#       `authentication error`. 3ª rodada (r16): a 2ª rodada aceitava
+#       `permission[_\s]denied(error)?`, ou seja o "Permission denied" NU do sistema
+#       operacional — a mesma doença que a 2ª rodada curou, em outro vocabulário.
+#       Gatilhos REAIS, todos sem nenhuma chave de API envolvida:
+#         ERROR: unable to open for writing: [Errno 13] Permission denied: '.../aula.m4a.part'
+#         /bin/sh: ffmpeg: Permission denied
+#         docker: Got permission denied while trying to connect to the Docker daemon socket
+#       Como este ramo tem PRECEDÊNCIA sobre o exit code, ele não só mandava trocar
+#       uma chave boa (escondendo falta de permissão de DISCO): sequestrava também o
+#       exit 3 — sessão morta pelo veredito do MOTOR viraria "troque o token" e o
+#       reseed nunca aconteceria. As 677 autópsias do disco têm ZERO "permission
+#       denied": a alternativa nua não sustentava um único caso legítimo (o mesmo
+#       argumento com que a 2ª rodada derrubou `forbidden`/`unauthorized`). O
+#       `PermissionDeniedError` do SDK (anthropic/openai) — o caso que ela existia
+#       para pegar — continua casando, e um `PermissionDenied` de gRPC/Google cai na
+#       camada (B) pelo 403 + "API key" da mesma linha.
 #   (B) proximidade POR LINHA — um 401/403/unauthorized/forbidden só vale quando a
 #       MESMA linha traz vocabulário de CHAVE DE API ("api key"/"api_key"/
 #       "x-api-key"/"apikey"/"credential"). Linha, não cauda inteira: "na mesma
@@ -192,9 +209,15 @@ _LINHA_TRUNCA = 300                  # a última linha do stderr vai pro alerta/
 #    token do perfil/arquivo, sondando e renovando"
 # que é o motor RENOVANDO a sessão com sucesso. Aceitar `token`/`bearer` como
 # contexto transformaria esse log benigno no mesmo falso alarme de novo.
+# SEPARADOR DE PALAVRA dentro de uma frase-âncora: espaço/underscore/hífen, NUNCA
+# `\s` — `\s` inclui \n, e aí DUAS LINHAS VIZINHAS SEM RELAÇÃO se colam numa
+# âncora. Real: `/bin/sh: ffmpeg: Permission denied` seguido de `ERROR: ...` casaria
+# "permission denied\nerror". A cauda é multilinha por construção (40 linhas do
+# stderr): âncora que atravessa \n é falso alarme esperando acontecer.
+_SEP = r"[ _-]"
 _RE_TOKEN_FORTE = re.compile(
-    r"(authenticationerror|authentication[_\s]error|"
-    r"permissiondeniederror|permission[_\s]denied(error)?|"
+    r"(authentication" + _SEP + r"?error|"
+    r"permission" + _SEP + r"?denied" + _SEP + r"?error|"
     r"invalid[_\s]api[_\s-]?key|"
     r"(invalid|incorrect|missing|expired|revoked|bad|wrong)\s+api[_\s-]?key|"
     r"api[_\s-]?key\s+(is\s+)?(invalid|incorrect|missing|expired|revoked|"
@@ -234,6 +257,10 @@ def _sinal_de_credencial(err):
 # mesmo depois de o classificador ter deixado de aceitá-las: defesa em profundidade,
 # e o daemon VIVO ainda roda o classificador largo até este fix subir.
 # QUEM DECIDE A CAUSA é `_sinal_de_credencial` (acima) — nunca esta regex.
+# ATENÇÃO à invariante: a MÁSCARA tem de ser SUPERCONJUNTO do que o classificador
+# aceita, senão a defesa em profundidade tem buraco. Esta regex sozinha JÁ NÃO é (ela
+# é byte-idêntica à do daemon vivo, e a camada (A) ganhou vocabulário depois) — por
+# isso `maestro.rotulo._ancora` mascara com a UNIÃO desta com `_RE_TOKEN_FORTE`.
 _RE_TOKEN = re.compile(
     r"(authenticationerror|permissiondeniederror|unauthorized|forbidden|"
     r"http\s*40[13]\b|status\s*40[13]\b|"

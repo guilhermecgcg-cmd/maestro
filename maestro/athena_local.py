@@ -131,6 +131,26 @@ _CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
 # recomeça do zero (honesto). Default 30 min (o vigia externo mata após 900 s sem pulso).
 _CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "1800"))
 
+
+def _env_int(nome, padrao, *, minimo=None):
+    """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
+    caso ilegível); abaixo de `minimo` => `minimo` (com WARNING). Uma variável de ambiente
+    mal digitada nunca pode impedir o daemon de subir."""
+    bruto = os.getenv(nome)
+    if bruto is None or not str(bruto).strip():
+        valor = int(padrao)
+    else:
+        try:
+            valor = int(str(bruto).strip())
+        except (TypeError, ValueError):
+            log.warning("%s=%r não é inteiro — usando o default %s", nome, bruto, padrao)
+            valor = int(padrao)
+    if minimo is not None and valor < minimo:
+        log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
+        valor = int(minimo)
+    return valor
+
+
 # ESTADO DO DISJUNTOR EM DISCO (achado r15) — ANTI-BAN.
 #
 # O `estado` por-curso nascia `{}` a cada `rodar()`. Como o daemon é reiniciado pelo
@@ -160,25 +180,6 @@ _CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "18
 # ligado por padrão, persistir `irredutivel` vira uma decisão separada e consciente.
 # (O FLAP não entra aqui porque já é durável: `vigia._contar_flaps_anteriores` conta os
 # JSONs de autópsia em disco na janela, não um contador em memória.)
-def _env_int(nome, padrao, *, minimo=None):
-    """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
-    caso ilegível); abaixo de `minimo` => `minimo` (com WARNING). Uma variável de ambiente
-    mal digitada nunca pode impedir o daemon de subir."""
-    bruto = os.getenv(nome)
-    if bruto is None or not str(bruto).strip():
-        valor = int(padrao)
-    else:
-        try:
-            valor = int(str(bruto).strip())
-        except (TypeError, ValueError):
-            log.warning("%s=%r não é inteiro — usando o default %s", nome, bruto, padrao)
-            valor = int(padrao)
-    if minimo is not None and valor < minimo:
-        log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
-        valor = int(minimo)
-    return valor
-
-
 _ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
                          "_pend_no_cooldown", "ultimo_no_notion")
 # TETO DE SANIDADE do futuro: um valor corrompido (ou um relógio que andou para trás)
@@ -1632,7 +1633,10 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
             valor = st[chave]
             if isinstance(valor, bool) or not isinstance(valor, (int, float)):
                 continue                               # bool/str/None/lista: descarta
-            valor = float(valor)
+            try:
+                valor = float(valor)                   # int gigante -> OverflowError
+            except (OverflowError, ValueError, TypeError):
+                continue
             if valor != valor or valor in (float("inf"), float("-inf")):
                 continue                               # NaN/inf
             if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown"):

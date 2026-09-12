@@ -344,6 +344,17 @@ def test_valor_absurdo_no_futuro_e_descartado(tmp_path):
     assert disjuntor.pode_tentar(st, 1_788_000_000.0) is True
 
 
+def test_inteiro_gigante_no_arquivo_nao_levanta(tmp_path):
+    # JSON aceita inteiro de qualquer tamanho; `float()` de um inteiro enorme levanta
+    # OverflowError. Um arquivo adulterado NUNCA pode derrubar a leitura.
+    path = str(tmp_path / "estado_cursos.json")
+    with open(path, "w") as f:
+        f.write('{"cursos": {"%s": {"disj_falhas": %s, "cooldown_ate": 1}}}'
+                % (C1, "9" * 400))
+    st = athena_local._carregar_estado_cursos(path, agora=1_788_000_000.0)[C1]
+    assert st == {"cooldown_ate": 1.0}, st
+
+
 @pytest.mark.parametrize("entrada", [
     {"cursos": {C1: {"disj_falhas": "muitas"}}},
     {"cursos": {C1: {"disj_falhas": True}}},               # bool não é contador

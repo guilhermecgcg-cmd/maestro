@@ -64,6 +64,14 @@ class Decisao:
 
 
 # --- assinaturas determinísticas (herdadas de causa.py; SEM _RE_SESSAO) ------
+# ATENÇÃO (r15): esta é a CÓPIA da regex de token que a `causa.py` tinha até 12/09 —
+# com `unauthorized`/`forbidden` NUAS. Na lane de CAPTURA essa largura produziu 23
+# falsos "troque o token" em 7 dias (todos o 403 da CDN do yt-dlp), e lá ela foi
+# substituída por `causa._sinal_de_credencial` (contexto de chave de API obrigatório).
+# AQUI ela CONTINUA como estava, de propósito: a lane de SISTEMAS é opt-in
+# (ATHENA_SISTEMAS_PATH) e não tem NENHUM falso medido — apertar sem evidência seria
+# trocar um risco conhecido por um desconhecido. Se um sistema gerado começar a escalar
+# token à toa, a correção já existe pronta em `causa._sinal_de_credencial`: importe-a.
 _RE_TOKEN = re.compile(
     r"(authenticationerror|permissiondeniederror|unauthorized|forbidden|"
     r"http\s*40[13]\b|status\s*40[13]\b|"

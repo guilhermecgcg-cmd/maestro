@@ -29,8 +29,15 @@ morte de processo e para os testes serem determinísticos):
     NUNCA chama time.time() por baixo.
   * O estado vive no dict por-curso `st` já existente (o mesmo que carrega
     "fase", "tentativas"...). O disjuntor só toca chaves com prefixo `disj_`
-    (e LÊ `irredutivel`, escrita por quem classifica). Persistido junto com o
-    resto do estado por-curso, sobrevive a reinícios.
+    (e LÊ `irredutivel`, escrita por quem classifica).
+  * PERSISTÊNCIA (r15): as chaves `disj_falhas`/`disj_bloqueado_ate` são gravadas
+    em disco ao fim de cada ciclo e restauradas no boot pelo loop-dono
+    (`athena_local._gravar_estado_cursos` / `_carregar_estado_cursos`), de modo que
+    a escada ATRAVESSA um reinício do daemon. Até a r15 isso era só uma promessa
+    do comentário: o `estado` nascia `{}` a cada `rodar()` e QUALQUER reinício
+    (vigia externo, launchd, reboot) zerava um cooldown de até 24 h — o curso
+    voltava a ser martelado, que é exatamente o que a escada existe para evitar.
+    O disjuntor em si continua PURO: quem faz I/O é o loop-dono.
 
 P1 fia estas três funções no `_passada_local_fn`:
   * `pode_tentar(st, agora)` no lugar do antigo `tentativas >= max_tentativas`;
@@ -44,7 +51,10 @@ ESCADA_S = (600, 3600, 21600, 86400)  # 10 min, 1 h, 6 h, 24 h (teto)
 
 # Nº de falhas consecutivas que ARMA a primeira janela. Igual ao `max_tentativas`
 # antigo (3): as duas primeiras falhas são "de graça" (transitório comum), a
-# terceira aciona o recozimento. Injetável para calibração por plataforma.
+# terceira aciona o recozimento. Injetável para calibração por plataforma — e, desde
+# a r15, de fato CONFIGURÁVEL em produção pela env ATHENA_MAX_TENTATIVAS, que o
+# `athena_local._DisjuntorRecozido` fia em todas as chamadas. (Antes da r15 a env
+# existia, era lida e não valia NADA: o limiar real era sempre este 3.)
 LIMIAR_PADRAO = 3
 
 

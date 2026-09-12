@@ -5,9 +5,14 @@ o QUE fazer — sem nunca propor login automático (inviolável anti-ban).
 FLUXO (2 camadas, determinístico-primeiro):
   1. ASSINATURAS DETERMINÍSTICAS sobre (exit_code, stderr_tail):
        - stderr DECLARA sessão morta          -> escalar_reseed  (humano refaz login HEADED)
-       - 401/403/"invalid api key"/auth-error -> escalar_token   (credencial de API ruim;
-                                                                  NÃO o nome de um provedor
-                                                                  num log de sucesso 200)
+       - falha de CHAVE DE API declarada    -> escalar_token   (AuthenticationError,
+         (ver `_sinal_de_credencial`)                          "invalid api key", ou 401/403
+                                                               COM contexto de api-key na
+                                                               MESMA linha. NUNCA o nome de
+                                                               um provedor num log 200, e
+                                                               NUNCA "forbidden"/"unauthorized"
+                                                               nuas — o 403 da CDN do yt-dlp
+                                                               deu 23 falsos em 7 dias)
        - exit 2/3 (Session{Lost,Dead}/NavDead) -> escalar_reseed  (veredito do motor)
        - exit 4 (CircuitBreaker/excesso falhas) -> escalar_humano  (causa DESCONHECIDA)
        - exit 5 (sonda inconclusiva/infra)    -> relancar        (transitório; bench no loop)
@@ -34,6 +39,9 @@ mas o stderr DECLARA sessão morta, a causa-raiz é a sessão (relançar sem res
 reproduziria a morte). A palavra "sessão" isolada NÃO é sinal: o motor a loga em operação
 normal ("sessão viva/persistida") e o abort por excesso de falhas a cita como HIPÓTESE —
 casá-la solta era o falso "Sessão expirou" que benchava o curso de vez (bug corrigido).
+A mesma regra vale para o TOKEN: "forbidden"/"unauthorized" nuas eram o falso "troque o
+token" — 23 de 23 escaladas em 7 dias, todas pelo 403 da CDN do yt-dlp (ver
+`_sinal_de_credencial`).
 """
 import os
 import re
@@ -142,21 +150,90 @@ _EXIT_SONDA_INCONCLUSIVA = 5
 _EXIT_ENUMERACAO_INCOMPLETA = 6
 _LINHA_TRUNCA = 300                  # a última linha do stderr vai pro alerta/JSON
 
-# Credencial de API ruim (401/403/api key inválida). É o que escala TROCA DE TOKEN.
+# Credencial de API ruim (chave de API recusada). É o que escala TROCA DE TOKEN.
 #
-# REGRA DE OURO (irmã da _RE_SESSAO): casa só frases que DECLARAM uma FALHA de
-# credencial — nunca o NOME de um provedor nem a palavra "api key" nuas. O motor
-# loga o httpx de operação NORMAL, e uma transcrição/resumo BEM-SUCEDIDO emite
-# `POST https://api.groq.com/... "HTTP/1.1 200 OK"`. A regex antiga tinha `groq`
-# como alternativa NUA, então casava esse log de SUCESSO 200 e classificava um
-# abort de causa desconhecida (exit 4) como "troque o token" -> irredutível ->
-# a captura latchava de vez com AS CHAVES VÁLIDAS (incidente Stoa 21/07, 1h28
-# parada; Groq e Anthropic testadas ao vivo = 200). O nome do provedor num log
-# não é sinal de credencial ruim; só um 401/403/"invalid api key"/AuthenticationError
-# é. Removidas as âncoras nuas `groq`/`x-api-key`/`api_key`; exigido um qualificador
-# de FALHA junto de "api key". `\b40[13]\b` nu também caiu (um id/contagem 401/403
-# em log benigno dava falso) — fica só 401/403 com contexto http/status, além de
-# unauthorized/forbidden, que não aparecem em log de raspagem normal.
+# REGRA DE OURO (irmã da _RE_SESSAO): casa só frases que DECLARAM uma FALHA DE
+# CHAVE DE API — nunca o NOME de um provedor, nunca a palavra "api key" nua e
+# NUNCA um 401/403/"unauthorized"/"forbidden" SOLTO.
+#
+# 1ª rodada do fix (incidente Stoa 21/07): a regex tinha `groq` como alternativa
+# NUA e casava o httpx de SUCESSO `POST https://api.groq.com/... "HTTP/1.1 200 OK"`
+# -> um abort de causa desconhecida (exit 4) virava "troque o token" e a captura
+# latchava 1h28 COM AS CHAVES VÁLIDAS. Saíram as âncoras nuas de provedor.
+#
+# 2ª rodada (ESTE fix, medido em 12/09 sobre ~/.athena-local/autopsias): sobraram
+# `unauthorized` e `forbidden` NUAS. Resultado: das 23 escaladas `escalar_token`
+# dos últimos 7 dias, 23 (CEM POR CENTO) foram FALSAS — 16 Greenn + 7 Alpaclass,
+# todas exit 4, todas casando SÓ a palavra "Forbidden" da linha do yt-dlp
+#   `ERROR: unable to download video data: HTTP Error 403: Forbidden`
+# que é a CDN do vídeo recusando o segmento (anti-bot/URL assinada vencida), não
+# uma chave de API. A consequência é tripla e cara: (a) o alerta ESSENCIAL manda o
+# dono trocar um token que está bom (alarme que mente = alarme que se ignora);
+# (b) a causa REAL (excesso de falhas, exit 4, que pede olhar o tracker) fica
+# escondida atrás do veredito errado; (c) o `escalar_token` conta falha no
+# disjuntor com alerta, em vez do `escalar_humano` nomeado do exit 4.
+# Varredura das 677 autópsias em disco: 95 linhas com "forbidden" — TODAS a mesma
+# linha do yt-dlp; ZERO "unauthorized"; ZERO "authenticationerror"; ZERO
+# "permissiondenied"; ZERO 401/403 com contexto http/status. Isto é: as âncoras
+# nuas só produziram falso, e nenhum caso legítimo depende delas.
+#
+# O QUE CASA AGORA, em duas camadas:
+#   (A) _RE_TOKEN_FORTE — a frase, sozinha, DECLARA a falha de credencial
+#       (AuthenticationError, PermissionDeniedError, invalid_api_key,
+#       "Incorrect API key provided", "API_KEY invalid", "insufficient permissions").
+#   (B) proximidade POR LINHA — um 401/403/unauthorized/forbidden só vale quando a
+#       MESMA linha traz vocabulário de CHAVE DE API ("api key"/"api_key"/
+#       "x-api-key"/"apikey"/"credential"). Linha, não cauda inteira: "na mesma
+#       cauda" juntaria um 403 de CDN com um "api_key" de outro log 40 linhas
+#       adiante — que é exatamente o falso que estamos matando.
+# O vocabulário de contexto EXCLUI de propósito `token`, `bearer` e `authorization`:
+# a cauda real da Alpaclass tem
+#   "a API learner recusou o Bearer do run em /lessons/... (401/USR_04) — relendo o
+#    token do perfil/arquivo, sondando e renovando"
+# que é o motor RENOVANDO a sessão com sucesso. Aceitar `token`/`bearer` como
+# contexto transformaria esse log benigno no mesmo falso alarme de novo.
+_RE_TOKEN_FORTE = re.compile(
+    r"(authenticationerror|authentication[_\s]error|"
+    r"permissiondeniederror|permission[_\s]denied(error)?|"
+    r"invalid[_\s]api[_\s-]?key|"
+    r"(invalid|incorrect|missing|expired|revoked|bad|wrong)\s+api[_\s-]?key|"
+    r"api[_\s-]?key\s+(is\s+)?(invalid|incorrect|missing|expired|revoked|"
+    r"not\s+found|was\s+not\s+provided)|"
+    r"no\s+api[_\s-]?key\s+provided|"
+    r"insufficient[_\s]permission)", re.I)
+
+# (B) o 401/403 — só com contexto de CHAVE DE API na MESMA linha.
+_RE_TOKEN_40X = re.compile(r"(\b40[13]\b|unauthorized|forbidden)", re.I)
+_RE_TOKEN_CTX = re.compile(r"(api[_\s-]?key|x-api-key|apikey|credential)", re.I)
+
+
+def _sinal_de_credencial(err):
+    """True se a cauda DECLARA uma falha de CHAVE DE API (ver as duas camadas acima).
+
+    Substitui o antigo `_RE_TOKEN.search(err)`: a palavra "forbidden"/"unauthorized"
+    nua deixou de ser sinal. Mantida como função (e não como uma regex só) porque a
+    camada (B) é uma regra de PROXIMIDADE POR LINHA, que regex de cauda inteira não
+    expressa sem casar coisas a 40 linhas de distância."""
+    if not err:
+        return False
+    if _RE_TOKEN_FORTE.search(err):
+        return True
+    for linha in err.splitlines():
+        if _RE_TOKEN_40X.search(linha) and _RE_TOKEN_CTX.search(linha):
+            return True
+    return False
+
+
+# ÂNCORA DE MASCARAMENTO (NÃO é o classificador). `maestro.rotulo` importa esta
+# regex para MASCARAR texto que vem de FORA (título/URL de curso que a plataforma
+# escolheu: ".../Unauthorized-Access-101", ".../forbidden-secrets") antes de ele
+# entrar num alerta/log. Ali a regra é o OPOSTO da classificação: mascarar DEMAIS é
+# barato (o rótulo sai com «…» e o dono ainda reconhece o curso), deixar passar é
+# que é caro — o texto voltaria pela cauda de outro processo e casaria o
+# classificador. Por isso ela CONTINUA larga (com `forbidden`/`unauthorized` nuas)
+# mesmo depois de o classificador ter deixado de aceitá-las: defesa em profundidade,
+# e o daemon VIVO ainda roda o classificador largo até este fix subir.
+# QUEM DECIDE A CAUSA é `_sinal_de_credencial` (acima) — nunca esta regex.
 _RE_TOKEN = re.compile(
     r"(authenticationerror|permissiondeniederror|unauthorized|forbidden|"
     r"http\s*40[13]\b|status\s*40[13]\b|"
@@ -339,6 +416,39 @@ _ERROS_TRACKER_LIMITE = 3            # top-3 erros recentes no motivo
 _ERRO_TRUNCA = 160                   # truncagem por erro (o motivo vai p/ alerta/JSON)
 
 
+# --------------------------------------------------------------------------
+# NOME DA PLATAFORMA do run — para a mensagem do circuit-breaker não mentir.
+#
+# O motor emite, em TODA plataforma, o mesmo texto do abort por excesso de falhas:
+# "Algo está sistematicamente errado do lado da Hotmart" (motor/orchestrator.py —
+# fora deste repositório). Nos runs de Greenn, Kiwify e Alpaclass isso é FALSO e
+# manda o dono olhar o lugar errado. Enquanto o motor não for corrigido, a causa
+# NOMEIA a plataforma REAL do run no motivo que vai ao alerta e ao JSON da
+# autópsia — o texto que o dono lê deixa de apontar para a Hotmart.
+#
+# A fonte preferida é o rótulo do YAML (`plataforma=` — "greenn", "alpaclass"),
+# que só o loop conhece; sem ele, o HOST da URL do curso (replicado de propósito,
+# como `_course_id_de_url`, para a causa não acoplar à cadeia de imports do
+# executor). "" quando nem isso dá — e aí a frase simplesmente não nomeia nada,
+# nunca chuta "Hotmart".
+_RE_HOST = re.compile(r"^[a-z][a-z0-9+.-]*://([^/?#]*)", re.I)
+
+
+def _nome_plataforma(obito, plataforma=None):
+    """Rótulo da plataforma do run ("greenn", "alpaclass", "sierramkt.greenn.club"...),
+    ou "" se indeterminável. NUNCA levanta e NUNCA inventa um default."""
+    if plataforma:
+        return str(plataforma).strip()
+    curso = getattr(obito, "curso", None)
+    if not curso:
+        return ""
+    m = _RE_HOST.match(str(curso).strip())
+    host = (m.group(1) if m else "").split("@")[-1].split(":")[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
 def _course_id_de_url(curso_url):
     """product-id Hotmart do trecho `/products/<id>` da URL — replicado (de
     propósito) de `adaptadores.captura._course_id_de_url`, para a causa não
@@ -382,7 +492,7 @@ def _erros_recentes_tracker(curso_url, tracker_dir=None,
     return [str(e)[:_ERRO_TRUNCA] for (e,) in linhas if e]
 
 
-def _deterministico(obito, tracker_dir=None):
+def _deterministico(obito, tracker_dir=None, plataforma=None):
     """Devolve (acao, motivo) — ou (acao, motivo, sem_falha) nas duas regras de morte
     SEM FALHA da captura (ver `Decisao.sem_falha`) — se bater numa assinatura conhecida;
     None se DESCONHECIDA."""
@@ -405,11 +515,14 @@ def _deterministico(obito, tracker_dir=None):
     if _RE_SESSAO.search(_RE_SESSAO_NEGADA.sub(" ", err)):
         return "escalar_reseed", "assinatura de sessão morta no stderr"
 
-    # 2) TOKEN de API (GROQ/401/403/api key): credencial ruim, troca de chave.
+    # 2) TOKEN de API (chave recusada): credencial ruim, troca de chave.
     #    Antes do exit-code do circuit-breaker: se as aulas falharam por chave de
     #    API inválida (o abort vira exit 4), a causa acionável é o TOKEN, não um
-    #    "olhe o tracker" genérico.
-    if _RE_TOKEN.search(err):
+    #    "olhe o tracker" genérico. É POR ESSA PRECEDÊNCIA que a exigência de
+    #    contexto em `_sinal_de_credencial` é obrigatória: enquanto bastava a
+    #    palavra "Forbidden" nua, todo exit 4 cuja cauda tivesse o 403 da CDN do
+    #    yt-dlp era sequestrado aqui — 23 de 23 escaladas de token em 7 dias.
+    if _sinal_de_credencial(err):
         return "escalar_token", "assinatura de credencial de API inválida no stderr"
 
     # 3) CONTRATO DE EXIT-CODE do motor (sinal FORTE, autoritativo):
@@ -432,14 +545,19 @@ def _deterministico(obito, tracker_dir=None):
         #        sessão/token operam sobre o STDERR do processo, não sobre o
         #        histórico do tracker).
         erros = _erros_recentes_tracker(getattr(obito, "curso", None), tracker_dir)
+        #        PLATAFORMA NOMEADA: o abort do motor diz "do lado da Hotmart" em
+        #        TODA plataforma. Aqui o motivo nomeia a do RUN (Greenn, Kiwify,
+        #        Alpaclass...) — o dono para de ser mandado para a Hotmart.
+        nome = _nome_plataforma(obito, plataforma)
+        onde = (" na plataforma %s" % nome) if nome else ""
         if erros:
             return "escalar_humano", (
-                "circuit-breaker por excesso de falhas (exit 4); erros recentes "
-                "do tracker: " + " | ".join(erros) +
+                "circuit-breaker por excesso de falhas (exit 4)" + onde +
+                "; erros recentes do tracker: " + " | ".join(erros) +
                 " — humano decide; NÃO é sessão morta")
         return "escalar_humano", (
-            "circuit-breaker por excesso de falhas (exit 4): causa sistêmica "
-            "desconhecida — humano inspeciona o tracker; NÃO é sessão morta")
+            "circuit-breaker por excesso de falhas (exit 4)" + onde + ": causa "
+            "sistêmica desconhecida — humano inspeciona o tracker; NÃO é sessão morta")
 
     # 4) EXIT 5 = sonda de sessão INCONCLUSIVA / erro de infra (contrato do motor):
     #    transitório — relança sob o backoff. NUNCA reseed (anti-ban: a sessão NÃO
@@ -589,13 +707,16 @@ def _parse_acao_llm(resp: str):
     return None                         # zero ou ambíguo -> fail-closed
 
 
-def classificar(obito, llm=None, tracker_dir=None):
+def classificar(obito, llm=None, tracker_dir=None, plataforma=None):
     """Classifica um `Obito` numa `Decisao`. `llm` é o seam do diagnosticador (callable
     prompt->texto); None => nenhum LLM disponível => fail-closed em escalar_humano quando
     a causa é desconhecida. Produção passa `llm=seam_claude_p`. `tracker_dir` aponta o
     diretório do tracker.db p/ enriquecer o motivo do exit-4 (None => env
-    ATHENA_MOTOR_DIR, o default do daemon)."""
-    det = _deterministico(obito, tracker_dir=tracker_dir)
+    ATHENA_MOTOR_DIR, o default do daemon). `plataforma` é o rótulo do YAML do curso
+    ("greenn", "alpaclass"...): entra no motivo do exit-4 para a mensagem nomear a
+    plataforma do RUN — o abort do motor diz "do lado da Hotmart" em todas elas. None
+    => o host da URL do curso; indeterminável => a frase não nomeia ninguém."""
+    det = _deterministico(obito, tracker_dir=tracker_dir, plataforma=plataforma)
     if det is not None:
         acao, motivo = det[0], det[1]
         return Decisao(acao=acao, motivo=motivo, fonte="deterministico",

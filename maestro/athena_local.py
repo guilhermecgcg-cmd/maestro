@@ -131,6 +131,62 @@ _CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
 # recomeça do zero (honesto). Default 30 min (o vigia externo mata após 900 s sem pulso).
 _CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "1800"))
 
+# ESTADO DO DISJUNTOR EM DISCO (achado r15) — ANTI-BAN.
+#
+# O `estado` por-curso nascia `{}` a cada `rodar()`. Como o daemon é reiniciado pelo
+# vigia externo / launchd / reboot do Mac, TODO reinício zerava a escada de backoff
+# (600s → 1h → 6h → 24h) e o cooldown de saída-limpa/sem-pendência: um curso que o
+# disjuntor tinha mandado esperar 24 h voltava a ser MARTELADO no primeiro ciclo da
+# encarnação nova. Justamente o oposto do que a escada existe para fazer — e a
+# martelada acontece contra a plataforma, que é a superfície de ban.
+#
+# Agora um JSON pequeno (uma entrada por curso, ~6 números) é gravado ao fim de cada
+# ciclo e RESTAURADO no boot. Mesmo padrão do episódio de sobrecarga: troca atômica
+# (tmp + os.replace), best-effort na escrita (falhar nunca derruba o loop) e arquivo
+# ilegível/corrompido é DESCARTADO com WARNING (nunca derruba o boot).
+#
+# O QUE É PERSISTIDO (lista BRANCA — nada fora dela atravessa o reinício):
+#   disj_falhas, disj_bloqueado_ate   a escada do recozimento
+#   cooldown_ate, _pend_no_cooldown   a janela de quiescido/sem-pendência + baseline
+#   ultimo_no_notion                  a régua do AVANÇO (sem ela, o 1º ciclo pós-boot
+#                                     não reconhece progresso e não re-arma o disjuntor)
+#
+# O QUE NÃO É (de propósito): `irredutivel`, `benched_exit5`, `exit5_seguidas`, `fase`,
+# `ultima_causa` e os latches de alerta. São LATCHES cujo ÚNICO destravamento hoje, com
+# o zelador DESLIGADO por padrão, é o reinício do daemon (o `Zelador._rearmar` existe,
+# mas só roda com ATHENA_ZELADOR_ATIVO). Persistir um latch de reseed sem ter quem o
+# destrave transformaria "curso travado até o próximo boot" em "curso travado PARA
+# SEMPRE, calado" — um bug pior que o que estamos consertando. Quando o zelador estiver
+# ligado por padrão, persistir `irredutivel` vira uma decisão separada e consciente.
+# (O FLAP não entra aqui porque já é durável: `vigia._contar_flaps_anteriores` conta os
+# JSONs de autópsia em disco na janela, não um contador em memória.)
+def _env_int(nome, padrao, *, minimo=None):
+    """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
+    caso ilegível); abaixo de `minimo` => `minimo` (com WARNING). Uma variável de ambiente
+    mal digitada nunca pode impedir o daemon de subir."""
+    bruto = os.getenv(nome)
+    if bruto is None or not str(bruto).strip():
+        valor = int(padrao)
+    else:
+        try:
+            valor = int(str(bruto).strip())
+        except (TypeError, ValueError):
+            log.warning("%s=%r não é inteiro — usando o default %s", nome, bruto, padrao)
+            valor = int(padrao)
+    if minimo is not None and valor < minimo:
+        log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
+        valor = int(minimo)
+    return valor
+
+
+_ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
+                         "_pend_no_cooldown", "ultimo_no_notion")
+# TETO DE SANIDADE do futuro: um valor corrompido (ou um relógio que andou para trás)
+# não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
+# DESCARTADO na leitura — 24h é o teto da escada e 24h é o cooldown sem-pendência, mais
+# uma folga generosa.
+_ESTADO_FUTURO_MAX_S = 2 * 86400.0
+
 
 # ---------------------------------------------------------------------------
 # NULL-OBJECTS (defaults) — assinaturas IDÊNTICAS às dos módulos reais (P3/P4/P5/P2),
@@ -161,6 +217,35 @@ class _DisjuntorTeto:
 
     def registrar_sucesso(self, st):
         return None
+
+
+class _DisjuntorRecozido:
+    """P4 de PRODUÇÃO: o módulo `maestro.disjuntor` (recozimento re-armável) LIGADO ao
+    limiar configurado — é ele que o `main` injeta.
+
+    POR QUE ELE EXISTE (achado r15): `ATHENA_MAX_TENTATIVAS` era CÓDIGO MORTO. O `main`
+    lia a env, passava `max_tentativas=` ao `rodar`/`ciclo_local`, e lá ela só servia
+    para construir o `_DisjuntorTeto` — o fallback que NUNCA é alcançado, porque o `main`
+    sempre injeta o disjuntor real. O limiar REAL era o `LIMIAR_PADRAO = 3` hardcoded do
+    módulo, já que as chamadas eram `disjuntor.pode_tentar(st, agora)` sem `limiar=`.
+    Isto é: a env prometia calibração e não fazia NADA — e o docstring do disjuntor
+    dizia "injetável para calibração por plataforma". Este adaptador CUMPRE a promessa:
+    fixa o limiar UMA vez, no boot, e o repassa em toda chamada. Nada muda no caminho
+    quente (o loop segue chamando `pode_tentar(st, agora)`), e com a env ausente o
+    limiar é o mesmo 3 de sempre: ZERO mudança de comportamento em produção hoje."""
+
+    def __init__(self, modulo, limiar):
+        self._m = modulo
+        self.limiar = int(limiar)
+
+    def pode_tentar(self, st, agora):
+        return self._m.pode_tentar(st, agora, limiar=self.limiar)
+
+    def registrar_falha(self, st, agora):
+        return self._m.registrar_falha(st, agora, limiar=self.limiar)
+
+    def registrar_sucesso(self, st):
+        return self._m.registrar_sucesso(st)
 
 
 class _VigiaNulo:
@@ -541,7 +626,12 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
             continue
         st = estado.setdefault(curso, {})
         try:
-            decisao = causa.classificar(obito, llm=llm)
+            # `plataforma=` (item 4 da r15): o abort por excesso de falhas do motor diz
+            # "Algo está sistematicamente errado do lado da Hotmart" em TODA plataforma.
+            # Passando o rótulo do YAML, o motivo do exit-4 que vai ao alerta e ao JSON
+            # da autópsia nomeia a plataforma do RUN (greenn/kiwify/alpaclass...).
+            decisao = causa.classificar(
+                obito, llm=llm, plataforma=_plataforma_de(curso, meta_por_curso))
         except Exception:
             decisao = None
         # FIX de observabilidade: a Decisao classificada vai PRO DISCO, no JSON da
@@ -1502,6 +1592,92 @@ def _apagar_episodio_carga(path) -> None:
                     type(e).__name__)
 
 
+def _carregar_estado_cursos(path, *, agora) -> dict:
+    """Estado por-curso PERSISTIDO por uma encarnação anterior (só as chaves da lista
+    branca), ou {}. Nunca levanta: um arquivo ilegível/corrompido vira WARNING e {} —
+    perder o backoff é ruim, não subir o daemon é pior.
+
+    SANEAMENTO por entrada (o arquivo é dado, não código): curso tem de ser string
+    não-vazia; o valor, um dict; cada chave, um número finito; instantes no futuro
+    além de `_ESTADO_FUTURO_MAX_S` são descartados (relógio/arquivo corrompido não
+    pode bloquear um curso por anos); `disj_falhas` vira int >= 0. Chave inválida é
+    descartada SOZINHA — o resto da entrada sobrevive."""
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            dados = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        log.warning("estado de curso persistido ilegível em %s — descartado (a escada "
+                    "do disjuntor recomeça do zero nesta encarnação)", path)
+        return {}
+    if not isinstance(dados, dict):
+        log.warning("estado de curso persistido com formato inesperado em %s "
+                    "(%s) — descartado", path, type(dados).__name__)
+        return {}
+    cursos = dados.get("cursos")
+    if not isinstance(cursos, dict):
+        return {}
+    limite = agora + _ESTADO_FUTURO_MAX_S
+    saida = {}
+    for curso, st in cursos.items():
+        if not isinstance(curso, str) or not curso or not isinstance(st, dict):
+            continue
+        limpo = {}
+        for chave in _ESTADO_CURSOS_CHAVES:
+            if chave not in st:
+                continue
+            valor = st[chave]
+            if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+                continue                               # bool/str/None/lista: descarta
+            valor = float(valor)
+            if valor != valor or valor in (float("inf"), float("-inf")):
+                continue                               # NaN/inf
+            if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown"):
+                if valor < 0:
+                    continue
+                limpo[chave] = int(valor)
+            else:                                      # instantes (epoch)
+                if valor > limite:
+                    log.warning("estado persistido de %s: %s=%s está longe demais no "
+                                "futuro — descartado", curso, chave, valor)
+                    continue
+                limpo[chave] = valor
+        if limpo:
+            saida[curso] = limpo
+    return saida
+
+
+def _gravar_estado_cursos(path, estado) -> None:
+    """Grava as chaves da lista branca de cada curso (troca atômica). Best-effort: uma
+    falha vira WARNING no loop.err — a captura segue, só a sobrevivência da escada ao
+    reinício fica comprometida."""
+    if not path:
+        return
+    try:
+        cursos = {}
+        for curso, st in (estado or {}).items():
+            if not isinstance(st, dict):
+                continue
+            linha = {k: st[k] for k in _ESTADO_CURSOS_CHAVES
+                     if isinstance(st.get(k), (int, float))
+                     and not isinstance(st.get(k), bool)}
+            if linha:
+                cursos[curso] = linha
+        pasta = os.path.dirname(path)
+        if pasta:
+            os.makedirs(pasta, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"versao": 1, "gravado_em": time.time(), "cursos": cursos}, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("não gravei o estado dos cursos em %s (%s: %s) — um reinício zeraria "
+                    "a escada do disjuntor", path, type(e).__name__, str(e)[:120])
+
+
 def _avisar_adiamentos(adiados, *, alertas, espinha, agora, estado_carga,
                        limiar_s=None, episodio_path=None):
     """Aviso AGREGADO do portão de carga, no MÁXIMO 1 por ciclo (nunca 1 por curso).
@@ -1786,7 +1962,8 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                 llm=None, espinha=None, sistemas=None, sistema_executor=None,
                 causa_sistema=None, sistema_lock_dir=None, sistema_autopsia_dir=None,
                 gasto_por_sistema_fn=None, budget_modo=None, pendencia_fn=None,
-                reaper_fn=None, boot_ts=None, carga_episodio_path=None, zelador=None):
+                reaper_fn=None, boot_ts=None, carga_episodio_path=None, zelador=None,
+                estado_cursos_path=None):
     """O LOOP doméstico. Cria `voo` e `estado` UMA vez e os REINJETA a cada ciclo. Um ciclo
     que estoura NÃO derruba o loop, mas a falha é ESCALADA (latch por assinatura). O PULSO
     é gravado no BOOT, em cada fase/curso do ciclo, no fim do ciclo e a cada fatia da espera
@@ -1797,7 +1974,13 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     `carga_episodio_path` (achado r6): o episódio de sobrecarga do portão de carga em DISCO.
     No boot, um episódio ainda aberto (e não velho — ver `_carregar_episodio_carga`) é
     RETOMADO: o relógio do aviso ESSENCIAL continua de onde parou e o portão nasce em
-    sobrecarga (`executor.retomar_sobrecarga`: a histerese atravessa o reinício)."""
+    sobrecarga (`executor.retomar_sobrecarga`: a histerese atravessa o reinício).
+
+    `estado_cursos_path` (achado r15, ANTI-BAN): o `estado` por-curso em DISCO. No boot,
+    a escada do disjuntor e os cooldowns de uma encarnação anterior são RESTAURADOS
+    (lista branca em `_ESTADO_CURSOS_CHAVES`) e, ao fim de CADA ciclo, regravados. Sem
+    isso, qualquer reinício zerava um cooldown de até 24 h e o curso voltava a ser
+    martelado. None = só memória (o comportamento antigo)."""
     estado = {}
     voo = {}
     estado_sistemas = {}
@@ -1853,6 +2036,14 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                                                      agora=time.time()))
     except Exception:
         pass
+    # ESTADO POR-CURSO de uma encarnação anterior (achado r15): a escada do disjuntor e
+    # os cooldowns voltam ANTES do 1º ciclo — senão o reinício liberava para martelar um
+    # curso que estava de castigo por até 24 h. Best-effort: nunca impede o loop de subir.
+    try:
+        estado.update(_carregar_estado_cursos(estado_cursos_path, agora=time.time()))
+    except Exception:
+        log.warning("não restaurei o estado dos cursos — a escada do disjuntor "
+                    "recomeça do zero nesta encarnação", exc_info=True)
     if "desde" in estado_carga:
         _retomar = getattr(executor, "retomar_sobrecarga", None)
         if callable(_retomar):
@@ -1911,6 +2102,12 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
                            assinatura, tipo="escalada", reversivel=True,
                            escalada=True, fonte="fail-closed", origem="athena-local/rodar")
                 ultimo_erro = assinatura
+        # ESTADO POR-CURSO EM DISCO (achado r15) — gravado ao fim de CADA ciclo, INCLUSIVE
+        # num ciclo que estourou (o `estado` é mutado in-place pela passada, então o que
+        # já foi decidido neste ciclo — um cooldown armado, uma falha no disjuntor — tem de
+        # sobreviver ao reinício que o vigia externo pode causar em seguida). Best-effort:
+        # a função já engole a exceção e loga WARNING.
+        _gravar_estado_cursos(estado_cursos_path, estado)
         # PULSO CHEIO de fim de ciclo (P6 backstop lê isto) — best-effort, gravado MESMO
         # num ciclo que estourou. Recalcula `ativos` (o snapshot das batidas seguintes).
         _pulsar(i, "fim", cheio=True)
@@ -2199,7 +2396,12 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
             "PLATAFORMAS_SUPORTADAS", ",".join(PLATAFORMAS_SUPORTADAS_PADRAO))
         .replace(" ", "").split(",") if p)
     plataformas_suportadas = plataformas or None
-    max_tentativas = int(os.getenv("ATHENA_MAX_TENTATIVAS", "3"))
+    # ATHENA_MAX_TENTATIVAS: o LIMIAR de falhas consecutivas que ARMA a 1ª janela do
+    # recozimento (3 = duas falhas "de graça", a terceira arma 600s). Até a r15 esta env
+    # era código morto (ver `_DisjuntorRecozido`); agora ela é fiada no disjuntor REAL.
+    # Valor inválido não derruba o daemon: WARNING e o default. Mínimo 1 (0/negativo
+    # armaria a janela antes da 1ª falha e nenhum curso dispararia nunca).
+    max_tentativas = _env_int("ATHENA_MAX_TENTATIVAS", 3, minimo=1)
 
     # Caminhos duráveis das 6 partes (todos sob ~/.athena-local por padrão, o mesmo home
     # do lock_dir anti-ban — sobrevive a reboot).
@@ -2209,6 +2411,10 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     pulso_path = os.getenv("ATHENA_PULSO_PATH", os.path.join(base, "pulso.json"))
     carga_episodio_path = os.getenv("ATHENA_CARGA_EPISODIO_PATH",
                                     os.path.join(base, "carga_episodio.json"))
+    # ESTADO POR-CURSO EM DISCO (r15): a escada do disjuntor e os cooldowns sobrevivem ao
+    # reinício. Mesmo diretório durável das outras partes (~/.athena-local por padrão).
+    estado_cursos_path = os.getenv("ATHENA_ESTADO_CURSOS_PATH",
+                                   os.path.join(base, "estado_cursos.json"))
     lock_dir_efetivo = lock_dir or os.path.join(base, "locks")
     batimento_intervalo = float(os.getenv("ATHENA_BATIMENTO_S", "1800"))
     # DIAGNÓSTICO por LLM da causa-raiz DESCONHECIDA: OFF por padrão (fail-closed ->
@@ -2250,7 +2456,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     asyncio.run(rodar(
         cursos, executor, progresso_fn, voz, intervalo_s=cfg.intervalo_s,
         max_tentativas=max_tentativas, plataformas_suportadas=plataformas_suportadas,
-        controle=controle_mod, controle_path=controle_path, disjuntor=disjuntor_mod,
+        controle=controle_mod, controle_path=controle_path,
+        disjuntor=_DisjuntorRecozido(disjuntor_mod, max_tentativas),
         vigia=vigia_mod, causa=causa_mod, alertas=alertas, batimento=batimento_mod,
         batimento_intervalo=batimento_intervalo, pulso_path=pulso_path,
         lock_dir=lock_dir_efetivo, autopsia_dir=autopsia_dir, llm=llm,
@@ -2259,7 +2466,8 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
         sistema_autopsia_dir=sistema_autopsia_dir,
         gasto_por_sistema_fn=gasto_por_sistema_fn, budget_modo=budget_modo,
         pendencia_fn=pendencia_fn, reaper_fn=reaper_fn,
-        carga_episodio_path=carga_episodio_path, zelador=zelador))
+        carga_episodio_path=carga_episodio_path, zelador=zelador,
+        estado_cursos_path=estado_cursos_path))
 
 
 if __name__ == "__main__":  # pragma: no cover

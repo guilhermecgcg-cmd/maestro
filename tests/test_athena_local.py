@@ -708,3 +708,31 @@ def test_morte_sem_falha_em_capturando_nao_conta_falha_nem_alerta(stderr, antes_
     assert "disj_falhas" not in st
     assert ex.disparos == ([C1] if redispara else []), st
     assert ("cooldown_ate" in st) is (not redispara), st
+
+
+def test_contar_no_notion_local_re_tenta_UMA_vez_antes_de_escalar():
+    """DENTE (13/09 00:00): a máquina em swap fez o subprocesso devolver vazio e os
+    25 cursos escalaram de uma vez — minutos depois o MESMO comando respondia. Uma
+    falha TRANSITÓRIA não pode parar o ciclo inteiro; duas seguidas ainda escalam."""
+    saidas = ["", f"{captura.PROGRESSO_SENTINELA} 9\n"]
+
+    def fake_run(cmd, *, cwd):
+        return saidas.pop(0)
+
+    assert athena_local.contar_no_notion_local("/py", "/dir", C1, run=fake_run) == 9
+    assert not saidas                                   # as DUAS foram usadas
+
+
+def test_contar_no_notion_local_duas_falhas_seguidas_ainda_levantam():
+    """O fail-closed segue intacto: silêncio persistente NUNCA vira 0."""
+    chamadas = []
+
+    def fake_run(cmd, *, cwd):
+        chamadas.append(cmd)
+        return "traceback qualquer, sem sentinela"
+
+    with pytest.raises(RuntimeError) as ei:
+        athena_local.contar_no_notion_local("/py", "/dir", C1, run=fake_run)
+    assert len(chamadas) == 2
+    assert "DUAS tentativas" in str(ei.value)
+    assert "traceback qualquer" in str(ei.value)         # o diagnóstico viaja junto

@@ -2143,9 +2143,14 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
 # Contagem-verdade do Notion LOCAL (I/O real; testada pelo seam `run`).
 # ---------------------------------------------------------------------------
 def _run_local(cmd, *, cwd):  # pragma: no cover — subprocesso REAL
+    """stdout + stderr do subprocesso. O stderr ENTRA de propósito: quando a
+    contagem falha, é a ÚNICA pista do motivo, e a sentinela é procurada por
+    substring (um traceback no meio não atrapalha). Sem ele, a escalada dizia só
+    `''` — foi o que aconteceu em 13/09 00:00, com a máquina sem memória, e o
+    diagnóstico teve de ser refeito à mão."""
     import subprocess
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                          timeout=120).stdout
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+    return (r.stdout or "") + (r.stderr or "")
 
 
 def contar_no_notion_local(motor_python, motor_dir, curso_url, *, run=None,
@@ -2160,11 +2165,22 @@ def contar_no_notion_local(motor_python, motor_dir, curso_url, *, run=None,
     prefixo = prefixo or captura._prefixo_de_curso(curso_url)
     script = "import motor.config  # carrega .env (NOTION_TOKEN etc.)\n" + captura._PROGRESSO_SCRIPT
     cmd = [motor_python, "-c", script, prefixo]
+    # UMA re-tentativa antes de escalar. O fail-closed continua intacto (sem
+    # sentinela NUNCA vira 0), mas a falha TRANSITÓRIA do subprocesso — máquina sem
+    # memória, teto de 120 s, blip de rede no Notion — deixa de virar escalada. Foi
+    # o que derrubou o ciclo inteiro em 13/09 00:00: os 25 cursos escalaram de uma
+    # vez, com a saída vazia, enquanto a máquina estava em swap; minutos depois o
+    # MESMO comando respondia na hora. Duas falhas seguidas ainda escalam.
     saida = run(cmd, cwd=motor_dir) or ""
     if captura.PROGRESSO_SENTINELA not in saida:
-        raise RuntimeError(
-            f"contagem LOCAL no Notion SEM confirmação ({captura.PROGRESSO_SENTINELA} "
-            f"ausente) p/ {curso_url}: {saida[-160:]!r}")
+        saida2 = run(cmd, cwd=motor_dir) or ""
+        if captura.PROGRESSO_SENTINELA in saida2:
+            saida = saida2
+        else:
+            raise RuntimeError(
+                f"contagem LOCAL no Notion SEM confirmação ({captura.PROGRESSO_SENTINELA} "
+                f"ausente em DUAS tentativas) p/ {curso_url}: "
+                f"{saida[-160:]!r} | {saida2[-160:]!r}")
     linha = next(l for l in saida.splitlines() if captura.PROGRESSO_SENTINELA in l)
     return int(linha.split(captura.PROGRESSO_SENTINELA, 1)[1].strip().split()[0])
 

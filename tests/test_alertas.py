@@ -249,3 +249,52 @@ def test_de_ambiente_com_token_constroi_cliente(monkeypatch):
     a = de_ambiente()
     assert a._tg is not None
     assert a._chats == [9]
+
+
+# --- nível `so_humano` (decisão do dono, 13/09) --------------------------------
+#
+# "A Athena no telegram fica apenas para interação... e não uma lista de afazeres e
+# pendência. Se eu quiser saber sobre a captura eu pergunto." O canal passa a receber
+# SÓ o que ele destrava: sessão morta e login pendente.
+
+class _TGSpy:
+    def __init__(self): self.enviadas = []
+    def send_message(self, chat_id, texto): self.enviadas.append(texto)
+
+
+def _alertas(nivel):
+    from maestro.alertas import Alertas
+    tg = _TGSpy()
+    return Alertas(tg, [1], nivel=nivel), tg
+
+
+def test_DENTE_so_humano_cala_morte_sobrecarga_e_curso_concluido():
+    a, tg = _alertas("so_humano")
+    a.captura_morreu("kiwify", "enumeração incompleta", essencial=True, chave=("humano", "c1"))
+    a.maquina_sobrecarregada("carga 14", essencial=True, chave="x")
+    a.curso_concluido("kiwify", "Curso X", 42)
+    assert tg.enviadas == [], tg.enviadas
+
+
+def test_so_humano_DEIXA_PASSAR_o_que_so_o_dono_destrava():
+    a, tg = _alertas("so_humano")
+    a.sessao_expirada("hotmart")
+    a.logins_pendentes(["cademi:alfaresearch"], "python -m motor.cademi --reseed")
+    a.sessao_vence("hotmart", "24/09", 2.0, "python scripts/check_session.py --reseed")
+    assert len(tg.enviadas) == 3
+    assert any("expirou" in t for t in tg.enviadas)
+    assert any("login necessário" in t for t in tg.enviadas)
+
+
+def test_o_nivel_essencial_continua_como_era():
+    """Quem quiser o comportamento anterior muda uma env — nada foi removido."""
+    a, tg = _alertas("essencial")
+    a.captura_morreu("kiwify", "morreu", essencial=True, chave=("humano", "c1"))
+    a.curso_concluido("kiwify", "Curso X", 42)
+    assert len(tg.enviadas) == 2
+
+
+def test_nivel_desconhecido_cai_no_seguro():
+    """Fail-safe de sempre: valor errado na env não pode virar canal mudo nem spam."""
+    a, _ = _alertas("inventado")
+    assert a._nivel == "essencial"

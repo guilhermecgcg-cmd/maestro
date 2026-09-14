@@ -33,7 +33,12 @@ from maestro.telegram_api import TelegramClient
 
 log = logging.getLogger("athena.alertas")
 
-_NIVEIS = ("essencial", "tudo")
+# `so_humano` (13/09, decisão do dono): o Telegram virou lugar de CONVERSA — ele
+# pergunta quando quer saber. Só passa o que SÓ ELE destrava: sessão morta (reseed) e
+# logins pendentes. Morte de captura, sobrecarga, curso concluído, bench e alarme de
+# token continuam no LOG, e ele os vê pedindo `/sitrep`. `essencial` é o nível
+# anterior (o que pede ação humana, incluindo as mortes); `tudo` é o modo de depuração.
+_NIVEIS = ("so_humano", "essencial", "tudo")
 _DEDUP_JANELA_PADRAO_S = 3600.0
 
 
@@ -78,9 +83,18 @@ class Alertas:
                 log.exception("falha ao enviar alerta para chat %s", chat)
         return chegou
 
-    def _suprimido_nao_essencial(self, essencial: bool, texto: str) -> bool:
-        """True = fica SÓ no log (auto-tratado; nenhuma ação do dono é necessária)."""
-        if essencial or self._nivel == "tudo":
+    def _suprimido_nao_essencial(self, essencial: bool, texto: str, *,
+                                 so_humano: bool = False) -> bool:
+        """True = fica SÓ no log. `so_humano=True` marca o alerta que SÓ O DONO
+        destrava (sessão morta, login pendente): é o único que atravessa o nível
+        `so_humano`. Sem essa marca, no nível `so_humano` até o essencial vira log —
+        é o que tira do canal a lista de pendência que ele pediu para não receber."""
+        if self._nivel == "tudo":
+            return False
+        if self._nivel == "so_humano" and not so_humano:
+            log.warning("alerta fora do nível so_humano (só-log, sem Telegram): %s", texto)
+            return True
+        if essencial:
             return False
         log.warning("alerta NÃO-essencial (só-log, sem Telegram): %s", texto)
         return True
@@ -188,8 +202,13 @@ class Alertas:
     def curso_concluido(self, plataforma: str, curso: str, n: int) -> None:
         # Positivo, raro (1× por curso) => essencial por natureza; dedup por curso
         # protege contra um chamador futuro que repita o evento a cada ciclo.
+        # No nível `so_humano` ele NÃO passa: é notícia boa, não pedido de ação — e
+        # notícia boa empurrada é justamente o feed que o dono mandou desligar. Ele
+        # vê o mesmo número quando pergunta (`/sitrepcaptura`).
         texto = (f"✅ {plataforma}: curso '{curso}' concluído — "
                  f"{n} aulas capturadas.")
+        if self._suprimido_nao_essencial(True, texto):
+            return
         chave_dedup = ("curso_concluido", plataforma, curso)
         if self._dedup_repetido(chave_dedup, texto):
             return

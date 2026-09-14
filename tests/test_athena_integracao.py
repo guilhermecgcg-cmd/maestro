@@ -687,8 +687,13 @@ class _TGSpy:
 
 
 def _alertas_reais(tg):
+    """Alertas com o canal LIGADO (`essencial`). Desde 14/09 o padrão é `mudo` — a
+    Athena não procura ninguém, por decisão do dono. Estes testes não são sobre a
+    decisão: são sobre o que o supervisor CLASSIFICA como essencial, e para observar
+    isso o canal precisa estar aberto. O teste do padrão mudo vive em
+    tests/test_alertas.py."""
     from maestro.alertas import Alertas
-    return Alertas(tg, [1])
+    return Alertas(tg, [1], nivel="essencial")
 
 
 def test_flap_relancar_nao_pinga_telegram_mas_fica_no_log(tmp_path, caplog):

@@ -33,15 +33,22 @@ from maestro.telegram_api import TelegramClient
 
 log = logging.getLogger("athena.alertas")
 
-# `so_humano` (13/09, decisão do dono): o Telegram virou lugar de CONVERSA — ele
-# pergunta quando quer saber. O que sai do canal é a NOTÍCIA (curso concluído) e o que
-# o sistema trata sozinho (máquina sobrecarregada, que retoma quando a carga baixa) —
-# ele vê isso pedindo `/sitrepcaptura`. O que NÃO sai é o que deixa a captura PARADA
-# esperando por ele: sessão morta, login pendente, bench irredutível (exit 5), token,
-# teto de budget, pausa de sistema. Esses continuam pingando, porque em todos eles o
-# acervo para de crescer até ele agir — e um canal que cala isso não é silêncio, é
-# cegueira. `essencial` é o nível anterior; `tudo` é o modo de depuração.
-_NIVEIS = ("so_humano", "essencial", "tudo")
+# NÍVEIS — decisão do dono (14/09): **`mudo` é o padrão**. A Athena não procura ninguém.
+#
+# Ele foi explícito duas vezes: "a Athena no telegram fica apenas para interação... não
+# uma lista de afazeres e pendência" e depois "apagar a possibilidade de envio de avisos
+# aleatórios — eu quero saber da captura quando eu pedir". Então o silêncio não é uma
+# configuração que alguém pode esquecer ligada: é o comportamento de fábrica, e o envio
+# passou a exigir um ato deliberado (`ATHENA_ALERTA_NIVEL`).
+#
+# NADA se perde: todo alerta continua indo para o LOG, e é de lá que os relatórios
+# (`/sitrep`, `/sitrepcaptura`) tiram o que responder quando ELE pergunta.
+#
+# O preço, dito com todas as letras: sessão morta e login pendente também param de
+# procurá-lo. A captura pode ficar dias parada esperando um login sem nada avisar — é
+# ele quem descobre, perguntando. `ATHENA_ALERTA_NIVEL=essencial` devolve o
+# comportamento anterior (só o que pede ação humana) e `tudo` é o modo de depuração.
+_NIVEIS = ("mudo", "essencial", "tudo")
 _DEDUP_JANELA_PADRAO_S = 3600.0
 
 
@@ -58,10 +65,12 @@ class Alertas:
                  relogio=time.time):
         self._tg = tg
         self._chats = list(chat_ids)
-        nivel = (nivel or os.getenv("ATHENA_ALERTA_NIVEL", "essencial"))
+        nivel = (nivel or os.getenv("ATHENA_ALERTA_NIVEL", "mudo"))
         nivel = str(nivel).strip().lower()
-        # fail-safe: valor desconhecido cai em 'essencial' (o default que corta ruído).
-        self._nivel = nivel if nivel in _NIVEIS else "essencial"
+        # fail-safe: valor desconhecido cai no PADRÃO (mudo). Antes ele caía em
+        # 'essencial' — com o silêncio virando a regra, errar para o lado de FALAR
+        # passaria a contrariar a decisão do dono a cada typo de env.
+        self._nivel = nivel if nivel in _NIVEIS else "mudo"
         if dedup_janela_s is None:
             try:
                 dedup_janela_s = float(
@@ -73,7 +82,13 @@ class Alertas:
         self._ultimo_envio = {}          # chave -> ts do último envio Telegram
 
     def _enviar(self, texto: str) -> bool:
-        """True = o texto CHEGOU a pelo menos um chat (só isso conta pro dedup)."""
+        """True = o texto CHEGOU a pelo menos um chat (só isso conta pro dedup).
+
+        Este é o ÚNICO ponto por onde qualquer alerta sai — por isso o `mudo` mora
+        aqui: não existe método que o contorne, nem um futuro que esqueça de checar."""
+        if self._nivel == "mudo":
+            log.warning("alerta MUDO (nível mudo — só-log, sem Telegram): %s", texto)
+            return False
         if self._tg is None or not self._chats:
             log.warning("alerta sem canal Telegram (só-log): %s", texto)
             return False
@@ -90,26 +105,14 @@ class Alertas:
     def _suprimido_nao_essencial(self, essencial: bool, texto: str) -> bool:
         """True = fica SÓ no log (auto-tratado; nenhuma ação do dono é necessária).
 
-        O nível `so_humano` NÃO mexe aqui: o que é essencial PARA o sistema — bench
-        exit-5, token, escalar_humano, teto de budget, pausa de sistema — continua
-        chegando, porque em todos esses casos a captura ESTÁ PARADA e só o dono
-        destrava. A primeira versão deste nível fazia o contrário (calava tudo o que
-        passasse pelo portão) e re-enterrava o achado r6: "num adaptador novo, um
-        defeito PERMANENTE ficava calado no log". Silêncio é a direção perigosa.
-
-        Quem o `so_humano` rebaixa são os dois alertas que NÃO pedem nada dele —
-        curso concluído (notícia boa) e máquina sobrecarregada (retoma sozinha) —, e
-        eles rebaixam a si mesmos, no próprio call-site."""
+        Continua valendo para quem LIGAR o canal (`ATHENA_ALERTA_NIVEL=essencial`): é o
+        corte que separa "o sistema se resolve" de "a captura parou esperando você".
+        No padrão `mudo` ele nem chega a ser consultado — o silêncio é decidido antes,
+        no `_enviar`."""
         if essencial or self._nivel == "tudo":
             return False
         log.warning("alerta NÃO-essencial (só-log, sem Telegram): %s", texto)
         return True
-
-    def _pede_acao_do_dono(self, essencial: bool) -> bool:
-        """`essencial` que sobrevive ao nível `so_humano`. Usado pelos dois alertas
-        que são INFORMAÇÃO, não pedido: no `so_humano` eles viram log, e o dono vê o
-        mesmo número quando pergunta (`/sitrepcaptura`)."""
-        return essencial and self._nivel != "so_humano"
 
     def _dedup_repetido(self, chave, texto: str) -> bool:
         """True = mesma chave já ENVIOU (com sucesso) dentro da janela — vira só-log.
@@ -164,7 +167,7 @@ class Alertas:
         `chave` dedupa dentro da janela (1 ping por janela, nunca 1 por curso)."""
         texto = (f"🟠 Máquina sobrecarregada — {motivo}. Disparos de captura ADIADOS "
                  f"(não é falha; retomo sozinho quando a carga baixar).")
-        if self._suprimido_nao_essencial(self._pede_acao_do_dono(essencial), texto):
+        if self._suprimido_nao_essencial(essencial, texto):
             return
         chave_dedup = ("maquina_sobrecarregada", chave) if chave is not None else None
         if self._dedup_repetido(chave_dedup, texto):
@@ -176,8 +179,10 @@ class Alertas:
         """Envio SEM dedup local (o dedup destes é do zelador, PERSISTIDO no status dele).
         True = entregue OU não há canal (só-log: nada a re-tentar); False = havia canal e
         falhou (o zelador re-tenta no próximo ciclo em vez de armar o dedup)."""
-        if self._tg is None or not self._chats:
-            log.warning("alerta sem canal Telegram (só-log): %s", texto)
+        if self._nivel == "mudo" or self._tg is None or not self._chats:
+            # True = "nada a re-tentar". No `mudo` isso importa: devolver False faria
+            # o zelador re-tentar o mesmo alerta a cada ciclo, para sempre.
+            log.warning("alerta só-log (mudo ou sem canal): %s", texto)
             return True
         return self._enviar(texto)
 
@@ -219,7 +224,7 @@ class Alertas:
         # vê o mesmo número quando pergunta (`/sitrepcaptura`).
         texto = (f"✅ {plataforma}: curso '{curso}' concluído — "
                  f"{n} aulas capturadas.")
-        if self._suprimido_nao_essencial(self._pede_acao_do_dono(True), texto):
+        if self._suprimido_nao_essencial(True, texto):
             return
         chave_dedup = ("curso_concluido", plataforma, curso)
         if self._dedup_repetido(chave_dedup, texto):

@@ -24,7 +24,7 @@ def test_captura_morreu_essencial_envia_plataforma_e_motivo():
     # `essencial=True`: morte que exige ação humana (contrato pós-gate 22/07 —
     # o default sem `essencial` é só-log, testado na seção do gate abaixo).
     tg = _TG()
-    Alertas(tg, [10]).captura_morreu("Stoa", "processo sumiu há 10h", essencial=True)
+    Alertas(tg, [10], nivel="essencial").captura_morreu("Stoa", "processo sumiu há 10h", essencial=True)
     assert len(tg.msgs) == 1
     chat, texto = tg.msgs[0]
     assert chat == 10
@@ -34,14 +34,14 @@ def test_captura_morreu_essencial_envia_plataforma_e_motivo():
 
 def test_sessao_expirada_envia_plataforma():
     tg = _TG()
-    Alertas(tg, [10]).sessao_expirada("Hotmart")
+    Alertas(tg, [10], nivel="essencial").sessao_expirada("Hotmart")
     assert len(tg.msgs) == 1
     assert "Hotmart" in tg.msgs[0][1] and "expirou" in tg.msgs[0][1]
 
 
 def test_curso_concluido_envia_curso_e_n():
     tg = _TG()
-    Alertas(tg, [10]).curso_concluido("Kiwify", "Seguro de Vida", 42)
+    Alertas(tg, [10], nivel="essencial").curso_concluido("Kiwify", "Seguro de Vida", 42)
     assert len(tg.msgs) == 1
     texto = tg.msgs[0][1]
     assert "Kiwify" in texto and "Seguro de Vida" in texto and "42" in texto
@@ -49,7 +49,7 @@ def test_curso_concluido_envia_curso_e_n():
 
 def test_cada_evento_tem_mensagem_distinta():
     tg = _TG()
-    a = Alertas(tg, [1])
+    a = Alertas(tg, [1], nivel="essencial")
     a.captura_morreu("P", "m", essencial=True)
     a.sessao_expirada("P")
     a.curso_concluido("P", "C", 1)
@@ -59,20 +59,20 @@ def test_cada_evento_tem_mensagem_distinta():
 
 def test_envia_para_todos_os_chats():
     tg = _TG()
-    Alertas(tg, [1, 2, 3]).captura_morreu("P", "m", essencial=True)
+    Alertas(tg, [1, 2, 3], nivel="essencial").captura_morreu("P", "m", essencial=True)
     assert [c for c, _ in tg.msgs] == [1, 2, 3]
 
 
 def test_fail_safe_sem_cliente_so_loga(caplog):
     with caplog.at_level(logging.WARNING, logger="athena.alertas"):
-        Alertas(None, [1]).captura_morreu("P", "morreu", essencial=True)
+        Alertas(None, [1], nivel="essencial").captura_morreu("P", "morreu", essencial=True)
     assert any("só-log" in r.message for r in caplog.records)
 
 
 def test_fail_safe_sem_chats_so_loga(caplog):
     tg = _TG()
     with caplog.at_level(logging.WARNING, logger="athena.alertas"):
-        Alertas(tg, []).sessao_expirada("P")
+        Alertas(tg, [], nivel="essencial").sessao_expirada("P")
     assert tg.msgs == []
     assert any("só-log" in r.message for r in caplog.records)
 
@@ -80,7 +80,7 @@ def test_fail_safe_sem_chats_so_loga(caplog):
 def test_erro_de_envio_nao_propaga(caplog):
     # Telegram fora do ar não pode derrubar quem chamou o alerta.
     with caplog.at_level(logging.ERROR, logger="athena.alertas"):
-        Alertas(_TGQuebra(), [1, 2]).curso_concluido("P", "C", 3)
+        Alertas(_TGQuebra(), [1, 2], nivel="essencial").curso_concluido("P", "C", 3)
     assert sum("falha ao enviar" in r.message for r in caplog.records) == 2
 
 
@@ -93,7 +93,7 @@ def test_morte_nao_essencial_e_so_log_sem_telegram(caplog):
     # curso, é essencial desde a r6 — tests/test_bench_essencial.py).
     tg = _TG()
     with caplog.at_level(logging.WARNING, logger="athena.alertas"):
-        Alertas(tg, [10]).captura_morreu(
+        Alertas(tg, [10], nivel="essencial").captura_morreu(
             "hotmart", "FLAP: 3 mortes na janela (curso X, causa=relancar)")
     assert tg.msgs == []                                   # canal Telegram: silêncio
     assert any("FLAP" in r.message for r in caplog.records)  # log: registra TUDO
@@ -101,7 +101,7 @@ def test_morte_nao_essencial_e_so_log_sem_telegram(caplog):
 
 def test_morte_essencial_envia():
     tg = _TG()
-    Alertas(tg, [10]).captura_morreu(
+    Alertas(tg, [10], nivel="essencial").captura_morreu(
         "hotmart", "causa desconhecida (fail-closed)", essencial=True)
     assert len(tg.msgs) == 1
     assert "MORREU" in tg.msgs[0][1]
@@ -110,7 +110,7 @@ def test_morte_essencial_envia():
 def test_sessao_expirada_sempre_envia_mesmo_no_nivel_essencial():
     # INVARIANTE anti-ban: reseed é o ÚNICO jeito de o dono saber que precisa logar.
     tg = _TG()
-    Alertas(tg, [10]).sessao_expirada("hotmart")
+    Alertas(tg, [10], nivel="essencial").sessao_expirada("hotmart")
     assert len(tg.msgs) == 1 and "expirou" in tg.msgs[0][1]
 
 
@@ -132,7 +132,7 @@ def test_de_ambiente_le_nivel_do_env(monkeypatch):
     monkeypatch.setenv("ATHENA_ALERTA_NIVEL", "tudo")
     assert de_ambiente()._nivel == "tudo"
     monkeypatch.delenv("ATHENA_ALERTA_NIVEL")
-    assert de_ambiente()._nivel == "essencial"             # default = essencial
+    assert de_ambiente()._nivel == "mudo"                  # default = MUDO (14/09)
 
 
 # ===========================================================================
@@ -141,7 +141,7 @@ def test_de_ambiente_le_nivel_do_env(monkeypatch):
 def test_dedup_mesma_chave_na_janela_envia_uma_vez(caplog):
     tg = _TG()
     t = [1000.0]
-    a = Alertas(tg, [10], relogio=lambda: t[0])
+    a = Alertas(tg, [10], nivel="essencial", relogio=lambda: t[0])
     a.captura_morreu("hotmart", "causa desconhecida", essencial=True,
                      chave=("humano", "curso-1"))
     t[0] += 60.0                                           # 1 min depois, mesma janela
@@ -155,7 +155,7 @@ def test_dedup_mesma_chave_na_janela_envia_uma_vez(caplog):
 def test_dedup_expira_fora_da_janela():
     tg = _TG()
     t = [1000.0]
-    a = Alertas(tg, [10], dedup_janela_s=3600.0, relogio=lambda: t[0])
+    a = Alertas(tg, [10], nivel="essencial", dedup_janela_s=3600.0, relogio=lambda: t[0])
     a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))
     t[0] += 3601.0                                         # janela venceu
     a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))
@@ -164,7 +164,7 @@ def test_dedup_expira_fora_da_janela():
 
 def test_dedup_chaves_diferentes_nao_colidem():
     tg = _TG()
-    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a = Alertas(tg, [10], nivel="essencial", relogio=lambda: 1000.0)
     a.captura_morreu("P", "m", essencial=True, chave=("humano", "curso-1"))
     a.captura_morreu("P", "m", essencial=True, chave=("humano", "curso-2"))
     assert len(tg.msgs) == 2                               # cursos distintos: ambos
@@ -172,7 +172,7 @@ def test_dedup_chaves_diferentes_nao_colidem():
 
 def test_sem_chave_nao_dedupa():
     tg = _TG()
-    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a = Alertas(tg, [10], nivel="essencial", relogio=lambda: 1000.0)
     a.captura_morreu("P", "m", essencial=True)
     a.captura_morreu("P", "m", essencial=True)
     assert len(tg.msgs) == 2                               # sem chave = sem dedup
@@ -181,7 +181,7 @@ def test_sem_chave_nao_dedupa():
 def test_sessao_expirada_nunca_dedupa():
     # Fail-safe da INVARIANTE: reseed repetido ainda avisa (nunca engolir reseed).
     tg = _TG()
-    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a = Alertas(tg, [10], nivel="essencial", relogio=lambda: 1000.0)
     a.sessao_expirada("hotmart")
     a.sessao_expirada("hotmart")
     assert len(tg.msgs) == 2
@@ -208,7 +208,7 @@ def test_envio_falho_nao_marca_dedup_e_proxima_tentativa_envia():
     # IMPORTANTE-1: se o 1º envio essencial FALHOU, a mesma chave na janela NÃO
     # pode ser dedupada — senão o dono fica 1h sem saber de uma escalada.
     tg = _TGFalhaUmaVez()
-    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a = Alertas(tg, [10], nivel="essencial", relogio=lambda: 1000.0)
     a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))   # falha
     a.captura_morreu("P", "m", essencial=True, chave=("humano", "c"))   # retenta
     assert len(tg.msgs) == 1                               # a 2ª CHEGOU (não dedupada)
@@ -218,7 +218,7 @@ def test_chave_nao_hashavel_nao_derruba_e_envia():
     # IMPORTANTE-2: fail-safe total — bug de chave jamais levanta pro loop nem
     # engole o alerta (na dúvida, ENVIA).
     tg = _TG()
-    a = Alertas(tg, [10], relogio=lambda: 1000.0)
+    a = Alertas(tg, [10], nivel="essencial", relogio=lambda: 1000.0)
     a.captura_morreu("P", "m", essencial=True, chave=["lista", "nao-hashavel"])
     a.captura_morreu("P", "m", essencial=True, chave=["lista", "nao-hashavel"])
     assert len(tg.msgs) == 2                               # nunca levantou, sempre enviou
@@ -249,3 +249,82 @@ def test_de_ambiente_com_token_constroi_cliente(monkeypatch):
     a = de_ambiente()
     assert a._tg is not None
     assert a._chats == [9]
+
+
+# --- `mudo`: a Athena não procura ninguém (decisão do dono, 14/09) -------------
+#
+# "Apagar da Athena a possibilidade de envio de avisos aleatórios. Eu quero saber da
+# captura quando eu pedir."
+#
+# Não é um nível a mais na lista: é o PADRÃO. E o corte mora no `_enviar`, ponto único
+# de saída — não existe método que o contorne nem futuro que esqueça de checar.
+#
+# O que se perde está dito no código e foi dito a ele: sessão morta e login pendente
+# também param de procurá-lo. `ATHENA_ALERTA_NIVEL=essencial` devolve o canal.
+
+class _TGSpy:
+    def __init__(self): self.enviadas = []
+    def send_message(self, chat_id, texto): self.enviadas.append(texto)
+
+
+def _alertas(nivel=None):
+    from maestro.alertas import Alertas
+    tg = _TGSpy()
+    return Alertas(tg, [1], nivel=nivel), tg
+
+
+def test_DENTE_no_padrao_NENHUM_alerta_chega_ao_telegram():
+    """O dente da decisão: sem env nenhuma, com canal configurado e funcionando, NADA
+    sai — nem o que antes era intocável (sessão morta, login pendente, bench). Trocar
+    o default de volta para `essencial` faz este teste falhar."""
+    a, tg = _alertas()            # sem nível: o padrão de fábrica
+    a.captura_morreu("kiwify", "BENCH irredutível (exit 5)", essencial=True, chave=("h", "c1"))
+    a.sessao_expirada("hotmart")
+    a.logins_pendentes(["cademi:alfaresearch"], "python -m motor.cademi --reseed")
+    a.sessao_vence("hotmart", "24/09", 2.0, "python scripts/check_session.py --reseed")
+    a.curso_concluido("kiwify", "Curso X", 42)
+    a.maquina_sobrecarregada("carga 14", essencial=True, chave="x")
+    assert tg.enviadas == [], tg.enviadas
+
+
+def test_mudo_nao_faz_o_zelador_re_tentar_para_sempre():
+    """`logins_pendentes` devolve True = "nada a re-tentar". Se o mudo devolvesse
+    False, o zelador re-tentaria o MESMO alerta a cada ciclo, eternamente."""
+    a, _ = _alertas()
+    assert a.logins_pendentes(["hotmart:conta"], "cmd") is True
+    assert a.sessao_vence("hotmart", "24/09", 1.0, "cmd") is True
+
+
+def test_mudo_registra_no_log_o_que_nao_enviou(caplog):
+    """O silêncio é no canal, não na memória: o relatório que ele pede depois sai do
+    log. Um alerta que some sem rastro seria cegueira, não silêncio."""
+    import logging
+    a, tg = _alertas()
+    with caplog.at_level(logging.WARNING, logger="athena.alertas"):
+        a.sessao_expirada("hotmart")
+    assert tg.enviadas == []
+    assert any("hotmart" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_ligar_o_canal_e_um_ato_deliberado():
+    """Nada foi removido: uma env devolve o comportamento anterior por inteiro."""
+    a, tg = _alertas("essencial")
+    a.captura_morreu("kiwify", "morreu", essencial=True, chave=("humano", "c1"))
+    a.sessao_expirada("hotmart")
+    assert len(tg.enviadas) == 2
+
+
+def test_o_nivel_essencial_continua_como_era():
+    """Quem quiser o comportamento anterior muda uma env — nada foi removido."""
+    a, tg = _alertas("essencial")
+    a.captura_morreu("kiwify", "morreu", essencial=True, chave=("humano", "c1"))
+    a.curso_concluido("kiwify", "Curso X", 42)
+    assert len(tg.enviadas) == 2
+
+
+def test_nivel_desconhecido_cai_no_PADRAO_e_o_padrao_e_silencio():
+    """Fail-safe invertido em 14/09: valor errado na env cai em `mudo`, não em
+    `essencial`. Com o silêncio virando a regra, errar para o lado de FALAR
+    contrariaria a decisão do dono a cada typo."""
+    a, _ = _alertas("inventado")
+    assert a._nivel == "mudo"

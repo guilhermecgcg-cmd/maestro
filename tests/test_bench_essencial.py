@@ -12,6 +12,12 @@ a URL no YAML / o adaptador) e NENHUMA frase de morte; o rótulo do curso passa 
 
 A conferência do texto usa o classificador REAL do caminho VIVO (maestro-athlocal), lido
 em modo SÓ LEITURA a partir do fonte (sem importar do caminho — nada de .pyc lá).
+
+
+NOTA (14/09): estes testes ligam o canal de propósito (`nivel="essencial"`).
+O padrão do sistema passou a ser `mudo` — a Athena não procura ninguém, por
+decisão do dono. O que se mede aqui é a CLASSIFICAÇÃO, que continua existindo
+para quem ligar o canal; o teste do padrão vive em tests/test_alertas.py.
 """
 import os
 import sys
@@ -94,7 +100,7 @@ def _benchar(tmp_path, alertas, cursos_contas, *, vezes=3, t0=1000.0):
 # ==========================================================================
 def test_bench_exit5_pinga_telegram_essencial_uma_vez_por_curso(tmp_path):
     tg = _TG()
-    ex, estado, *_ = _benchar(tmp_path, Alertas(tg, [1]), [(C1, "a"), (C2, "b")])
+    ex, estado, *_ = _benchar(tmp_path, Alertas(tg, [1], nivel="essencial"), [(C1, "a"), (C2, "b")])
     assert estado[C1].get("benched_exit5") and estado[C2].get("benched_exit5")
     bench = [m for m in tg.msgs if "BENCH exit-5" in m]
     # DENTES: antes -> [] (o bench era só-log e o curso parava calado)
@@ -107,7 +113,7 @@ def test_bench_exit5_pinga_telegram_essencial_uma_vez_por_curso(tmp_path):
 def test_bench_do_mesmo_curso_na_janela_e_dedupado(tmp_path):
     # desbench (avanço real no Notion) e re-bench dentro da janela: 1 ping só.
     tg = _TG()
-    alertas = Alertas(tg, [1], dedup_janela_s=3600)
+    alertas = Alertas(tg, [1], nivel="essencial", dedup_janela_s=3600)
     ex, estado, cursos, prog, common, voz, voo, t = _benchar(tmp_path, alertas, [(C1, "a")])
     assert len([m for m in tg.msgs if "BENCH" in m]) == 1
     avancou = _prog({C1: (5, 18)})
@@ -158,7 +164,7 @@ def test_bench_chama_o_alerta_essencial_com_chave_por_curso():
 def test_texto_do_bench_nao_casa_as_ancoras_de_morte_do_classificador_vivo(tmp_path):
     viva = _causa_viva()
     tg = _TG()
-    _benchar(tmp_path, Alertas(tg, [1]), [(C1, "a")])
+    _benchar(tmp_path, Alertas(tg, [1], nivel="essencial"), [(C1, "a")])
     [msg] = [m for m in tg.msgs if "BENCH" in m]           # o texto INTEIRO do Telegram
     _nao_declara_morte(viva, msg)
 
@@ -169,7 +175,7 @@ def test_url_hostil_da_plataforma_e_mascarada_e_o_curso_segue_reconhecivel(tmp_p
               "https://x.memberkit.com.br/curso/Unauthorized-Access-101",
               "https://app.hub.la/user_groups/forbidden-secrets"]
     tg = _TG()
-    _benchar(tmp_path, Alertas(tg, [1]), [(u, f"c{i}") for i, u in enumerate(hostis)])
+    _benchar(tmp_path, Alertas(tg, [1], nivel="essencial"), [(u, f"c{i}") for i, u in enumerate(hostis)])
     bench = [m for m in tg.msgs if "BENCH" in m]
     assert len(bench) == 3
     for m in bench:

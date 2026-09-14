@@ -829,7 +829,9 @@ def test_alertas_real_logins_e_preventivo_sao_essenciais_e_dizem_se_chegou():
             self.msgs.append(texto)
 
     tg = TG()
-    a = Alertas(tg, [1])
+    # canal LIGADO de propósito: o assunto aqui é o CONTRATO de retorno do zelador
+    # (True = nada a re-tentar), não a decisão de 14/09 de calar o canal por padrão.
+    a = Alertas(tg, [1], nivel="essencial")
     cmd = "uv run scripts/reseed.py kiwify:kiwify-principal"
     assert a.logins_pendentes(["kiwify:kiwify-principal"], cmd) is True
     assert "login necessário" in tg.msgs[-1] and cmd in tg.msgs[-1]
@@ -839,7 +841,11 @@ def test_alertas_real_logins_e_preventivo_sao_essenciais_e_dizem_se_chegou():
                           "curseduca:x") is True
     assert "2,4 dia" in tg.msgs[-1] and "curseduca:x" in tg.msgs[-1]
     assert Alertas(None, [1]).logins_pendentes(["a:b"], "c") is True       # sem canal: só log
-    assert Alertas(TG(falha=True), [1]).logins_pendentes(["a:b"], "c") is False
+    # canal ligado + Telegram fora = False (o zelador re-tenta). É o único caso em que
+    # False é a resposta certa: houve canal e ele FALHOU.
+    assert Alertas(TG(falha=True), [1], nivel="essencial").logins_pendentes(["a:b"], "c") is False
+    # e no padrão de hoje (mudo) o retorno é True: não há nada a re-tentar, por decisão.
+    assert Alertas(TG(), [1]).logins_pendentes(["a:b"], "c") is True
 
 
 # ==========================================================================================

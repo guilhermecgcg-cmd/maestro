@@ -254,8 +254,13 @@ def test_de_ambiente_com_token_constroi_cliente(monkeypatch):
 # --- nível `so_humano` (decisão do dono, 13/09) --------------------------------
 #
 # "A Athena no telegram fica apenas para interação... e não uma lista de afazeres e
-# pendência. Se eu quiser saber sobre a captura eu pergunto." O canal passa a receber
-# SÓ o que ele destrava: sessão morta e login pendente.
+# pendência. Se eu quiser saber sobre a captura eu pergunto."
+#
+# A primeira versão deste nível leu isso como "cala tudo" e calava também o que DEIXA A
+# CAPTURA PARADA esperando por ele (bench irredutível, token, sessão morta). Isso não é
+# tirar a lista de afazeres do canal: é esconder do dono a única coisa que ele precisa
+# saber. A regra certa é a inversa — o canal perde a NOTÍCIA (curso concluído) e o que
+# o sistema resolve sozinho (sobrecarga); mantém o pedido de ação.
 
 class _TGSpy:
     def __init__(self): self.enviadas = []
@@ -268,11 +273,31 @@ def _alertas(nivel):
     return Alertas(tg, [1], nivel=nivel), tg
 
 
-def test_DENTE_so_humano_cala_morte_sobrecarga_e_curso_concluido():
+def test_so_humano_cala_a_noticia_boa_e_o_que_o_sistema_trata_sozinho():
+    """O que o dono pediu para não receber: o placar e o aviso que se resolve só."""
     a, tg = _alertas("so_humano")
-    a.captura_morreu("kiwify", "enumeração incompleta", essencial=True, chave=("humano", "c1"))
-    a.maquina_sobrecarregada("carga 14", essencial=True, chave="x")
     a.curso_concluido("kiwify", "Curso X", 42)
+    a.maquina_sobrecarregada("carga 14", essencial=True, chave="x")
+    assert tg.enviadas == [], tg.enviadas
+
+
+def test_DENTE_so_humano_NAO_cala_o_que_deixa_a_captura_parada():
+    """Este é o dente: reverter para `if nivel == so_humano and not so_humano:` faz
+    ESTE teste falhar. É o alerta do BENCH irredutível (athena_local.py:484, exit 5) —
+    o curso para de vez até um humano arrumar a URL/adaptador. Calá-lo re-enterra o
+    achado r6 ('defeito PERMANENTE calado no log') com o canal parecendo saudável."""
+    a, tg = _alertas("so_humano")
+    a.captura_morreu("kiwify", "BENCH irredutível (exit 5) — só humano destrava",
+                     essencial=True, chave=("humano", "c1"))
+    assert len(tg.enviadas) == 1, tg.enviadas
+    assert "BENCH" in tg.enviadas[0]
+
+
+def test_so_humano_continua_calando_a_morte_NAO_essencial():
+    """O corte que o nível `essencial` já fazia não foi desfeito: morte transitória
+    (o motor retenta sozinho) segue só-log — senão o canal volta a ser uma lista."""
+    a, tg = _alertas("so_humano")
+    a.captura_morreu("kiwify", "timeout de rede", essencial=False, chave=("t", "c1"))
     assert tg.enviadas == [], tg.enviadas
 
 

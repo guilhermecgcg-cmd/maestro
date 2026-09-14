@@ -34,10 +34,13 @@ from maestro.telegram_api import TelegramClient
 log = logging.getLogger("athena.alertas")
 
 # `so_humano` (13/09, decisão do dono): o Telegram virou lugar de CONVERSA — ele
-# pergunta quando quer saber. Só passa o que SÓ ELE destrava: sessão morta (reseed) e
-# logins pendentes. Morte de captura, sobrecarga, curso concluído, bench e alarme de
-# token continuam no LOG, e ele os vê pedindo `/sitrep`. `essencial` é o nível
-# anterior (o que pede ação humana, incluindo as mortes); `tudo` é o modo de depuração.
+# pergunta quando quer saber. O que sai do canal é a NOTÍCIA (curso concluído) e o que
+# o sistema trata sozinho (máquina sobrecarregada, que retoma quando a carga baixa) —
+# ele vê isso pedindo `/sitrepcaptura`. O que NÃO sai é o que deixa a captura PARADA
+# esperando por ele: sessão morta, login pendente, bench irredutível (exit 5), token,
+# teto de budget, pausa de sistema. Esses continuam pingando, porque em todos eles o
+# acervo para de crescer até ele agir — e um canal que cala isso não é silêncio, é
+# cegueira. `essencial` é o nível anterior; `tudo` é o modo de depuração.
 _NIVEIS = ("so_humano", "essencial", "tudo")
 _DEDUP_JANELA_PADRAO_S = 3600.0
 
@@ -46,8 +49,9 @@ class Alertas:
     """Emite alertas de supervisão. `tg=None` => modo só-log (fail-safe), para a
     Athena poder chamar alertas mesmo sem canal Telegram configurado.
 
-    `nivel`: 'essencial' (default — só o que exige ação humana pinga o Telegram)
-    ou 'tudo' (comportamento antigo: tudo pinga). `dedup_janela_s` e `relogio`
+    `nivel`: 'essencial' (default — só o que exige ação humana pinga o Telegram),
+    'so_humano' (o mesmo, menos notícia boa e o que o sistema trata sozinho) ou
+    'tudo' (comportamento antigo: tudo pinga). `dedup_janela_s` e `relogio`
     são injetáveis para teste; defaults vêm do ambiente/`time.time`."""
 
     def __init__(self, tg, chat_ids, nivel=None, dedup_janela_s=None,
@@ -83,21 +87,29 @@ class Alertas:
                 log.exception("falha ao enviar alerta para chat %s", chat)
         return chegou
 
-    def _suprimido_nao_essencial(self, essencial: bool, texto: str, *,
-                                 so_humano: bool = False) -> bool:
-        """True = fica SÓ no log. `so_humano=True` marca o alerta que SÓ O DONO
-        destrava (sessão morta, login pendente): é o único que atravessa o nível
-        `so_humano`. Sem essa marca, no nível `so_humano` até o essencial vira log —
-        é o que tira do canal a lista de pendência que ele pediu para não receber."""
-        if self._nivel == "tudo":
-            return False
-        if self._nivel == "so_humano" and not so_humano:
-            log.warning("alerta fora do nível so_humano (só-log, sem Telegram): %s", texto)
-            return True
-        if essencial:
+    def _suprimido_nao_essencial(self, essencial: bool, texto: str) -> bool:
+        """True = fica SÓ no log (auto-tratado; nenhuma ação do dono é necessária).
+
+        O nível `so_humano` NÃO mexe aqui: o que é essencial PARA o sistema — bench
+        exit-5, token, escalar_humano, teto de budget, pausa de sistema — continua
+        chegando, porque em todos esses casos a captura ESTÁ PARADA e só o dono
+        destrava. A primeira versão deste nível fazia o contrário (calava tudo o que
+        passasse pelo portão) e re-enterrava o achado r6: "num adaptador novo, um
+        defeito PERMANENTE ficava calado no log". Silêncio é a direção perigosa.
+
+        Quem o `so_humano` rebaixa são os dois alertas que NÃO pedem nada dele —
+        curso concluído (notícia boa) e máquina sobrecarregada (retoma sozinha) —, e
+        eles rebaixam a si mesmos, no próprio call-site."""
+        if essencial or self._nivel == "tudo":
             return False
         log.warning("alerta NÃO-essencial (só-log, sem Telegram): %s", texto)
         return True
+
+    def _pede_acao_do_dono(self, essencial: bool) -> bool:
+        """`essencial` que sobrevive ao nível `so_humano`. Usado pelos dois alertas
+        que são INFORMAÇÃO, não pedido: no `so_humano` eles viram log, e o dono vê o
+        mesmo número quando pergunta (`/sitrepcaptura`)."""
+        return essencial and self._nivel != "so_humano"
 
     def _dedup_repetido(self, chave, texto: str) -> bool:
         """True = mesma chave já ENVIOU (com sucesso) dentro da janela — vira só-log.
@@ -152,7 +164,7 @@ class Alertas:
         `chave` dedupa dentro da janela (1 ping por janela, nunca 1 por curso)."""
         texto = (f"🟠 Máquina sobrecarregada — {motivo}. Disparos de captura ADIADOS "
                  f"(não é falha; retomo sozinho quando a carga baixar).")
-        if self._suprimido_nao_essencial(essencial, texto):
+        if self._suprimido_nao_essencial(self._pede_acao_do_dono(essencial), texto):
             return
         chave_dedup = ("maquina_sobrecarregada", chave) if chave is not None else None
         if self._dedup_repetido(chave_dedup, texto):
@@ -207,7 +219,7 @@ class Alertas:
         # vê o mesmo número quando pergunta (`/sitrepcaptura`).
         texto = (f"✅ {plataforma}: curso '{curso}' concluído — "
                  f"{n} aulas capturadas.")
-        if self._suprimido_nao_essencial(True, texto):
+        if self._suprimido_nao_essencial(self._pede_acao_do_dono(True), texto):
             return
         chave_dedup = ("curso_concluido", plataforma, curso)
         if self._dedup_repetido(chave_dedup, texto):

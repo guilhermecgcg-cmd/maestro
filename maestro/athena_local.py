@@ -47,9 +47,12 @@ PENDENTE / o que ficou por LIGAR (honesto):
     final do motor na cauda, e por morta no reinício do Mac pelo lock anterior ao boot.
 """
 import asyncio
+import dataclasses
 import json
 import logging
+import math
 import os
+import re
 import time
 
 from maestro import adaptador_pipeline, orquestrador
@@ -80,6 +83,68 @@ FASE_CONCLUIDO = captura.FASE_CONCLUIDO
 # NUNCA um latch permanente. Anti-ban intacto: reseed continua irredutível.
 _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 
+
+# ENVS NUMÉRICAS TOLERANTES (rodada 2, item 6): definidas ANTES da primeira leitura do módulo,
+# e TODA leitura numérica de ambiente deste arquivo passa por elas — um typo no launch.sh
+# (ATHENA_BENCH_EXIT5_MIN="três") derrubava o import, e o launchd ficava relançando um daemon
+# que morria na largada. O teste varre o fonte: nenhum int()/float() cru de env sobra.
+def _env_int(nome, padrao, *, minimo=None, maximo=None):
+    """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
+    caso ilegível); abaixo de `minimo` => `minimo` e acima de `maximo` => `maximo` (com
+    WARNING). Uma variável de ambiente mal digitada nunca pode impedir o daemon de subir."""
+    bruto = os.getenv(nome)
+    if bruto is None or not str(bruto).strip():
+        valor = int(padrao)
+    else:
+        try:
+            valor = int(str(bruto).strip())
+        except (TypeError, ValueError):
+            log.warning("%s=%r não é inteiro — usando o default %s", nome, bruto, padrao)
+            valor = int(padrao)
+    if minimo is not None and valor < minimo:
+        log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
+        valor = int(minimo)
+    if maximo is not None and valor > maximo:
+        log.warning("%s=%s acima do máximo %s — usando %s", nome, valor, maximo, maximo)
+        valor = int(maximo)
+    return valor
+
+
+def _env_float(nome, padrao, *, minimo=None, maximo=None):
+    """Irmão do `_env_int` para segundos: ausente/vazio => `padrao`; ilegível, nan ou inf =>
+    `padrao` com WARNING (um `inf` numa janela de bench seria um bench PERMANENTE); abaixo
+    de `minimo` => `minimo` e acima de `maximo` => `maximo`, com WARNING. Nunca levanta no
+    import."""
+    bruto = os.getenv(nome)
+    if bruto is None or not str(bruto).strip():
+        valor = float(padrao)
+    else:
+        try:
+            valor = float(str(bruto).strip())
+        except (TypeError, ValueError):
+            valor = None
+        if valor is None or not math.isfinite(valor):
+            log.warning("%s=%r não é um número finito — usando o default %s", nome, bruto,
+                        padrao)
+            valor = float(padrao)
+    if minimo is not None and valor < minimo:
+        log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
+        valor = float(minimo)
+    if maximo is not None and valor > maximo:
+        log.warning("%s=%s acima do máximo %s — usando %s", nome, valor, maximo, maximo)
+        valor = float(maximo)
+    return valor
+
+
+# TETO DE SANIDADE do futuro no ESTADO EM DISCO: um valor corrompido (ou um relógio que andou
+# para trás) não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
+# DESCARTADO na leitura (`_carregar_estado_cursos`) — 24h é o teto da escada e 24h é o
+# cooldown sem-pendência, mais uma folga generosa. É também o TETO das envs que geram prazos
+# persistidos (rodada 2, itens 3 e 6: espera/expiração do exit 4 e os dois cooldowns): um prazo
+# configurado acima dele era jogado fora no primeiro reinício — o bench de exit 4 de 5 dias
+# soltava o curso na hora em que o vigia reiniciava o loop.
+_ESTADO_FUTURO_MAX_S = 2 * 86400.0
+
 # BENCH do exit-5 (anti-flap): exit 5 = sonda de sessão INCONCLUSIVA / erro de infra
 # (contrato do motor — NÃO é sessão morta). Uma URL MALFORMADA no YAML (ex.:
 # …/products/X/agent) torna a sonda inconclusiva PARA SEMPRE: cada disparo morre
@@ -95,7 +160,7 @@ _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 # A contagem zera em: saída limpa, avanço real no Notion (que também DESBENCHA:
 # se outra via produziu progresso, never-stop reavalia), ou morte de outra causa.
 _EXIT_SONDA_INCONCLUSIVA = 5           # contrato do motor (ver causa.py)
-_BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
+_BENCH_EXIT5_MIN = _env_int("ATHENA_BENCH_EXIT5_MIN", 3, minimo=1)
 
 # COOLDOWN de curso QUIESCIDO por SAÍDA LIMPA: quando o motor sai LIMPO (exit 0) sem
 # produzir nada novo (Notion não avançou), o curso está concluído/sem-pendência para o
@@ -105,7 +170,8 @@ _BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
 # conteúdo aparecer, um ciclo pós-cooldown o retoma; e QUALQUER avanço real no Notion —
 # ou pendência capturável NOVA no tracker (acima do baseline do arme; ex.: reseed) —
 # limpa o cooldown na hora. Default 6h; env ATHENA_COOLDOWN_CONCLUIDO_S calibra.
-_COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"))  # 6h
+_COOLDOWN_SAIDA_LIMPA_S = _env_float("ATHENA_COOLDOWN_CONCLUIDO_S", 21600.0, minimo=0.0,
+                                     maximo=_ESTADO_FUTURO_MAX_S)              # 6h
 
 # COOLDOWN de curso SEM PENDÊNCIA CAPTURÁVEL (higiene 2): o tracker prova que só restam
 # aulas TERMINAIS (no_notion/sem_conteudo/falhou…), mesmo com o Notion < total (aulas
@@ -114,14 +180,15 @@ _COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"
 # (mais que a saída-limpa: aqui o tracker PROVA que não há trabalho, então revisitar é
 # ainda mais raro). QUALQUER avanço no Notion / pendência nova limpa na hora (never-stop).
 # INVARIANTE: pendência REAL (parede/throttle => aula pendente/in-flight) NÃO cai aqui.
-_COOLDOWN_SEM_PENDENCIA_S = float(os.getenv("ATHENA_COOLDOWN_SEM_PENDENCIA_S", "86400"))  # 24h
+_COOLDOWN_SEM_PENDENCIA_S = _env_float("ATHENA_COOLDOWN_SEM_PENDENCIA_S", 86400.0, minimo=0.0,
+                                       maximo=_ESTADO_FUTURO_MAX_S)            # 24h
 
 # PORTÃO DE CARGA (maestro.carga; incidente 10/09): o LocalExecutor ADIA o disparo quando o
 # Mac está sobrecarregado. Adiar é auto-tratado — o aviso agregado por ciclo fica SÓ-LOG;
 # se a sobrecarga PERSISTIR por esta janela (nada sendo capturado), o aviso vira ESSENCIAL
 # (1 ping por janela de dedup do Alertas) + 1 escalada na espinha por episódio. 0 = nunca
 # escala (só-log sempre). Default 1h.
-_CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
+_CARGA_ALERTA_S = _env_float("ATHENA_CARGA_ALERTA_S", 3600.0, minimo=0.0)
 
 # EPISÓDIO DE SOBRECARGA EM DISCO (achado r6): o `desde` do episódio vai para um arquivo
 # pequeno (ATHENA_CARGA_EPISODIO_PATH, default ~/.athena-local/carga_episodio.json) e o
@@ -129,26 +196,216 @@ _CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
 # relógio do aviso ESSENCIAL. LACUNA: se a última observação de adiamento ficou mais longe
 # que isto do boot, o loop esteve fora tempo demais para chamar de "o mesmo episódio" —
 # recomeça do zero (honesto). Default 30 min (o vigia externo mata após 900 s sem pulso).
-_CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "1800"))
+_CARGA_EPISODIO_LACUNA_S = _env_float("ATHENA_CARGA_EPISODIO_LACUNA_S", 1800.0, minimo=0.0)
 
 
-def _env_int(nome, padrao, *, minimo=None):
-    """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
-    caso ilegível); abaixo de `minimo` => `minimo` (com WARNING). Uma variável de ambiente
-    mal digitada nunca pode impedir o daemon de subir."""
-    bruto = os.getenv(nome)
-    if bruto is None or not str(bruto).strip():
-        valor = int(padrao)
+# RELANÇAMENTO APÓS O CIRCUIT-BREAKER (exit 4) — trilha anti-ban aprovada pelo dono (15/09).
+# Incidente 13–14/09: o Cademí codigoviral foi disparado 17 vezes em ~14h, cada run abortado
+# pelo disjuntor do MOTOR ("5 erros nas últimas 5 aulas") e relançado ~1 min depois — mesmo
+# após a 4ª falha. O exit 4 é o próprio motor dizendo "continuar martelando é o caminho do
+# banimento"; o daemon não pode responder relançando. Travas (ver `_aplicar_decisao` e a
+# passada): ESPERA mínima antes de relançar (nunca no ciclo da autópsia), a SÉRIE que impede
+# o avanço no Notion de apagar a escada, e o BENCH no limiar (como o exit-5).
+#
+# REVISÃO INDEPENDENTE (15/09, NO-GO de e1c5da9): o motor sai 4 também quando NÃO é a
+# plataforma — o disjuntor LOCAL (Claude/Notion/Groq) e o YouTube suspenso/bloqueado. Benchar
+# esses deixava a cota da Groq acabada ou a Anthropic fora 2–3 h benchar TODOS os cursos, calados
+# e sem volta. Agora: só a PAREDE DA PLATAFORMA conta série e bencha; a série DECAI e o bench
+# EXPIRA em ATHENA_BENCH_EXIT4_EXPIRA_S (UMA tentativa depois; o próximo abort rebencha).
+_EXIT_CIRCUIT_BREAKER = 4              # contrato do motor (ver causa.py)
+_BENCH_EXIT4_MIN = _env_int("ATHENA_BENCH_EXIT4_MIN", 3, minimo=1)
+_ESPERA_EXIT4_S = _env_float("ATHENA_ESPERA_EXIT4_S", 600.0, minimo=0.0,
+                             maximo=_ESTADO_FUTURO_MAX_S)                      # 10 min
+_BENCH_EXIT4_EXPIRA_S = _env_float("ATHENA_BENCH_EXIT4_EXPIRA_S", 86400.0, minimo=3600.0,
+                                   maximo=_ESTADO_FUTURO_MAX_S)                # 24 h
+
+# CLASSE DO ABORT, lida da SAÍDA INTEIRA que a autópsia já tem — `Obito.stderr_bruto`, os
+# últimos 64 KB (rodada 2: nas 40 linhas do `stderr_tail`, o ruído de encerramento — httpx,
+# yt-dlp, call log do Playwright — empurrava a frase para fora e o local virava parede):
+#   1. a LINHA DE MÁQUINA do motor `ABORT_DISJUNTOR tipo=local|plataforma|youtube` (a última
+#      vence) — contrato estável, preferido à prosa;
+#   2. senão a PROSA do próprio motor (motor/orchestrator.py e os CLIs), a ocorrência MAIS
+#      RECENTE — "É a Claude ou o Notion falhando" (disjuntor local), "NÃO é a plataforma do
+#      curso e NÃO é a conta" (bloqueio/suspensão do YouTube) e "restrita pelo YouTube" (a
+#      rede dos vídeos declarados indisponíveis);
+#   3. sem marcador nenhum: PAREDE DA PLATAFORMA — conservador para a conta (20 das 192
+#      autópsias exit-4 de produção não trazem frase do abort nas 40 linhas). A expiração do
+#      bench garante que esse lado conservador nunca prende um curso para sempre.
+_RE_ABORT_MAQUINA = re.compile(r"ABORT_DISJUNTOR\s+tipo=(local|plataforma|youtube|hotmart)\b")
+_PROSA_CLASSE_EXIT4 = (
+    ("local", "É a Claude ou o Notion falhando"),
+    ("youtube", "NÃO é a plataforma do curso e NÃO é a conta"),
+    ("youtube", "restrita pelo YouTube"),
+)
+_ROTULO_CLASSE_EXIT4 = {
+    "plataforma": "parede da plataforma do curso (o disjuntor do motor contou erros das aulas)",
+    "local": "provedor local (Claude/Notion/Groq) falhando — não é a plataforma do curso nem "
+             "a conta",
+    "youtube": "bloqueio do YouTube — não é a plataforma do curso nem a conta",
+}
+
+
+def _classe_do_abort(cauda) -> str:
+    """'plataforma' | 'local' | 'youtube' para a cauda de um exit 4. Pura; nunca levanta."""
+    texto = str(cauda or "")
+    maquina = list(_RE_ABORT_MAQUINA.finditer(texto))
+    if maquina:
+        tipo = maquina[-1].group(1)
+        return "plataforma" if tipo == "hotmart" else tipo
+    classe, pos = "plataforma", -1
+    for candidata, frase in _PROSA_CLASSE_EXIT4:
+        i = texto.rfind(frase)
+        if i > pos:
+            classe, pos = candidata, i
+    return classe
+
+
+# MORTE SÓ-DE-LOCK QUE ABORTOU NO DISJUNTOR (rodada 2, item 2): a captura ÓRFÃ (disparada por
+# uma encarnação anterior do loop, que levou o Popen) chega sem exit code, e o bloco do exit 4
+# só age com `exit_code == 4` — a órfã que abortou na parede era relançada no ciclo da própria
+# autópsia. A saída inteira decide se foi o `SystemExit(4)` do disjuntor:
+#   - a linha de máquina `ABORT_DISJUNTOR tipo=…`;
+#   - o cabeçalho que os CLIs imprimem logo antes do `SystemExit(4)` (motor 2cf9d04): "RUN
+#     INTERROMPIDO POR EXCESSO DE FALHAS", "PASSE --youtube PARADO POR BLOQUEIO DO YOUTUBE",
+#     "YOUTUBE SUSPENSO NO PASSE", "VÍDEO(S) [DO YOUTUBE] VIERAM COMO INDISPONÍVEIS";
+#   - "RUN ABORTADO com N/M aulas concluídas:" SÓ com mensagem de disjuntor na mesma linha.
+#     SOZINHA ela não basta: o `run_course` a loga no `except (SessionLostError,
+#     CircuitBreakerError, LockPerdido)` — sessão morta, sonda inconclusiva (subclasse de
+#     SessionLostError, exit 5) e lock perdido também a imprimem.
+_RE_SAIDA_ABORT_DISJUNTOR = re.compile(
+    r"ABORT_DISJUNTOR\s+tipo="
+    r"|RUN INTERROMPIDO POR EXCESSO DE FALHAS"
+    r"|PARADO POR BLOQUEIO DO YOUTUBE"
+    r"|YOUTUBE SUSPENSO NO PASSE"
+    r"|VÍDEO\(S\)(?: DO YOUTUBE)? VIERAM COMO INDISPONÍVEIS"
+    r"|RUN ABORTADO com \d+/\d+ aulas concluídas: [^\n]*?"
+    r"(?:nas últimas \d+ aulas|NENHUMA funcionou|É a Claude ou o Notion falhando"
+    r"|NÃO é a plataforma do curso e NÃO é a conta)")
+
+
+def _saida_de_abort_do_disjuntor(texto) -> bool:
+    """A saída (sem exit code observável) é a de um `SystemExit(4)` do disjuntor do motor?"""
+    return bool(_RE_SAIDA_ABORT_DISJUNTOR.search(str(texto or "")))
+
+
+# SUSPENSÃO GLOBAL DOS PASSES DO YOUTUBE (rodada 2, item 7 — incidente REAL de 15/09): o passe
+# `--youtube` do Ciro Gestor abortou com exit 4 classe youtube às 11:07 ("Sign in to confirm
+# you're not a bot": o IP do Mac barrado) e foi redisparado às 11:07:50 e às 11:10:59 — cada
+# retentativa abria a conta Hotmart paga e batia de novo no YouTube, aprofundando o bloqueio.
+# O bloqueio é do IP, não do curso: vale para TODOS os cursos.
+#   - um exit 4 da classe `youtube` ABRE a suspensão: 3 h, dobrando a cada bloqueio novo dentro
+#     de 48 h do anterior, teto 24 h (degraus 3 → 6 → 12 → 24 h);
+#   - enquanto vale, o executor não escolhe o passe `--youtube` para curso nenhum (e não troca
+#     por uma sonda base quando o YouTube era o único trabalho);
+#   - vencida, sai UMA prova (o primeiro passe youtube disparado); os outros esperam o resultado:
+#     sucesso ou abort de outra classe ENCERRA a suspensão; bloqueio de novo REABRE no degrau
+#     seguinte. O degrau zera depois de 48 h sem bloqueio (avaliado no bloqueio seguinte);
+#   - o mesmo bloqueio visto por outro curso com a janela JÁ aberta não sobe degrau;
+#   - persistida no arquivo de estado (chave `youtube`), sobrevive ao reinício.
+# Memberkit/Greenn: o braço de áudio deles consulta o YouTube DENTRO do passe único (`base`) —
+# o daemon não distingue esse passe, e suspender o `base` pararia também as aulas Panda/Vimeo.
+# Um bloqueio visto neles abre a suspensão (o motor sai 4 classe youtube) e o porteiro do
+# próprio motor para o YouTube no resto do passe.
+_CHAVE_YOUTUBE = "__youtube__"         # no `estado` do loop (não é curso); em disco: "youtube"
+_YOUTUBE_SUSPENSAO_S = _env_float("ATHENA_YOUTUBE_SUSPENSAO_S", 10800.0, minimo=60.0,
+                                  maximo=_ESTADO_FUTURO_MAX_S)                 # 3 h
+_YOUTUBE_SUSPENSAO_TETO_S = _env_float("ATHENA_YOUTUBE_SUSPENSAO_TETO_S", 86400.0, minimo=60.0,
+                                       maximo=_ESTADO_FUTURO_MAX_S)            # 24 h
+_YOUTUBE_DEGRAU_ZERA_S = _env_float("ATHENA_YOUTUBE_DEGRAU_ZERA_S", 172800.0,
+                                    minimo=3600.0)                             # 48 h
+
+
+def _youtube_janela_s(degrau) -> float:
+    """A janela do degrau N: base × 2^(N-1), limitada pelo teto."""
+    teto = max(_YOUTUBE_SUSPENSAO_TETO_S, _YOUTUBE_SUSPENSAO_S)
+    return min(_YOUTUBE_SUSPENSAO_S * (2 ** max(int(degrau) - 1, 0)), teto)
+
+
+def _youtube_degrau_max() -> int:
+    """O primeiro degrau cuja janela já é o teto (com os padrões, 4 = 24 h)."""
+    n, teto = 1, max(_YOUTUBE_SUSPENSAO_TETO_S, _YOUTUBE_SUSPENSAO_S)
+    while _youtube_janela_s(n) < teto and n < 32:
+        n += 1
+    return n
+
+
+def _youtube_bloqueado(sy, agora) -> bool:
+    """Os passes do YouTube estão suspensos AGORA? Janela aberta, ou a prova em andamento. Uma
+    prova sem resultado há mais que o teto (resultado perdido) é descartada: libera nova prova."""
+    if not isinstance(sy, dict):
+        return False
+    if sy.get("prova_curso"):
+        if agora - float(sy.get("prova_desde") or 0.0) <= max(_YOUTUBE_SUSPENSAO_TETO_S,
+                                                              _YOUTUBE_SUSPENSAO_S):
+            return True
+        sy.pop("prova_curso", None)
+        sy.pop("prova_desde", None)
+    ate = sy.get("ate")
+    return ate is not None and agora < float(ate)
+
+
+def _youtube_abrir(sy, agora):
+    """(Re)abre a suspensão no degrau certo; devolve (degrau, ate)."""
+    ultimo = sy.get("ultimo_bloqueio")
+    if ultimo is not None and (agora - float(ultimo)) < _YOUTUBE_DEGRAU_ZERA_S:
+        degrau = min(int(sy.get("degrau") or 0) + 1, _youtube_degrau_max())
     else:
+        degrau = 1                                     # 48 h sem bloqueio: o degrau zera
+    sy["degrau"] = degrau
+    sy["ate"] = agora + _youtube_janela_s(degrau)
+    sy["ultimo_bloqueio"] = agora
+    sy.pop("prova_curso", None)
+    sy.pop("prova_desde", None)
+    return degrau, sy["ate"]
+
+
+def _texto_youtube_suspenso(ate, degrau) -> str:
+    return (f"YouTube bloqueou o IP do Mac — passes do YouTube suspensos até "
+            f"{time.strftime('%H:%M', time.localtime(float(ate)))} (degrau {degrau})")
+
+
+def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
+    """Depois da decisão da morte: abre/reabre/encerra a suspensão global do YouTube."""
+    sy = estado.get(_CHAVE_YOUTUBE)
+    exit4 = getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER
+    classe = (_classe_do_abort(getattr(obito, "stderr_bruto", "")
+                               or getattr(obito, "stderr_tail", "") or "") if exit4 else None)
+    prova = isinstance(sy, dict) and sy.get("prova_curso") == curso
+    if classe != "youtube":
+        if prova:                                      # a prova passou sem bloqueio do YouTube
+            sy.pop("prova_curso", None)
+            sy.pop("prova_desde", None)
+            sy.pop("ate", None)
+            _registrar(espinha, "suspensão dos passes do YouTube encerrada",
+                       f"a prova de {curso} terminou sem bloqueio do YouTube (exit "
+                       f"{getattr(obito, 'exit_code', None)})", reversivel=True,
+                       fonte="deterministico", curso=curso, origem="athena-local/youtube")
+        return
+    if not prova and _youtube_bloqueado(sy, agora):
+        return                                         # o MESMO bloqueio, visto por outro curso
+    sy = estado.setdefault(_CHAVE_YOUTUBE, {})
+    degrau, ate = _youtube_abrir(sy, agora)
+    texto = _texto_youtube_suspenso(ate, degrau)       # UMA vez por abertura
+    log.warning(texto)
+    if voz is not None:
         try:
-            valor = int(str(bruto).strip())
-        except (TypeError, ValueError):
-            log.warning("%s=%r não é inteiro — usando o default %s", nome, bruto, padrao)
-            valor = int(padrao)
-    if minimo is not None and valor < minimo:
-        log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
-        valor = int(minimo)
-    return valor
+            voz.escalar(Problema("youtube_suspenso", "youtube", texto, "aviso"), texto)
+        except Exception:
+            pass
+    _registrar(espinha, texto, f"exit 4 classe youtube em {curso} — o IP do Mac, não o curso: "
+               f"nenhum passe do YouTube até vencer; depois UMA prova",
+               tipo="escalada", reversivel=True, escalada=True, trava="youtube-global",
+               curso=curso, fonte="deterministico", origem="athena-local/youtube")
+
+
+def _serie_exit4_aberta(st, agora) -> bool:
+    """Há série de exit-4 de PLATAFORMA viva — com abort mais novo que a janela de decaimento?"""
+    if not st.get("exit4_seguidas"):
+        return False
+    if st.get("exit4_rearmado"):          # a UMA tentativa pós-bench ainda não rodou: não decai
+        return True
+    ultimo = st.get("exit4_ultimo")
+    return ultimo is not None and (agora - float(ultimo)) < _BENCH_EXIT4_EXPIRA_S
 
 
 # ESTADO DO DISJUNTOR EM DISCO (achado r15) — ANTI-BAN.
@@ -170,9 +427,19 @@ def _env_int(nome, padrao, *, minimo=None):
 #   cooldown_ate, _pend_no_cooldown   a janela de quiescido/sem-pendência + baseline
 #   ultimo_no_notion                  a régua do AVANÇO (sem ela, o 1º ciclo pós-boot
 #                                     não reconhece progresso e não re-arma o disjuntor)
+#   exit4_seguidas, exit4_ultimo,     a série de aborts de PLATAFORMA (com o instante do
+#   exit4_ate                         último, p/ decair) + a espera pós-exit-4 (15/09).
+#                                     CONTADOR e JANELA: sem eles cada reinício concedia
+#                                     uma série nova de 3 aborts a um curso em laço.
+#   exit4_rearmado                    a UMA tentativa pós-bench ainda não DISPAROU (rodada 2,
+#                                     item 4): a série não decai enquanto ela espera a conta.
+#   benched_exit4_ate                 o PRAZO do bench de exit-4. Com prazo, persistir é
+#                                     seguro (ele se solta sozinho); o latch booleano é
+#                                     reconstruído dele na passada — um reinício do vigia
+#                                     não encurta mais o castigo.
 #
-# O QUE NÃO É (de propósito): `irredutivel`, `benched_exit5`, `exit5_seguidas`, `fase`,
-# `ultima_causa` e os latches de alerta. São LATCHES cujo ÚNICO destravamento hoje, com
+# O QUE NÃO É (de propósito): `irredutivel`, `benched_exit5`, `benched_exit4`,
+# `exit5_seguidas`, `fase`, `ultima_causa` e os latches de alerta. São LATCHES cujo ÚNICO destravamento hoje, com
 # o zelador DESLIGADO por padrão, é o reinício do daemon (o `Zelador._rearmar` existe,
 # mas só roda com ATHENA_ZELADOR_ATIVO). Persistir um latch de reseed sem ter quem o
 # destrave transformaria "curso travado até o próximo boot" em "curso travado PARA
@@ -181,12 +448,10 @@ def _env_int(nome, padrao, *, minimo=None):
 # (O FLAP não entra aqui porque já é durável: `vigia._contar_flaps_anteriores` conta os
 # JSONs de autópsia em disco na janela, não um contador em memória.)
 _ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
-                         "_pend_no_cooldown", "ultimo_no_notion")
-# TETO DE SANIDADE do futuro: um valor corrompido (ou um relógio que andou para trás)
-# não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
-# DESCARTADO na leitura — 24h é o teto da escada e 24h é o cooldown sem-pendência, mais
-# uma folga generosa.
-_ESTADO_FUTURO_MAX_S = 2 * 86400.0
+                         "_pend_no_cooldown", "ultimo_no_notion", "exit4_seguidas",
+                         "exit4_ultimo", "exit4_ate", "benched_exit4_ate", "exit4_rearmado")
+# TETO DE SANIDADE do futuro: `_ESTADO_FUTURO_MAX_S`, definido junto das envs (lá em cima)
+# porque é também o teto das envs que geram prazos persistidos.
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +580,7 @@ def _registrar(espinha, o_que, por_que, **kw):
 # rotulado `medido=False` — a regra inviolável nº2 da espinha (nunca somar
 # presumido com medido). Uma classificação de causa-raiz é 1 chamada headless
 # curta; o proxy é conservador e serve só ao teto/observabilidade, jamais à fatura.
-_CUSTO_PROXY_CLAUDE_P_USD = float(os.getenv("ATHENA_CUSTO_PROXY_CLAUDE_P_USD", "0.02"))
+_CUSTO_PROXY_CLAUDE_P_USD = _env_float("ATHENA_CUSTO_PROXY_CLAUDE_P_USD", 0.02, minimo=0.0)
 
 
 def _safe_ativo(executor, curso_url) -> bool:
@@ -347,6 +612,19 @@ def _texto_bench(curso, n5) -> str:
             f"{rotulo_seguro(curso)} — curso PARADO. Ação: confira a URL desse curso no "
             f"YAML (provável malformada) ou o adaptador da plataforma. Não é o acesso da "
             f"conta: os demais cursos dela seguem; avanço real no Notion reabre este")
+
+
+def _texto_bench_exit4(curso, n4) -> str:
+    """Motivo do alerta ESSENCIAL de bench exit-4: QUAL curso parou, POR QUÊ (o disjuntor do
+    próprio motor abortou N runs seguidos por excesso de falhas) e O QUE fazer (olhar o
+    tracker/a plataforma à mão antes de reabrir). Mesmo contrato do `_texto_bench`: nenhuma
+    frase de sessão morta nem de credencial (o rótulo passa pelo `rotulo_seguro`)."""
+    horas = f"{_BENCH_EXIT4_EXPIRA_S / 3600:.0f}"
+    return (f"BENCH exit-4: {n4} aborts seguidos do disjuntor do motor (excesso de falhas) "
+            f"em {rotulo_seguro(curso)} — classe: {_ROTULO_CLASSE_EXIT4['plataforma']}. "
+            f"Curso PARADO: relançar abria aulas contra a mesma parede, o padrão que bane a "
+            f"conta. Ação: olhe o tracker e a plataforma à mão; os demais cursos da conta "
+            f"seguem; o bench se solta sozinho em {horas} h para UMA tentativa")
 
 
 def _plataforma_de(curso_url, meta_por_curso) -> str:
@@ -398,6 +676,9 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
             and acao == "aguardar_backoff"):
         st["_saida_limpa_ciclo"] = agora
         st.pop("exit5_seguidas", None)   # um run limpo prova a sonda sã: zera o bench
+        st.pop("exit4_seguidas", None)   # e o run que terminou sem abortar zera a série do exit-4
+        st.pop("exit4_ultimo", None)
+        st.pop("exit4_rearmado", None)
         return
 
     # MORTE SEM FALHA da captura (causa: `sem_falha` — reinício/desligamento do Mac
@@ -439,6 +720,8 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
         st["irredutivel"] = True
         st["esgotado_avisado"] = True                # o alerta typado abaixo já cobre
         st.pop("benched_exit5", None)                # o latch agora é de RESEED, não de bench
+        st.pop("benched_exit4", None)                # nem de exit-4: a EXPIRAÇÃO daquele bench
+        st.pop("benched_exit4_ate", None)            # nunca pode soltar uma sessão morta
         alertas.sessao_expirada(plat)
         st["fase"] = FASE_NOVO
         # E1: sessão morta → curso TRAVADO até reseed humano (irredutível, anti-ban).
@@ -506,6 +789,63 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
         disjuntor.registrar_falha(st, agora)
     except Exception:
         pass
+
+    # EXIT 4 (circuit-breaker do MOTOR) — trilha anti-ban 15/09, incidente codigoviral:
+    #   ESPERA: `exit4_ate` segura o relançamento por _ESPERA_EXIT4_S mesmo com o crédito de
+    #     tentativas livres do disjuntor (as 2 primeiras falhas não armam janela). Piso de 1 s:
+    #     a passada DESTE ciclo roda com o mesmo `agora`, então nem a env zerada relança no
+    #     ciclo da autópsia.
+    #   SÉRIE: `exit4_seguidas` conta os aborts; enquanto > 0 o avanço no Notion NÃO zera a
+    #     escada (o run que aborta produz aulas antes do disjuntor — era esse avanço que
+    #     apagava a falha que esta autópsia acabou de contar). Só uma SAÍDA LIMPA zera a série:
+    #     morte de outra causa não prova o curso são.
+    #   BENCH: no limiar, irredutível POR CURSO + alerta essencial, como o exit-5. O avanço no
+    #     Notion NÃO desbencha (é o sinal que o próprio laço produz, e num tenant Cademí o
+    #     Notion sobe por outros cursos da conta). Tem PRAZO (`benched_exit4_ate`, persistido):
+    #     ao vencer, a passada concede UMA tentativa e o próximo abort de plataforma rebencha.
+    #     NÃO marca `esgotado_avisado`: a escalada "captura_local_esgotada" da Voz segue saindo
+    #     (revisão 15/09 — o bench a calava, e era a única mensagem que chegava ao Telegram).
+    # CLASSE (revisão 15/09): só o abort de PAREDE DA PLATAFORMA conta série e bencha. O LOCAL
+    # (Claude/Notion/Groq) e o do YOUTUBE ganham a espera e a escada normal, mas nem contam nem
+    # quebram a série: não dizem nada sobre a plataforma. A classe e a espera vão no motivo
+    # que o dono lê — nada de mandar olhar a plataforma quando quem caiu foi o provedor.
+    # `escalar_token` fica FORA da série (mesma razão do exit-5): a chave é da API downstream,
+    # benchar engoliria o alerta "troque o token"; sem avanço no Notion a escada já espaça.
+    if getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER:
+        classe = _classe_do_abort(getattr(obito, "stderr_bruto", "")
+                                  or getattr(obito, "stderr_tail", "") or "")
+        espera = max(_ESPERA_EXIT4_S, 1.0)
+        st["exit4_ate"] = agora + espera
+        motivo_causa = (f"{motivo_causa or 'circuit-breaker do motor (exit 4)'} — classe: "
+                        f"{_ROTULO_CLASSE_EXIT4[classe]}; relanço só depois de {int(espera)} s")
+        if classe == "plataforma" and acao != "escalar_token":
+            ultimo = st.get("exit4_ultimo")
+            # a UMA tentativa pós-bench (item 4 da rodada 2) nunca decai: a espera pela conta
+            # não é tempo de curso são
+            recente = bool(st.pop("exit4_rearmado", None)) or (
+                ultimo is not None and (agora - float(ultimo)) < _BENCH_EXIT4_EXPIRA_S)
+            n4 = (int(st.get("exit4_seguidas", 0) or 0) + 1) if recente else 1  # DECAI
+            st["exit4_seguidas"] = n4
+            st["exit4_ultimo"] = agora
+            if n4 >= _BENCH_EXIT4_MIN:
+                st["irredutivel"] = True              # o disjuntor para SÓ este curso
+                st["benched_exit4"] = True
+                st["benched_exit4_ate"] = agora + _BENCH_EXIT4_EXPIRA_S
+                st.pop("benched_exit5", None)         # o desbench do exit-5 (avanço) não o solta
+                st["fase"] = FASE_NOVO
+                alertas.captura_morreu(plat, _texto_bench_exit4(curso, n4), essencial=True,
+                                       chave=("bench_exit4", curso))
+                # E16: bench por exit-4 em série — irredutível POR-CURSO, anti-ban.
+                _registrar(espinha, f"BENCH exit-4: travei {curso} após {n4} aborts "
+                           f"seguidos do disjuntor do motor",
+                           f"exit-4 em série, classe: {_ROTULO_CLASSE_EXIT4['plataforma']} — "
+                           f"relançar martelaria a plataforma; avanço no Notion NÃO desbencha; "
+                           f"expira em {int(_BENCH_EXIT4_EXPIRA_S)} s",
+                           tipo="escalada", reversivel=True, escalada=True,
+                           trava="bench-exit4", curso=curso, plataforma=plat,
+                           fonte=fonte_causa, origem="athena-local/causa")
+                return
+
     if acao == "escalar_token":
         # ESSENCIAL (só o dono troca a chave) + dedup por curso: o backoff re-tenta
         # e re-morre na mesma chave ruim — 1 ping por janela basta.
@@ -592,7 +932,7 @@ def _anotar_causa_na_autopsia(obito, decisao, plataforma):
 
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
                      autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None,
-                     boot_ts=None):
+                     boot_ts=None, voz=None):
     """Passe de AUTÓPSIA do ciclo: drena os óbitos do executor, roda o vigia (que também
     varre `lock_dir` por mortes de encarnações anteriores), classifica cada óbito pela
     causa-raiz e aplica a decisão ao `st` do curso. Best-effort: um erro aqui NÃO derruba
@@ -626,6 +966,15 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
         if not curso:
             continue
         st = estado.setdefault(curso, {})
+        # ÓRFÃ QUE ABORTOU NO DISJUNTOR (rodada 2, item 2): sem exit code, a saída inteira diz
+        # se foi o exit 4 — e aí ela é autopsiada COMO exit 4 (causa, espera, série, bench),
+        # em vez de cair no "desconhecida" e ser relançada no ciclo da autópsia.
+        if getattr(obito, "exit_code", None) is None and _saida_de_abort_do_disjuntor(
+                getattr(obito, "stderr_bruto", "") or getattr(obito, "stderr_tail", "") or ""):
+            try:
+                obito = dataclasses.replace(obito, exit_code=_EXIT_CIRCUIT_BREAKER)
+            except TypeError:
+                pass                                       # dublê que não é dataclass: segue
         try:
             # `plataforma=` (item 4 da r15): o abort por excesso de falhas do motor diz
             # "Algo está sistematicamente errado do lado da Hotmart" em TODA plataforma.
@@ -657,6 +1006,11 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
         _aplicar_decisao(curso, st, obito, decisao, disjuntor=disjuntor,
                          alertas=alertas, agora=agora, meta_por_curso=meta_por_curso,
                          flap_min=flap_min, espinha=espinha)
+        # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): best-effort — nunca derruba o ciclo
+        try:
+            _observar_youtube(estado, curso, obito, agora=agora, voz=voz, espinha=espinha)
+        except Exception:
+            log.warning("não avaliei a suspensão do YouTube para %s", curso, exc_info=True)
 
 
 def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st, *, espinha=None):
@@ -690,7 +1044,8 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
       1. já CONCLUIDO -> None (idempotente).
       2. lê a contagem-verdade do Notion. Ilegível -> escala honesto, NÃO dispara às cegas.
       3. AVANÇO detectado (no_notion subiu) -> `disjuntor.registrar_sucesso` re-arma o
-         recozimento (backoff volta ao degrau zero).
+         recozimento (backoff volta ao degrau zero) — EXCETO com série de exit-4 aberta:
+         aí só a saída limpa que produziu re-arma (o run que aborta também produz).
       4. COMPLETO no Notion (no_notion >= total, total>0) -> anti-dup por COMPLETUDE.
       5. processo AINDA ativo -> quieto (None): captura em andamento (anti-ban/disjuntor).
       5b. a CONTA tem óbito colhido e ainda não autopsiado (reap no meio da passada) ->
@@ -698,7 +1053,10 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
          contagem, sem re-disparo antes da causa).
       6. FALLBACK de morte: estava CAPTURANDO, não está mais ativo, e a autópsia do ciclo
          NÃO tratou -> conta uma falha (backoff) e volta a NOVO (never-stop).
+      6b. BENCH de exit-4 com prazo: dentro dele o latch vale (reconstruído após reinício);
+         vencido, solta para UMA tentativa.
       7. `disjuntor.pode_tentar` FECHADO (teto/backoff/irredutível) -> escala UMA vez (latch).
+      7b. ESPERA pós-exit-4 (`exit4_ate`) ainda correndo -> quieto (None), sem disparar.
       8. senão -> DISPARA. `ContaOcupada` (anti-ban) => aguarda a vez (None). Falha/silêncio
          do disparo -> escala honesto. `MaquinaSobrecarregada` (portão de carga) => ADIADO
          neste ciclo (None): NÃO é falha (sem disjuntor/flap/tentativa, sem alerta por
@@ -735,10 +1093,16 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         if no_notion is not None:
             prev = st.get("ultimo_no_notion")
             if prev is not None and int(no_notion) > int(prev):
-                try:
-                    disjuntor.registrar_sucesso(st)
-                except Exception:
-                    pass
+                # SÉRIE DE EXIT-4 ABERTA: o avanço NÃO zera a escada. O run que aborta no
+                # disjuntor do motor produz aulas ANTES de abortar — este avanço apagava a
+                # falha que a autópsia deste mesmo ciclo acabou de contar (codigoviral, 17
+                # disparos). Quem re-arma, nesse caso, é a saída limpa que produziu (abaixo).
+                # Série DECAÍDA (último abort mais velho que a janela) não segura mais nada.
+                if not _serie_exit4_aberta(st, agora):
+                    try:
+                        disjuntor.registrar_sucesso(st)
+                    except Exception:
+                        pass
                 st.pop("cooldown_ate", None)               # AVANÇO real: sai do cooldown (há trabalho)
                 st.pop("exit5_seguidas", None)             # a captura PRODUZIU: sonda sã, zera o bench
                 if st.pop("benched_exit5", None):          # DESBENCH (never-stop): avanço real
@@ -803,6 +1167,14 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                                "saída limpa (exit 0) sem avanço no Notion",
                                reversivel=True, fonte="deterministico", curso=curso,
                                plataforma=plat, origem="athena-local/passada")
+                else:
+                    # o run terminou SEM abortar e PRODUZIU: é o sucesso que o avanço lido em
+                    # voo não pôde registrar enquanto a série de exit-4 estava aberta. Idempotente
+                    # no caso comum (o avanço em voo já tinha zerado a escada).
+                    try:
+                        disjuntor.registrar_sucesso(st)
+                    except Exception:
+                        pass
                 st["fase"] = FASE_NOVO
             elif st.get("_morte_ciclo") != agora:
                 # FALLBACK de MORTE (default/no-autópsia): caiu sem saída-limpa e a autópsia
@@ -854,6 +1226,34 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return None
         if pend is not None and pend > 0:
             st.pop("sem_pendencia_avisado", None)           # há trabalho: re-arma o latch
+        # BENCH DE EXIT-4 COM PRAZO (revisão 15/09): dentro do prazo, o latch vale — e é
+        # RECONSTRUÍDO aqui depois de um reinício (só o prazo atravessa o disco). Vencido,
+        # solta o bench para UMA tentativa sob a escada normal, com a série re-armada no
+        # limiar menos um: o próximo abort de plataforma rebencha na hora. Nunca solta um
+        # latch de reseed nem um bench de exit-5 (esses não passam por aqui soltos).
+        prazo = st.get("benched_exit4_ate")
+        if prazo is not None:
+            if agora < float(prazo):
+                st["benched_exit4"] = True
+                st["irredutivel"] = True
+            else:
+                st.pop("benched_exit4_ate", None)
+                st.pop("benched_exit4", None)
+                if not st.get("benched_exit5") and st.get("ultima_causa") != "escalar_reseed":
+                    st.pop("irredutivel", None)
+                st.pop("esgotado_avisado", None)           # o próximo fechamento escala de novo
+                st["exit4_seguidas"] = max(_BENCH_EXIT4_MIN - 1, 0)
+                st["exit4_ultimo"] = agora
+                # PENDENTE até DISPARAR (rodada 2, item 4): com a conta ocupada por outro curso
+                # por mais que a janela, a série decairia antes de a tentativa rodar e o abort
+                # dela viraria série nova. O relógio do decaimento só recomeça no disparo.
+                st["exit4_rearmado"] = 1
+                # E17: bench de exit-4 expirou — UMA tentativa (never-stop com prazo).
+                _registrar(esp, f"bench exit-4 de {curso} expirou — UMA tentativa",
+                           f"prazo de {int(_BENCH_EXIT4_EXPIRA_S)} s vencido; o próximo abort "
+                           f"de parede da plataforma rebencha na hora",
+                           reversivel=True, fonte="deterministico", curso=curso,
+                           plataforma=plat, origem="athena-local/passada")
         try:
             pode = disjuntor.pode_tentar(st, agora)
         except Exception:
@@ -863,6 +1263,18 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                       f"ativo — DISJUNTOR ABERTO (teto/backoff/irredutível): paro de "
                       f"disparar e escalo (não martelo). Re-arma quando o backoff expira / "
                       f"há avanço; irredutível (reseed/token) só o humano destrava.")
+            prazo_bench = st.get("benched_exit4_ate") if st.get("benched_exit4") else None
+            if prazo_bench is not None:
+                # BENCH DE EXIT 4 (rodada 2, item 5): no `mudo` esta é a ÚNICA mensagem que sai
+                # para o dono, e "só o humano destrava" é falso aqui — o bench vence sozinho.
+                # A voz diz a classe, a hora do vencimento e que nenhuma ação reabre nada.
+                quando = time.strftime("%d/%m %H:%M", time.localtime(float(prazo_bench)))
+                pedido = (f"[{projeto_nome}] {curso} SUSPENSO por aborts seguidos do "
+                          f"disjuntor do motor — classe: {_ROTULO_CLASSE_EXIT4['plataforma']}. "
+                          f"Não disparo até {quando}; aí o bench vence SOZINHO e reabre para "
+                          f"UMA tentativa (outro abort de parede rebencha). Nenhuma ação é "
+                          f"necessária para reabrir; olhar o tracker e a plataforma à mão "
+                          f"adianta a causa.")
             if not st.get("esgotado_avisado"):
                 voz.escalar(Problema("captura_local_esgotada", curso, pedido, "critico"),
                             pedido)
@@ -875,6 +1287,13 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                            origem="athena-local/passada")
             return Acao("", False, True, pedido)
         st["esgotado_avisado"] = False                     # disjuntor reabriu: re-arma o latch
+        # ESPERA pós-exit-4 (anti-ban 15/09): o curso que acabou de abortar no disjuntor do
+        # motor NÃO volta à plataforma antes da janela — nem no ciclo da própria autópsia,
+        # nem sob o crédito de tentativas livres do disjuntor. Fica DEPOIS do gate do
+        # disjuntor de propósito (revisão 15/09): um curso benchado/de escada fechada escala
+        # pela Voz no ciclo da autópsia, como antes; a espera só segura o DISPARO.
+        if agora < float(st.get("exit4_ate", 0.0) or 0.0):
+            return None
         try:
             conf = executor.disparar(curso)
         except captura.MaquinaSobrecarregada as e:
@@ -945,6 +1364,23 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return Acao("", False, True, pedido)
         st["tentativas"] = st.get("tentativas", 0) + 1
         st["fase"] = FASE_CAPTURANDO
+        if st.pop("exit4_rearmado", None):                 # a UMA tentativa pós-bench DISPAROU:
+            st["exit4_ultimo"] = agora                     # o decaimento conta daqui
+        # A PROVA DO YOUTUBE (rodada 2, item 7): a suspensão venceu e este é o primeiro passe
+        # `--youtube` a sair — ele é a prova. Os demais cursos ficam bloqueados JÁ neste ciclo,
+        # até a autópsia dele dizer o resultado.
+        sy = estado.get(_CHAVE_YOUTUBE)
+        if (isinstance(sy, dict) and sy.get("ate") is not None and not sy.get("prova_curso")
+                and str(conf).endswith(":passe=youtube")):
+            sy["prova_curso"] = curso
+            sy["prova_desde"] = agora
+            _bloq = getattr(executor, "bloquear_passe_youtube", None)
+            if callable(_bloq):
+                _bloq(True)
+            _registrar(esp, f"prova do YouTube: {curso}",
+                       "a suspensão venceu — UM passe do YouTube sai; os outros esperam o "
+                       "resultado dele", reversivel=True, fonte="deterministico", curso=curso,
+                       plataforma=plat, origem="athena-local/youtube")
         # Marca-d'água do Notion no disparo: se a saída-limpa não a ultrapassar, o run nada
         # produziu (curso quiescido -> cooldown); se ultrapassar, houve progresso (segue).
         st["_no_notion_no_disparo"] = st.get("ultimo_no_notion")
@@ -966,7 +1402,7 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
 # ===========================================================================
 # Frescor do heartbeat: acima disso, com run "ativo", o run está TRAVADO (processo
 # vivo mas parado) — matar é seguro (sistema não tem sessão/anti-ban). Default 15min.
-_HEARTBEAT_LIMIAR_S = float(os.getenv("ATHENA_SISTEMA_HEARTBEAT_S", "900"))
+_HEARTBEAT_LIMIAR_S = _env_float("ATHENA_SISTEMA_HEARTBEAT_S", 900.0, minimo=1.0)
 # Proxy conservador de custo quando o resultado.json não traz custo (nunca deve,
 # mas fail-safe): 0 medido, 0 presumido — o resultado.json é a fonte-verdade.
 
@@ -1014,7 +1450,7 @@ def _build_mais_recente(raiz):
 _BUDGET_MODO = os.getenv("ATHENA_BUDGET_MODO", "alerta")
 # Proxy de custo do brainstorm `claude -p` antes de escalar — SEMPRE medido=False
 # (regra inviolável nº2: jamais somar presumido com medido).
-_CUSTO_PROXY_BRAINSTORM_USD = float(os.getenv("ATHENA_CUSTO_PROXY_BRAINSTORM_USD", "0.05"))
+_CUSTO_PROXY_BRAINSTORM_USD = _env_float("ATHENA_CUSTO_PROXY_BRAINSTORM_USD", 0.05, minimo=0.0)
 
 # Classes de trava do ledger que são DEFEITO DE ENGENHARIA → reconstruir (§E.1).
 _TRAVAS_ENGENHARIA = frozenset({
@@ -1657,7 +2093,8 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
                 continue
             if valor != valor or valor in (float("inf"), float("-inf")):
                 continue                               # NaN/inf
-            if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown"):
+            if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown",
+                         "exit4_seguidas", "exit4_rearmado"):  # contadores; os demais: instantes
                 if valor < 0:
                     continue
                 limpo[chave] = int(valor)
@@ -1672,6 +2109,47 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
     return saida
 
 
+_ESTADO_YOUTUBE_INSTANTES = ("ate", "ultimo_bloqueio", "prova_desde")
+
+
+def _carregar_estado_youtube(path, *, agora) -> dict:
+    """A suspensão global do YouTube persistida (chave `youtube` do arquivo de estado), ou {}.
+    Tolerante como `_carregar_estado_cursos`: arquivo ausente/ilegível, chave ausente (versão
+    antiga) ou de outro tipo => {}; cada campo é saneado sozinho (instante finito e não além de
+    `_ESTADO_FUTURO_MAX_S`; degrau inteiro >= 1; prova = URL não vazia). Nunca levanta."""
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            dados = json.load(f)
+    except Exception:
+        return {}
+    sy = dados.get("youtube") if isinstance(dados, dict) else None
+    if not isinstance(sy, dict):
+        return {}
+    limpo = {}
+    for chave in _ESTADO_YOUTUBE_INSTANTES:
+        valor = sy.get(chave)
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+            continue
+        try:
+            valor = float(valor)
+        except (OverflowError, ValueError):
+            continue
+        if not math.isfinite(valor) or valor > agora + _ESTADO_FUTURO_MAX_S:
+            continue
+        limpo[chave] = valor
+    degrau = sy.get("degrau")
+    if isinstance(degrau, int) and not isinstance(degrau, bool) and degrau >= 1:
+        limpo["degrau"] = degrau
+    prova = sy.get("prova_curso")
+    if isinstance(prova, str) and prova and "prova_desde" in limpo:
+        limpo["prova_curso"] = prova
+    else:
+        limpo.pop("prova_desde", None)
+    return limpo
+
+
 def _gravar_estado_cursos(path, estado) -> None:
     """Grava as chaves da lista branca de cada curso (troca atômica). Best-effort: uma
     falha vira WARNING no loop.err — a captura segue, só a sobrevivência da escada ao
@@ -1681,7 +2159,7 @@ def _gravar_estado_cursos(path, estado) -> None:
     try:
         cursos = {}
         for curso, st in (estado or {}).items():
-            if not isinstance(st, dict):
+            if curso == _CHAVE_YOUTUBE or not isinstance(st, dict):
                 continue
             linha = {k: st[k] for k in _ESTADO_CURSOS_CHAVES
                      if isinstance(st.get(k), (int, float))
@@ -1693,7 +2171,12 @@ def _gravar_estado_cursos(path, estado) -> None:
             os.makedirs(pasta, exist_ok=True)
         tmp = f"{path}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"versao": 1, "gravado_em": time.time(), "cursos": cursos}, f)
+            registro = {"versao": 1, "gravado_em": time.time(), "cursos": cursos}
+            sy = (estado or {}).get(_CHAVE_YOUTUBE)
+            if isinstance(sy, dict) and sy:                # suspensão global do YouTube (item 7)
+                registro["youtube"] = {k: v for k, v in sy.items()
+                                       if k in _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso")}
+            json.dump(registro, f)
         os.replace(tmp, path)
     except Exception as e:
         log.warning("não gravei o estado dos cursos em %s (%s: %s) — um reinício zeraria "
@@ -1854,7 +2337,15 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     _autopsiar_ciclo(executor, estado, vigia=vigia, causa=causa, disjuntor=disjuntor,
                      alertas=alertas, lock_dir=lock_dir, autopsia_dir=autopsia_dir,
                      agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min,
-                     llm=llm, espinha=espinha, boot_ts=boot_ts)
+                     llm=llm, espinha=espinha, boot_ts=boot_ts, voz=voz)
+    # (3b) SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): DEPOIS da autópsia (que abre/encerra)
+    # e ANTES das passadas, o executor sabe se pode escolher o passe `--youtube` neste ciclo.
+    _bloquear_youtube = getattr(executor, "bloquear_passe_youtube", None)
+    if callable(_bloquear_youtube):
+        try:
+            _bloquear_youtube(_youtube_bloqueado(estado.get(_CHAVE_YOUTUBE), agora))
+        except Exception:
+            pass
 
     # (4) passada LOCAL + owner. FRONTEIRA DE CICLO do portão de carga: a janela do
     # ESCALONAMENTO (no máx N disparos novos por ciclo na saída da sobrecarga) vira AQUI,
@@ -2066,6 +2557,13 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     except Exception:
         log.warning("não restaurei o estado dos cursos — a escada do disjuntor "
                     "recomeça do zero nesta encarnação", exc_info=True)
+    # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o reinício não solta o IP do Mac barrado
+    try:
+        sy = _carregar_estado_youtube(estado_cursos_path, agora=time.time())
+        if sy:
+            estado[_CHAVE_YOUTUBE] = sy
+    except Exception:
+        log.warning("não restaurei a suspensão do YouTube", exc_info=True)
     if "desde" in estado_carga:
         _retomar = getattr(executor, "retomar_sobrecarga", None)
         if callable(_retomar):
@@ -2454,7 +2952,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     estado_cursos_path = os.getenv("ATHENA_ESTADO_CURSOS_PATH",
                                    os.path.join(base, "estado_cursos.json"))
     lock_dir_efetivo = lock_dir or os.path.join(base, "locks")
-    batimento_intervalo = float(os.getenv("ATHENA_BATIMENTO_S", "1800"))
+    batimento_intervalo = _env_float("ATHENA_BATIMENTO_S", 1800.0, minimo=0.0)
     # DIAGNÓSTICO por LLM da causa-raiz DESCONHECIDA: OFF por padrão (fail-closed ->
     # escalar_humano). Ligar com ATHENA_CAUSA_LLM=1 faz uma morte de causa desconhecida
     # chamar `claude -p` (subprocesso REAL, custo/tempo) para classificar. Deixado como

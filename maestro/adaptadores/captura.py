@@ -26,6 +26,7 @@ nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -714,6 +715,50 @@ _PLATAFORMAS = {
 # config dele; é fiação interna do supervisor). O seam de spawn injetado (testes) ignora
 # a chave, então o contrato `(cmd, *, env, cwd)` fica intacto.
 _ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
+
+# CADÊNCIA DO MOTOR (anti-ban 15/09, achado F1): nenhum CLI disparado pelo daemon passava
+# pacer ao `run_course`, e ninguém definia TEXT_CONCURRENCY — o semáforo do motor ficava em
+# 4: quatro páginas de aula abertas ao mesmo tempo na conta paga, uma atrás da outra. O
+# daemon crava em TODO disparo (`_montar`, junto dos INVIOLÁVEIS): concorrência
+# ATHENA_MOTOR_CONCORRENCIA (default 1, TETO 2 — vence o TEXT_CONCURRENCY herdado do
+# `aula/.env` que o launch.sh carrega e o extra_env) e a cadência do `motor.pacing` com PISO
+# nos defaults dele (3 s + até 2 s de jitter entre os STARTs de aula): herdar 0/lixo não
+# desliga a cadência; herdar mais que o piso vale. A concorrência age já em todos os CLIs
+# (todos leem TEXT_CONCURRENCY); a cadência, no motor que monta o pacer por padrão no
+# `run_course` (branch antiban-motor) — num motor antigo a env é inerte, nunca nociva.
+_CONCORRENCIA_MOTOR_PADRAO = 1
+_CONCORRENCIA_MOTOR_TETO = 2
+_CADENCIA_PISOS_S = (("CAPTURE_PACING_MIN_S", 3.0), ("CAPTURE_PACING_JITTER_S", 2.0))
+# TETO da cadência (revisão 15/09): um 1e9 herdado passava pelo `isfinite` e cada aula
+# esperaria décadas — a captura parava calada, sem erro nenhum para a autópsia ver.
+_CADENCIA_TETO_S = 60.0
+
+
+def _cravar_cadencia_do_motor(env) -> None:
+    """Aplica o contrato de concorrência/cadência sobre o `env` do disparo (muta). Nunca
+    levanta: valor ilegível cai no padrão (concorrência) ou no piso (cadência)."""
+    bruto = str(env.get("ATHENA_MOTOR_CONCORRENCIA") or "").strip()
+    try:
+        n = int(bruto) if bruto else _CONCORRENCIA_MOTOR_PADRAO
+    except ValueError:
+        n = _CONCORRENCIA_MOTOR_PADRAO
+    env["TEXT_CONCURRENCY"] = str(min(max(n, 1), _CONCORRENCIA_MOTOR_TETO))
+    for nome, piso in _CADENCIA_PISOS_S:
+        bruto = str(env.get(nome) or "").strip()
+        try:
+            valor = float(bruto) if bruto else piso
+        except ValueError:
+            valor = piso
+        if not math.isfinite(valor) or valor < piso:        # 0, negativo, nan, inf
+            valor = piso
+        env[nome] = str(min(valor, _CADENCIA_TETO_S))
+
+
+class PasseYoutubeSuspenso(ContaOcupada):
+    """SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7 da trilha anti-ban): o único trabalho do
+    curso é o passe `--youtube` e o YouTube está bloqueado para o IP do Mac. Aguarda (não é
+    falha: sem disjuntor, tentativa nem escalada) — e NÃO vira sonda `base`, que abriria a
+    conta à toa."""
 
 
 # PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 5) E pela Stoa
@@ -1756,6 +1801,9 @@ class LocalExecutor:
         # em vez de fixar sempre o 1º). In-memory: perda no restart é benigna (recomeça do
         # início do anel). NÃO afeta o anti-ban (o guard é o lock durável em disco).
         self._passe_cursor = {}
+        # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o loop diz a cada ciclo (e na hora da
+        # prova) se o passe `--youtube` pode ser escolhido. False = comportamento de sempre.
+        self._youtube_bloqueado = False
         # Override de diretório do motor POR PLATAFORMA (ex.: Stoa vive no worktree
         # adaptador-stoa, não em /aula). Default = self._motor_dir para as demais.
         self._motor_dir_por_plataforma = dict(motor_dir_por_plataforma or {})
@@ -2676,7 +2724,12 @@ class LocalExecutor:
         if len(passes) == 1:
             return passes[0]                               # áudio-nativos: NADA muda
         ativaveis = [p for p in passes if _passe_ativavel(p, meta.plataforma)]
-        if len(ativaveis) == 1:
+        # SUSPENSÃO GLOBAL DO YOUTUBE (item 7): o `--youtube` sai do anel enquanto o IP do Mac
+        # está barrado; os passes que não tocam o YouTube seguem.
+        youtube_suspenso = self._youtube_bloqueado and "youtube" in ativaveis
+        if youtube_suspenso:
+            ativaveis = [p for p in ativaveis if p != "youtube"]
+        if len(ativaveis) == 1 and not youtube_suspenso:
             # Um único passe ativável (ex.: Stoa com o gate ATHENA_STOA_PASSES_ATIVO
             # desligado => só "base"): a escolha está decidida — NÃO consulta pendências
             # (poupa a query SQLite e mantém o caminho de execução IDÊNTICO ao de antes
@@ -2693,6 +2746,10 @@ class LocalExecutor:
         else:
             candidatos = [p for p in ativaveis if pend.get(p, 0) > 0]
         if not candidatos:
+            if youtube_suspenso and pend is not None and pend.get("youtube", 0) > 0:
+                raise PasseYoutubeSuspenso(
+                    f"conta {meta.conta!r}: só há passe do YouTube na fila e o YouTube está "
+                    f"suspenso para o IP do Mac — aguardo a janela (sem sonda base)")
             return "base"                                  # nada elegível: sonda base
         return self._proximo_no_anel(meta.conta, passes, candidatos)
 
@@ -2706,6 +2763,11 @@ class LocalExecutor:
                 self._passe_cursor[conta] = (idx + 1) % len(passes)
                 return passes[idx]
         return candidatos[0]                               # inalcançável (candidatos ⊆ passes)
+
+    def bloquear_passe_youtube(self, bloqueado) -> None:
+        """SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o loop liga/desliga a escolha do
+        passe `--youtube` para TODOS os cursos (a decisão e o estado moram no loop)."""
+        self._youtube_bloqueado = bool(bloqueado)
 
     def _checar_host_e_credencial(self, meta, spec):
         """Última linha de defesa do host e da credencial (LEVANTA RuntimeError => nada é
@@ -2844,6 +2906,9 @@ class LocalExecutor:
         env["WHISPER_BACKEND"] = "groq"                    # INVIOLÁVEL Groq (vence extra_env)
         if self._groq_key:
             env["GROQ_API_KEY"] = self._groq_key
+        # INVIOLÁVEL anti-ban (15/09): concorrência <= 2 e piso de espaçamento entre as
+        # aulas — vence o ambiente herdado e o extra_env, como o Groq.
+        _cravar_cadencia_do_motor(env)
         # ISOLAMENTO DE NAVEGADOR (anti-ban): Stoa/Kajabi no Chromium EMBUTIDO (não colide
         # com o Chrome do sistema do Hotmart no singleton do macOS); Hotmart/Memberkit
         # seguem channel=chrome. Popar quando não-chromium GARANTE channel=chrome mesmo que

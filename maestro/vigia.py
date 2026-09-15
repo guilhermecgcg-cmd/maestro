@@ -35,7 +35,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, asdict, replace
+from dataclasses import dataclass, asdict, field, replace
 from datetime import datetime
 from typing import Optional
 
@@ -46,6 +46,12 @@ _AUTOPSIA_DIR_PADRAO = os.path.join(
 _JANELA_FLAP_S = 30 * 60          # 30 min — a janela do flapping
 _FLAP_MIN = 3                     # >= 3 mortes na janela = flapping
 _STDERR_LINHAS = 40              # quantas linhas de tail do stderr guardar
+# CAUDA BRUTA (rodada 2 da trilha anti-ban, 15/09): os últimos caracteres da MESMA saída, sem
+# o corte de linhas — o que o executor já copia no reap (`captura._CAUDA_REAP_BYTES`, 64 KB).
+# A classe de um abort (parede/local/YouTube) é decidida sobre ela: o ruído de encerramento
+# (httpx, yt-dlp, call log do Playwright) empurra a frase do abort para fora das 40 linhas.
+# Só em memória: NÃO vai para o JSON da autópsia (seriam 64 KB por morte em disco).
+_STDERR_BRUTO_CHARS = 64 * 1024
 # Folga entre o .err e o lock do MESMO disparo. O `_spawn_popen` TRUNCA o .err da conta
 # ("wb") logo ANTES do Popen e o lock com o PID é gravado logo DEPOIS — o .err de um
 # disparo nunca é mais velho que o lock dele além do tempo do Popen. Um .err mais velho
@@ -111,6 +117,9 @@ class Obito:
     lock_mtime: Optional[float] = None
     boot_ts: Optional[float] = None
     lock_antes_do_boot: bool = False
+    # a saída SEM o corte de linhas (últimos `_STDERR_BRUTO_CHARS`), para quem precisa ler
+    # além das 40 linhas (a classe do exit 4). Fora do JSON e do repr.
+    stderr_bruto: str = field(default="", repr=False, compare=False)
 
 
 # --------------------------------------------------------------------------
@@ -229,8 +238,8 @@ def boot_ts_do_mac():
     return None
 
 
-def _stderr_tail(fonte: FonteFilho, n_linhas: int) -> str:
-    """Últimas `n_linhas` do stderr do filho. `stderr_tail` explícito vence o path."""
+def _texto_da_fonte(fonte: FonteFilho) -> str:
+    """A saída inteira que se tem do filho. `stderr_tail` explícito vence o path."""
     texto = fonte.stderr_tail
     if texto is None and fonte.stderr_path:
         try:
@@ -238,6 +247,12 @@ def _stderr_tail(fonte: FonteFilho, n_linhas: int) -> str:
                 texto = f.read()
         except OSError:
             texto = ""
+    return texto or ""
+
+
+def _stderr_tail(fonte: FonteFilho, n_linhas: int) -> str:
+    """Últimas `n_linhas` do stderr do filho. `stderr_tail` explícito vence o path."""
+    texto = _texto_da_fonte(fonte)
     if not texto:
         return ""
     linhas = texto.splitlines()
@@ -287,6 +302,7 @@ def _gravar_autopsia(autopsia_dir, obito: Obito, ts_epoch: float, detectado_por:
     os.makedirs(autopsia_dir, exist_ok=True)
     rec = asdict(obito)
     rec.pop("autopsia_path", None)        # o arquivo não aponta para si mesmo
+    rec.pop("stderr_bruto", None)         # só em memória: o disco guarda as 40 linhas
     rec["ts_epoch"] = ts_epoch
     rec["detectado_por"] = detectado_por
     carimbo = datetime.fromtimestamp(ts_epoch).strftime("%Y%m%dT%H%M%S_%f")
@@ -391,6 +407,7 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
 
         curso = fonte.curso or (lock.get("course_url") if lock else "") or ""
         stderr_tail = _stderr_tail(fonte, stderr_linhas)
+        stderr_bruto = _texto_da_fonte(fonte)[-_STDERR_BRUTO_CHARS:]
         ts_iso = datetime.fromtimestamp(agora).isoformat()
 
         # SAÍDA LIMPA (exit_code == 0): o filho encerrou SEM erro — NÃO é morte. É o run de
@@ -404,12 +421,13 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
             flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s)
             obitos.append(Obito(conta=conta, curso=curso, exit_code=0,
                                 stderr_tail=stderr_tail, flaps_na_janela=flaps,
-                                ts=ts_iso, saida_limpa=True))
+                                ts=ts_iso, saida_limpa=True, stderr_bruto=stderr_bruto))
             continue
 
         flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) + 1
         obito = Obito(conta=conta, curso=curso, exit_code=fonte.exit_code,
                       stderr_tail=stderr_tail, flaps_na_janela=flaps, ts=ts_iso,
+                      stderr_bruto=stderr_bruto,
                       lock_mtime=lock_mtime, boot_ts=boot_do_mac,
                       lock_antes_do_boot=lock_antes_do_boot)
         path = _gravar_autopsia(autopsia_dir, obito, ts_epoch=agora,

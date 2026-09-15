@@ -135,10 +135,10 @@ _CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
 _CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "1800"))
 
 
-def _env_int(nome, padrao, *, minimo=None):
+def _env_int(nome, padrao, *, minimo=None, maximo=None):
     """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
-    caso ilegível); abaixo de `minimo` => `minimo` (com WARNING). Uma variável de ambiente
-    mal digitada nunca pode impedir o daemon de subir."""
+    caso ilegível); abaixo de `minimo` => `minimo` e acima de `maximo` => `maximo` (com
+    WARNING). Uma variável de ambiente mal digitada nunca pode impedir o daemon de subir."""
     bruto = os.getenv(nome)
     if bruto is None or not str(bruto).strip():
         valor = int(padrao)
@@ -151,13 +151,17 @@ def _env_int(nome, padrao, *, minimo=None):
     if minimo is not None and valor < minimo:
         log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
         valor = int(minimo)
+    if maximo is not None and valor > maximo:
+        log.warning("%s=%s acima do máximo %s — usando %s", nome, valor, maximo, maximo)
+        valor = int(maximo)
     return valor
 
 
-def _env_float(nome, padrao, *, minimo=None):
+def _env_float(nome, padrao, *, minimo=None, maximo=None):
     """Irmão do `_env_int` para segundos: ausente/vazio => `padrao`; ilegível, nan ou inf =>
     `padrao` com WARNING (um `inf` numa janela de bench seria um bench PERMANENTE); abaixo
-    de `minimo` => `minimo` com WARNING. Nunca levanta no import."""
+    de `minimo` => `minimo` e acima de `maximo` => `maximo`, com WARNING. Nunca levanta no
+    import."""
     bruto = os.getenv(nome)
     if bruto is None or not str(bruto).strip():
         valor = float(padrao)
@@ -173,7 +177,19 @@ def _env_float(nome, padrao, *, minimo=None):
     if minimo is not None and valor < minimo:
         log.warning("%s=%s abaixo do mínimo %s — usando %s", nome, valor, minimo, minimo)
         valor = float(minimo)
+    if maximo is not None and valor > maximo:
+        log.warning("%s=%s acima do máximo %s — usando %s", nome, valor, maximo, maximo)
+        valor = float(maximo)
     return valor
+
+
+# TETO DE SANIDADE do futuro no ESTADO EM DISCO: um valor corrompido (ou um relógio que andou
+# para trás) não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
+# DESCARTADO na leitura (`_carregar_estado_cursos`) — 24h é o teto da escada e 24h é o
+# cooldown sem-pendência, mais uma folga generosa. É também o TETO das envs que geram prazos
+# persistidos (rodada 2, item 3): um prazo configurado acima dele era jogado fora no primeiro
+# reinício — o bench de exit 4 de 5 dias soltava o curso na hora em que o vigia reiniciava o loop.
+_ESTADO_FUTURO_MAX_S = 2 * 86400.0
 
 
 # RELANÇAMENTO APÓS O CIRCUIT-BREAKER (exit 4) — trilha anti-ban aprovada pelo dono (15/09).
@@ -191,9 +207,10 @@ def _env_float(nome, padrao, *, minimo=None):
 # EXPIRA em ATHENA_BENCH_EXIT4_EXPIRA_S (UMA tentativa depois; o próximo abort rebencha).
 _EXIT_CIRCUIT_BREAKER = 4              # contrato do motor (ver causa.py)
 _BENCH_EXIT4_MIN = _env_int("ATHENA_BENCH_EXIT4_MIN", 3, minimo=1)
-_ESPERA_EXIT4_S = _env_float("ATHENA_ESPERA_EXIT4_S", 600.0, minimo=0.0)          # 10 min
-_BENCH_EXIT4_EXPIRA_S = _env_float("ATHENA_BENCH_EXIT4_EXPIRA_S", 86400.0,
-                                   minimo=3600.0)                               # 24 h
+_ESPERA_EXIT4_S = _env_float("ATHENA_ESPERA_EXIT4_S", 600.0, minimo=0.0,
+                             maximo=_ESTADO_FUTURO_MAX_S)                      # 10 min
+_BENCH_EXIT4_EXPIRA_S = _env_float("ATHENA_BENCH_EXIT4_EXPIRA_S", 86400.0, minimo=3600.0,
+                                   maximo=_ESTADO_FUTURO_MAX_S)                # 24 h
 
 # CLASSE DO ABORT, lida da SAÍDA INTEIRA que a autópsia já tem — `Obito.stderr_bruto`, os
 # últimos 64 KB (rodada 2: nas 40 linhas do `stderr_tail`, o ruído de encerramento — httpx,
@@ -312,11 +329,8 @@ def _serie_exit4_aberta(st, agora) -> bool:
 _ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
                          "_pend_no_cooldown", "ultimo_no_notion", "exit4_seguidas",
                          "exit4_ultimo", "exit4_ate", "benched_exit4_ate")
-# TETO DE SANIDADE do futuro: um valor corrompido (ou um relógio que andou para trás)
-# não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
-# DESCARTADO na leitura — 24h é o teto da escada e 24h é o cooldown sem-pendência, mais
-# uma folga generosa.
-_ESTADO_FUTURO_MAX_S = 2 * 86400.0
+# TETO DE SANIDADE do futuro: `_ESTADO_FUTURO_MAX_S`, definido junto das envs (lá em cima)
+# porque é também o teto das envs que geram prazos persistidos.
 
 
 # ---------------------------------------------------------------------------

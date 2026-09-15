@@ -97,6 +97,17 @@ _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 _EXIT_SONDA_INCONCLUSIVA = 5           # contrato do motor (ver causa.py)
 _BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
 
+# RELANÇAMENTO APÓS O CIRCUIT-BREAKER (exit 4) — trilha anti-ban aprovada pelo dono (15/09).
+# Incidente 13–14/09: o Cademí codigoviral foi disparado 17 vezes em ~14h, cada run abortado
+# pelo disjuntor do MOTOR ("5 erros nas últimas 5 aulas") e relançado ~1 min depois — mesmo
+# após a 4ª falha. O exit 4 é o próprio motor dizendo "continuar martelando é o caminho do
+# banimento"; o daemon não pode responder relançando. Três travas (ver `_aplicar_decisao` e
+# a passada): ESPERA mínima antes de relançar (nunca no ciclo da autópsia), a SÉRIE que
+# impede o avanço no Notion de apagar a escada, e o BENCH no limiar (como o exit-5).
+_EXIT_CIRCUIT_BREAKER = 4              # contrato do motor (ver causa.py)
+_BENCH_EXIT4_MIN = int(os.getenv("ATHENA_BENCH_EXIT4_MIN", "3"))
+_ESPERA_EXIT4_S = float(os.getenv("ATHENA_ESPERA_EXIT4_S", "600"))   # 10 min
+
 # COOLDOWN de curso QUIESCIDO por SAÍDA LIMPA: quando o motor sai LIMPO (exit 0) sem
 # produzir nada novo (Notion não avançou), o curso está concluído/sem-pendência para o
 # denominador que temos. Em vez de re-spawnar a cada ciclo (o que floodava o vigia com
@@ -170,9 +181,14 @@ def _env_int(nome, padrao, *, minimo=None):
 #   cooldown_ate, _pend_no_cooldown   a janela de quiescido/sem-pendência + baseline
 #   ultimo_no_notion                  a régua do AVANÇO (sem ela, o 1º ciclo pós-boot
 #                                     não reconhece progresso e não re-arma o disjuntor)
+#   exit4_seguidas, exit4_ate         a série de aborts do motor + a espera pós-exit-4
+#                                     (15/09). São CONTADOR e JANELA, não latch: sem eles
+#                                     cada reinício concedia uma série nova de 3 aborts a
+#                                     um curso em laço; com eles, o reinício concede UMA
+#                                     tentativa e o próximo abort bencha de novo.
 #
-# O QUE NÃO É (de propósito): `irredutivel`, `benched_exit5`, `exit5_seguidas`, `fase`,
-# `ultima_causa` e os latches de alerta. São LATCHES cujo ÚNICO destravamento hoje, com
+# O QUE NÃO É (de propósito): `irredutivel`, `benched_exit5`, `benched_exit4`,
+# `exit5_seguidas`, `fase`, `ultima_causa` e os latches de alerta. São LATCHES cujo ÚNICO destravamento hoje, com
 # o zelador DESLIGADO por padrão, é o reinício do daemon (o `Zelador._rearmar` existe,
 # mas só roda com ATHENA_ZELADOR_ATIVO). Persistir um latch de reseed sem ter quem o
 # destrave transformaria "curso travado até o próximo boot" em "curso travado PARA
@@ -181,7 +197,8 @@ def _env_int(nome, padrao, *, minimo=None):
 # (O FLAP não entra aqui porque já é durável: `vigia._contar_flaps_anteriores` conta os
 # JSONs de autópsia em disco na janela, não um contador em memória.)
 _ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
-                         "_pend_no_cooldown", "ultimo_no_notion")
+                         "_pend_no_cooldown", "ultimo_no_notion", "exit4_seguidas",
+                         "exit4_ate")
 # TETO DE SANIDADE do futuro: um valor corrompido (ou um relógio que andou para trás)
 # não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
 # DESCARTADO na leitura — 24h é o teto da escada e 24h é o cooldown sem-pendência, mais
@@ -349,6 +366,18 @@ def _texto_bench(curso, n5) -> str:
             f"conta: os demais cursos dela seguem; avanço real no Notion reabre este")
 
 
+def _texto_bench_exit4(curso, n4) -> str:
+    """Motivo do alerta ESSENCIAL de bench exit-4: QUAL curso parou, POR QUÊ (o disjuntor do
+    próprio motor abortou N runs seguidos por excesso de falhas) e O QUE fazer (olhar o
+    tracker/a plataforma à mão antes de reabrir). Mesmo contrato do `_texto_bench`: nenhuma
+    frase de sessão morta nem de credencial (o rótulo passa pelo `rotulo_seguro`)."""
+    return (f"BENCH exit-4: {n4} aborts seguidos do disjuntor do motor (excesso de falhas) "
+            f"em {rotulo_seguro(curso)} — curso PARADO. Relançar abria aulas contra a mesma "
+            f"parede, o padrão que bane a conta. Ação: olhe o tracker e a plataforma à mão "
+            f"antes de reabrir; os demais cursos da conta seguem; um reinício do daemon "
+            f"concede UMA tentativa")
+
+
 def _plataforma_de(curso_url, meta_por_curso) -> str:
     """Rótulo de plataforma para os alertas typados. Prefere a `plataforma` do CursoLocal;
     cai na inferência por URL; por fim, a própria URL (nunca vazio)."""
@@ -398,6 +427,7 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
             and acao == "aguardar_backoff"):
         st["_saida_limpa_ciclo"] = agora
         st.pop("exit5_seguidas", None)   # um run limpo prova a sonda sã: zera o bench
+        st.pop("exit4_seguidas", None)   # e o run que terminou sem abortar zera a série do exit-4
         return
 
     # MORTE SEM FALHA da captura (causa: `sem_falha` — reinício/desligamento do Mac
@@ -506,6 +536,45 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
         disjuntor.registrar_falha(st, agora)
     except Exception:
         pass
+
+    # EXIT 4 (circuit-breaker do MOTOR) — trilha anti-ban 15/09, incidente codigoviral:
+    #   ESPERA: `exit4_ate` segura o relançamento por _ESPERA_EXIT4_S mesmo com o crédito de
+    #     tentativas livres do disjuntor (as 2 primeiras falhas não armam janela). Piso de 1 s:
+    #     a passada DESTE ciclo roda com o mesmo `agora`, então nem a env zerada relança no
+    #     ciclo da autópsia.
+    #   SÉRIE: `exit4_seguidas` conta os aborts; enquanto > 0 o avanço no Notion NÃO zera a
+    #     escada (o run que aborta produz aulas antes do disjuntor — era esse avanço que
+    #     apagava a falha que esta autópsia acabou de contar). Só uma SAÍDA LIMPA zera a série:
+    #     morte de outra causa não prova o curso são.
+    #   BENCH: no limiar, irredutível POR CURSO + alerta essencial, como o exit-5. O avanço no
+    #     Notion NÃO desbencha (é o sinal que o próprio laço produz, e num tenant Cademí o
+    #     Notion sobe por outros cursos da conta); o latch não é persistido (reinício concede
+    #     UMA tentativa), a série é — o próximo abort bencha de novo.
+    # `escalar_token` fica FORA da série (mesma razão do exit-5): a chave é da API downstream,
+    # benchar engoliria o alerta "troque o token"; sem avanço no Notion a escada já espaça.
+    if getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER:
+        st["exit4_ate"] = agora + max(_ESPERA_EXIT4_S, 1.0)
+        if acao != "escalar_token":
+            n4 = int(st.get("exit4_seguidas", 0) or 0) + 1
+            st["exit4_seguidas"] = n4
+            if n4 >= _BENCH_EXIT4_MIN:
+                st["irredutivel"] = True              # o disjuntor para SÓ este curso
+                st["benched_exit4"] = True
+                st.pop("benched_exit5", None)         # o desbench do exit-5 (avanço) não o solta
+                st["esgotado_avisado"] = True         # o alerta typado abaixo já cobre
+                st["fase"] = FASE_NOVO
+                alertas.captura_morreu(plat, _texto_bench_exit4(curso, n4), essencial=True,
+                                       chave=("bench_exit4", curso))
+                # E16: bench por exit-4 em série — irredutível POR-CURSO, anti-ban.
+                _registrar(espinha, f"BENCH exit-4: travei {curso} após {n4} aborts "
+                           f"seguidos do disjuntor do motor",
+                           "exit-4 em série (excesso de falhas a cada run) — relançar "
+                           "martelaria a plataforma; avanço no Notion NÃO desbencha",
+                           tipo="escalada", reversivel=True, escalada=True,
+                           trava="bench-exit4", curso=curso, plataforma=plat,
+                           fonte=fonte_causa, origem="athena-local/causa")
+                return
+
     if acao == "escalar_token":
         # ESSENCIAL (só o dono troca a chave) + dedup por curso: o backoff re-tenta
         # e re-morre na mesma chave ruim — 1 ping por janela basta.
@@ -690,7 +759,8 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
       1. já CONCLUIDO -> None (idempotente).
       2. lê a contagem-verdade do Notion. Ilegível -> escala honesto, NÃO dispara às cegas.
       3. AVANÇO detectado (no_notion subiu) -> `disjuntor.registrar_sucesso` re-arma o
-         recozimento (backoff volta ao degrau zero).
+         recozimento (backoff volta ao degrau zero) — EXCETO com série de exit-4 aberta:
+         aí só a saída limpa que produziu re-arma (o run que aborta também produz).
       4. COMPLETO no Notion (no_notion >= total, total>0) -> anti-dup por COMPLETUDE.
       5. processo AINDA ativo -> quieto (None): captura em andamento (anti-ban/disjuntor).
       5b. a CONTA tem óbito colhido e ainda não autopsiado (reap no meio da passada) ->
@@ -698,6 +768,7 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
          contagem, sem re-disparo antes da causa).
       6. FALLBACK de morte: estava CAPTURANDO, não está mais ativo, e a autópsia do ciclo
          NÃO tratou -> conta uma falha (backoff) e volta a NOVO (never-stop).
+      6b. ESPERA pós-exit-4 (`exit4_ate`) ainda correndo -> quieto (None).
       7. `disjuntor.pode_tentar` FECHADO (teto/backoff/irredutível) -> escala UMA vez (latch).
       8. senão -> DISPARA. `ContaOcupada` (anti-ban) => aguarda a vez (None). Falha/silêncio
          do disparo -> escala honesto. `MaquinaSobrecarregada` (portão de carga) => ADIADO
@@ -735,10 +806,15 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         if no_notion is not None:
             prev = st.get("ultimo_no_notion")
             if prev is not None and int(no_notion) > int(prev):
-                try:
-                    disjuntor.registrar_sucesso(st)
-                except Exception:
-                    pass
+                # SÉRIE DE EXIT-4 ABERTA: o avanço NÃO zera a escada. O run que aborta no
+                # disjuntor do motor produz aulas ANTES de abortar — este avanço apagava a
+                # falha que a autópsia deste mesmo ciclo acabou de contar (codigoviral, 17
+                # disparos). Quem re-arma, nesse caso, é a saída limpa que produziu (abaixo).
+                if not st.get("exit4_seguidas"):
+                    try:
+                        disjuntor.registrar_sucesso(st)
+                    except Exception:
+                        pass
                 st.pop("cooldown_ate", None)               # AVANÇO real: sai do cooldown (há trabalho)
                 st.pop("exit5_seguidas", None)             # a captura PRODUZIU: sonda sã, zera o bench
                 if st.pop("benched_exit5", None):          # DESBENCH (never-stop): avanço real
@@ -803,6 +879,14 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                                "saída limpa (exit 0) sem avanço no Notion",
                                reversivel=True, fonte="deterministico", curso=curso,
                                plataforma=plat, origem="athena-local/passada")
+                else:
+                    # o run terminou SEM abortar e PRODUZIU: é o sucesso que o avanço lido em
+                    # voo não pôde registrar enquanto a série de exit-4 estava aberta. Idempotente
+                    # no caso comum (o avanço em voo já tinha zerado a escada).
+                    try:
+                        disjuntor.registrar_sucesso(st)
+                    except Exception:
+                        pass
                 st["fase"] = FASE_NOVO
             elif st.get("_morte_ciclo") != agora:
                 # FALLBACK de MORTE (default/no-autópsia): caiu sem saída-limpa e a autópsia
@@ -854,6 +938,12 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return None
         if pend is not None and pend > 0:
             st.pop("sem_pendencia_avisado", None)           # há trabalho: re-arma o latch
+        # ESPERA pós-exit-4 (anti-ban 15/09): o curso que acabou de abortar no disjuntor do
+        # motor NÃO volta à plataforma antes da janela — nem no ciclo da própria autópsia,
+        # nem sob o crédito de tentativas livres do disjuntor. Não é escalada nova (a
+        # autópsia já escalou): só quieto até vencer.
+        if agora < float(st.get("exit4_ate", 0.0) or 0.0):
+            return None
         try:
             pode = disjuntor.pode_tentar(st, agora)
         except Exception:
@@ -1639,7 +1729,8 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
                 continue
             if valor != valor or valor in (float("inf"), float("-inf")):
                 continue                               # NaN/inf
-            if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown"):
+            if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown",
+                         "exit4_seguidas"):
                 if valor < 0:
                     continue
                 limpo[chave] = int(valor)

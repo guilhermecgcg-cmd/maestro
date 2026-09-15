@@ -1141,6 +1141,18 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                       f"ativo — DISJUNTOR ABERTO (teto/backoff/irredutível): paro de "
                       f"disparar e escalo (não martelo). Re-arma quando o backoff expira / "
                       f"há avanço; irredutível (reseed/token) só o humano destrava.")
+            prazo_bench = st.get("benched_exit4_ate") if st.get("benched_exit4") else None
+            if prazo_bench is not None:
+                # BENCH DE EXIT 4 (rodada 2, item 5): no `mudo` esta é a ÚNICA mensagem que sai
+                # para o dono, e "só o humano destrava" é falso aqui — o bench vence sozinho.
+                # A voz diz a classe, a hora do vencimento e que nenhuma ação reabre nada.
+                quando = time.strftime("%d/%m %H:%M", time.localtime(float(prazo_bench)))
+                pedido = (f"[{projeto_nome}] {curso} SUSPENSO por aborts seguidos do "
+                          f"disjuntor do motor — classe: {_ROTULO_CLASSE_EXIT4['plataforma']}. "
+                          f"Não disparo até {quando}; aí o bench vence SOZINHO e reabre para "
+                          f"UMA tentativa (outro abort de parede rebencha). Nenhuma ação é "
+                          f"necessária para reabrir; olhar o tracker e a plataforma à mão "
+                          f"adianta a causa.")
             if not st.get("esgotado_avisado"):
                 voz.escalar(Problema("captura_local_esgotada", curso, pedido, "critico"),
                             pedido)

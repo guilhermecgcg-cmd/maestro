@@ -708,6 +708,9 @@ _ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
 _CONCORRENCIA_MOTOR_PADRAO = 1
 _CONCORRENCIA_MOTOR_TETO = 2
 _CADENCIA_PISOS_S = (("CAPTURE_PACING_MIN_S", 3.0), ("CAPTURE_PACING_JITTER_S", 2.0))
+# TETO da cadência (revisão 15/09): um 1e9 herdado passava pelo `isfinite` e cada aula
+# esperaria décadas — a captura parava calada, sem erro nenhum para a autópsia ver.
+_CADENCIA_TETO_S = 60.0
 
 
 def _cravar_cadencia_do_motor(env) -> None:
@@ -727,7 +730,7 @@ def _cravar_cadencia_do_motor(env) -> None:
             valor = piso
         if not math.isfinite(valor) or valor < piso:        # 0, negativo, nan, inf
             valor = piso
-        env[nome] = str(valor)
+        env[nome] = str(min(valor, _CADENCIA_TETO_S))
 
 
 # PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 5) E pela Stoa

@@ -88,6 +88,15 @@ def test_cadencia_herdada_acima_do_piso_vale_e_lixo_cai_no_piso(monkeypatch, bru
     assert float(_env_do_disparo("kajabi")["CAPTURE_PACING_MIN_S"]) == esperado
 
 
+@pytest.mark.parametrize("nome", ["CAPTURE_PACING_MIN_S", "CAPTURE_PACING_JITTER_S"])
+@pytest.mark.parametrize("bruto,esperado", [("1e9", 60.0), ("61", 60.0), ("60", 60.0)])
+def test_cadencia_herdada_tem_teto_de_60s(monkeypatch, nome, bruto, esperado):
+    # revisão 15/09: 1e9 passava pelo `isfinite` e cada aula esperaria 31 anos — a captura
+    # parava calada, sem erro nenhum para a autópsia ver
+    monkeypatch.setenv(nome, bruto)
+    assert float(_env_do_disparo("cademi")[nome]) == esperado
+
+
 # Contrato com o CÓDIGO do motor: o env que o daemon crava é o que os CLIs LEEM. Lê o fonte
 # (texto, sem importar) da primeira árvore do motor que tiver o arquivo; sem árvore, pula.
 _ARVORES = [p for p in (os.environ.get("ATHENA_MOTOR_DIR"),

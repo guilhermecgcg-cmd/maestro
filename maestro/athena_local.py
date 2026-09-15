@@ -341,6 +341,11 @@ def _saida_de_abort_do_disjuntor(texto) -> bool:
 #     ela não tem resultado; o lock de PID morto da prova não é apagado antes da autópsia (a conta
 #     fica travada e o .err dela intacto) e, se o lock sumir mesmo assim, a autópsia lê o .err da
 #     conta pelo PID da prova;
+#   - RODÍZIO DO PORTADOR (D3r3, item 2): 3 `sem_sucesso` SEGUIDOS nas provas de um curso (só ok e
+#     bloqueado zeram) o tiram da lista de PORTADORES por 24 h — só de portar a prova: os passes
+#     normais dele seguem. Depois de qualquer resultado não-ok, a próxima prova prefere OUTRO
+#     portador (o curso é recusado; num ciclo em que ninguém mais a leva, ele volta a poder). Todo
+#     portador possível do ciclo fora do rodízio: voz, uma vez por episódio;
 #   - ESPERA NEUTRA (item 7): o portador que saiu 0 sem avanço com a suspensão valendo não é
 #     "curso quiescido" (sem cooldown) nem "captura ESTAGNADA": espera a janela vencer.
 _CHAVE_YOUTUBE = "__youtube__"         # no `estado` do loop (não é curso); em disco: "youtube"
@@ -354,6 +359,10 @@ _YOUTUBE_ALERTA_VENCIDA_S = _env_float("ATHENA_YOUTUBE_ALERTA_VENCIDA_S", 21600.
                                        minimo=60.0)                            # 6 h
 _AVISO_YOUTUBE_VENCIDA = "suspensão do YouTube vencida sem prova — nenhum passe elegível"
 _RE_PROVA_YOUTUBE = re.compile(r"YOUTUBE_PROVA resultado=(ok|bloqueado|sem_sucesso|nao_tocou)\b")
+# D3r3, item 2: RODÍZIO DO PORTADOR — sem_sucesso seguidos que tiram o curso da prova, e por quanto.
+_PROVA_SEM_SUCESSO_MAX = 3
+_PROVA_FORA_S = 86400.0                                                        # 24 h
+_AVISO_PROVA_PRESA = "prova do YouTube presa em sem_sucesso em {curso} — nenhum outro portador"
 
 
 def _youtube_janela_s(degrau) -> float:
@@ -390,6 +399,7 @@ def _youtube_bloqueado(sy, agora) -> bool:
             return True
         # D3: a prova sem resultado além do teto é a prova SEM LINHA — a suspensão continua e a
         # janela reabre no MESMO degrau (antes a prova era só descartada: liberava outra na hora)
+        _youtube_evitar_portador(sy, sy.get("prova_curso"))
         _youtube_soltar_prova(sy)
         sy["ate"] = agora + _youtube_janela_s(int(sy.get("degrau") or 1))
         return True
@@ -518,6 +528,7 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
                            "a suspensão continua e a janela reabre no mesmo degrau — nunca solta "
                            "as outras contas", reversivel=True, fonte="deterministico",
                            curso=curso, origem="athena-local/youtube")
+        _anotar_rodizio_da_prova(estado, sy, curso, resultado, agora=agora, espinha=espinha)
         return
     if classe != "youtube":
         return
@@ -525,6 +536,84 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
         return                                         # o MESMO bloqueio, visto por outro curso
     sy = estado.setdefault(_CHAVE_YOUTUBE, {})
     _anunciar_suspensao_youtube(sy, agora, curso, voz=voz, espinha=espinha, subir=False)
+
+
+def _youtube_evitar_portador(sy, curso):
+    """D3r3, item 2: a próxima prova prefere OUTRO portador que não `curso` (o último resultado dele
+    não foi ok). A preferência cai quando um ciclo inteiro passa sem outro portador levar a prova."""
+    if curso:
+        sy["prova_evitar"] = curso
+    sy.pop("_prova_evitar_liberado", None)
+
+
+def _anotar_rodizio_da_prova(estado, sy, curso, resultado, *, agora, espinha):
+    """D3r3, item 2 — RODÍZIO DO PORTADOR, depois do resultado da prova de `curso`.
+
+    O contador é de `sem_sucesso` SEGUIDOS nas provas DESTE curso, e só ok e bloqueado o zeram. A
+    prova sem linha e `nao_tocou` não mexem nele: `nao_tocou` zerando deixaria o mesmo curso portar
+    sem fim alternando os dois. Com `_PROVA_SEM_SUCESSO_MAX` seguidos, o curso fica `_PROVA_FORA_S`
+    fora da lista de portadores — só da prova: os passes normais dele seguem, sem cooldown, bench
+    nem espera por isso. Qualquer resultado não-ok faz a próxima prova preferir outro portador."""
+    st = estado.setdefault(curso, {})
+    if resultado in ("ok", "bloqueado"):
+        st.pop("prova_sem_sucesso_seguidas", None)
+    elif resultado == "sem_sucesso":
+        seguidas = int(st.get("prova_sem_sucesso_seguidas") or 0) + 1
+        st["prova_sem_sucesso_seguidas"] = seguidas
+        if seguidas >= _PROVA_SEM_SUCESSO_MAX:
+            st["prova_fora_ate"] = agora + _PROVA_FORA_S
+            horas = int(_PROVA_FORA_S // 3600)
+            log.warning("%s fora da prova do YouTube por %d h: %d provas seguidas sem sucesso",
+                        curso, horas, seguidas)
+            _registrar(espinha, f"{curso} fora da prova do YouTube por {horas} h",
+                       f"{seguidas} provas seguidas sem sucesso (pediu ao YouTube, nada deu certo, "
+                       f"sem sinal de bloqueio): a prova vai para outro portador; os passes normais "
+                       f"do curso seguem", reversivel=True, fonte="deterministico", curso=curso,
+                       origem="athena-local/youtube")
+    if resultado == "ok":
+        sy.pop("prova_evitar", None)
+        sy.pop("_prova_evitar_liberado", None)
+    else:
+        _youtube_evitar_portador(sy, curso)
+
+
+def _avisar_prova_youtube_presa(estado, cursos, executor, *, agora, voz, espinha):
+    """D3r3, item 2: a janela venceu, não há prova em curso e TODO curso do ciclo que poderia portar
+    a prova está fora do rodízio (sem_sucesso seguidos) — a suspensão segue sem prova. Voz, UMA vez
+    por episódio (o `prova_fora_ate` do curso, persistido em `prova_presa_avisada`). Um portador
+    possível que só está ocupado não conta como "nenhum": ele leva a prova quando ficar livre, e a
+    vencida sem prova há horas já tem o aviso dela."""
+    sy = estado.get(_CHAVE_YOUTUBE)
+    if (not isinstance(sy, dict) or sy.get("ate") is None or sy.get("prova_curso")
+            or agora < float(sy["ate"])):
+        return
+    pode_portar = getattr(executor, "pode_portar_prova_youtube", None)
+    if not callable(pode_portar):
+        return
+    portadores = [c for c in cursos
+                  if (estado.get(c) or {}).get("fase") != FASE_CONCLUIDO and pode_portar(c)]
+    fora = [c for c in portadores
+            if agora < float((estado.get(c) or {}).get("prova_fora_ate") or 0.0)]
+    if not fora or len(fora) < len(portadores):
+        return                                         # há outro portador possível
+    for curso in fora:
+        st = estado[curso]
+        if st.get("prova_presa_avisada") == st["prova_fora_ate"]:
+            continue
+        st["prova_presa_avisada"] = st["prova_fora_ate"]
+        texto = _AVISO_PROVA_PRESA.format(curso=curso)
+        log.warning(texto)
+        if voz is not None:
+            try:
+                voz.escalar(Problema("youtube_prova_presa", "youtube", texto, "aviso"), texto)
+            except Exception:
+                pass
+        quando = time.strftime("%d/%m %H:%M", time.localtime(float(st["prova_fora_ate"])))
+        _registrar(espinha, texto,
+                   f"{curso} está fora do rodízio da prova até {quando} e nenhum outro curso do "
+                   f"ciclo pode levá-la: a suspensão do YouTube segue sem prova",
+                   tipo="escalada", reversivel=True, escalada=True, curso=curso,
+                   fonte="deterministico", origem="athena-local/youtube")
 
 
 def _avisar_prova_youtube_sem_resultado(sy, *, agora, voz, espinha):
@@ -624,6 +713,10 @@ def _serie_exit4_aberta(st, agora) -> bool:
 #                                     seguro (ele se solta sozinho); o latch booleano é
 #                                     reconstruído dele na passada — um reinício do vigia
 #                                     não encurta mais o castigo.
+#   prova_sem_sucesso_seguidas,       o RODÍZIO DO PORTADOR da prova do YouTube (D3r3, item 2):
+#   prova_fora_ate,                   os sem_sucesso seguidos do curso, o prazo das 24 h fora
+#   prova_presa_avisada               da prova e o episódio do aviso de prova presa. Sem eles
+#                                     um reinício devolvia a prova ao curso que não consegue.
 #
 # O QUE NÃO É (de propósito): `irredutivel`, `benched_exit5`, `benched_exit4`,
 # `exit5_seguidas`, `fase`, `ultima_causa` e os latches de alerta. São LATCHES cujo ÚNICO destravamento hoje, com
@@ -637,7 +730,8 @@ def _serie_exit4_aberta(st, agora) -> bool:
 _ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
                          "_pend_no_cooldown", "ultimo_no_notion", "exit4_seguidas",
                          "exit4_ultimo", "exit4_ate", "benched_exit4_ate", "exit4_rearmado",
-                         "espera_youtube")
+                         "espera_youtube", "prova_sem_sucesso_seguidas", "prova_fora_ate",
+                         "prova_presa_avisada")
 # TETO DE SANIDADE do futuro: `_ESTADO_FUTURO_MAX_S`, definido junto das envs (lá em cima)
 # porque é também o teto das envs que geram prazos persistidos.
 
@@ -2359,8 +2453,8 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
             if valor != valor or valor in (float("inf"), float("-inf")):
                 continue                               # NaN/inf
             if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown",
-                         "exit4_seguidas", "exit4_rearmado",
-                         "espera_youtube"):             # contadores; os demais: instantes
+                         "exit4_seguidas", "exit4_rearmado", "espera_youtube",
+                         "prova_sem_sucesso_seguidas"):  # contadores; os demais: instantes
                 if valor < 0:
                     continue
                 limpo[chave] = int(valor)
@@ -2377,7 +2471,8 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
 
 _ESTADO_YOUTUBE_INSTANTES = ("ate", "ultimo_bloqueio", "prova_desde", "aviso_vencida_ate",
                              "aviso_prova_desde")
-_ESTADO_YOUTUBE_CHAVES = _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso", "prova_pid")
+_ESTADO_YOUTUBE_CHAVES = _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso", "prova_pid",
+                                                     "prova_evitar")
 
 
 def _carregar_estado_youtube(path, *, agora) -> dict:
@@ -2419,6 +2514,9 @@ def _carregar_estado_youtube(path, *, agora) -> dict:
             limpo["prova_pid"] = pid
     else:
         limpo.pop("prova_desde", None)
+    evitar = sy.get("prova_evitar")                    # D3r3, item 2: o último portador não-ok
+    if isinstance(evitar, str) and evitar:
+        limpo["prova_evitar"] = evitar
     return limpo
 
 
@@ -2622,9 +2720,42 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     _sy = estado.get(_CHAVE_YOUTUBE)
     _yt_bloqueado = _youtube_bloqueado(_sy, agora)
 
+    # RODÍZIO DO PORTADOR (D3r3, item 2): `_prova_recusada` diz se ESTE curso não leva a prova
+    # agora — fora do rodízio (sem_sucesso seguidos, 24 h) ou o último portador não-ok com outro
+    # portador possível no ciclo (a próxima prova prefere OUTRO). O executor a consulta ao escolher
+    # o passe (o `--youtube` sai do anel do curso e os outros passes seguem) e a reserva também. O
+    # último portador não-ok recusado num ciclo em que ninguém mais levou a prova (o outro estava
+    # ocupado) volta a poder no ciclo seguinte (fim do ciclo).
+    _recusas_da_prova = set()
+
+    def _outro_portador_possivel(curso):
+        # outro curso do ciclo que PODE portar a prova (não concluído, fora do rodízio só se o
+        # prazo venceu); sem nenhum, preferir outro só atrasaria a prova — o curso leva na hora
+        pode_portar = getattr(executor, "pode_portar_prova_youtube", None)
+        if not callable(pode_portar):
+            return False
+        for c in cursos_ok:
+            st_c = estado.get(c) or {}
+            if (c != curso and st_c.get("fase") != FASE_CONCLUIDO
+                    and agora >= float(st_c.get("prova_fora_ate") or 0.0) and pode_portar(c)):
+                return True
+        return False
+
+    def _prova_recusada(curso):
+        if agora < float((estado.get(curso) or {}).get("prova_fora_ate") or 0.0):
+            return True
+        sy = estado.get(_CHAVE_YOUTUBE)
+        if (isinstance(sy, dict) and sy.get("prova_evitar") == curso
+                and not sy.get("_prova_evitar_liberado") and _outro_portador_possivel(curso)):
+            _recusas_da_prova.add(curso)
+            return True
+        return False
+
     def _reservar_prova_youtube(curso, passe):
         sy = estado.get(_CHAVE_YOUTUBE)
         if not isinstance(sy, dict) or sy.get("ate") is None or sy.get("prova_curso"):
+            return None
+        if _prova_recusada(curso):
             return None
         desde = float(agora)                           # o MESMO float no disco e no token
         sy["prova_curso"] = curso
@@ -2680,7 +2811,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
             _armar = getattr(executor, "armar_prova_youtube", None)
             if callable(_armar):
                 _armar(_reservar_prova_youtube, _cancelar_prova_youtube,
-                       _confirmar_prova_youtube)
+                       _confirmar_prova_youtube, _prova_recusada)
         else:
             _desarmar = getattr(executor, "desarmar_prova_youtube", None)
             if callable(_desarmar):
@@ -2737,6 +2868,18 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
         _avisar_youtube_vencida(estado, agora=agora, voz=voz, espinha=espinha)
     except Exception:
         pass
+    # D3r3, item 2: o último portador não-ok foi recusado e ninguém mais levou a prova neste ciclo
+    # -> no próximo ele volta a poder (preferir OUTRO não pode deixar a suspensão sem prova); e,
+    # com todo portador possível fora do rodízio, o aviso da prova presa
+    try:
+        _sy_fim = estado.get(_CHAVE_YOUTUBE)
+        if (isinstance(_sy_fim, dict) and not _sy_fim.get("prova_curso")
+                and _sy_fim.get("prova_evitar") in _recusas_da_prova):
+            _sy_fim["_prova_evitar_liberado"] = True
+        _avisar_prova_youtube_presa(estado, cursos_ok, executor, agora=agora, voz=voz,
+                                    espinha=espinha)
+    except Exception:
+        log.warning("não avaliei o rodízio da prova do YouTube", exc_info=True)
 
     # (4a) VIGIA PERSISTIDO DOS ZELOS ÓRFÃOS (P7): roda em TODO ciclo, com o zelador ligado
     # ou não — um restart no meio de um zelo (inclusive o rollback ATHENA_ZELADOR_ATIVO=0 +

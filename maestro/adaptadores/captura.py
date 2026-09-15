@@ -1837,6 +1837,7 @@ class LocalExecutor:
         self._reservar_prova = None
         self._cancelar_prova = None
         self._confirmar_prova = None
+        self._recusar_prova = None                 # D3r3, item 2: o rodízio do portador
         # D3r2, B1(d): (curso, pid) da prova em curso — o lock de PID MORTO dela não é apagado
         # antes da autópsia (ver `_ler_lock`). None = nenhuma prova.
         self._lock_da_prova = None
@@ -2812,7 +2813,11 @@ class LocalExecutor:
         ativaveis = [p for p in passes if _passe_ativavel(p, meta.plataforma)]
         # SUSPENSÃO GLOBAL DO YOUTUBE (item 7): o `--youtube` sai do anel enquanto o IP do Mac
         # está barrado; os passes que não tocam o YouTube seguem.
-        youtube_suspenso = self._youtube_bloqueado and "youtube" in ativaveis
+        # RODÍZIO DO PORTADOR (D3r3, item 2): com a prova armada, o curso que o loop recusa como
+        # portador (fora do rodízio, ou o último não-ok) também não escolhe o `--youtube` — sem a
+        # prova ele só abriria a Hotmart à toa; os outros passes dele seguem no anel.
+        youtube_suspenso = "youtube" in ativaveis and (
+            self._youtube_bloqueado or self._prova_recusada(meta.url))
         if youtube_suspenso:
             ativaveis = [p for p in ativaveis if p != "youtube"]
         if len(ativaveis) == 1 and not youtube_suspenso:
@@ -2855,19 +2860,43 @@ class LocalExecutor:
         passe `--youtube` para TODOS os cursos (a decisão e o estado moram no loop)."""
         self._youtube_bloqueado = bool(bloqueado)
 
-    def armar_prova_youtube(self, reservar, cancelar=None, confirmar=None) -> None:
+    def armar_prova_youtube(self, reservar, cancelar=None, confirmar=None, recusar=None) -> None:
         """A PROVA DO YOUTUBE (D3): a janela venceu e não há prova em curso. O próximo disparo de
         um passe que pode tocar o YouTube chama `reservar(curso_url, passe)` antes do spawn e, se
         receber um token, o põe no env do filho; um spawn que falha chama `cancelar(curso_url)`;
-        o spawn que sobe chama `confirmar(curso_url, pid)` (D3r2, B1: o PID da prova)."""
+        o spawn que sobe chama `confirmar(curso_url, pid)` (D3r2, B1: o PID da prova);
+        `recusar(curso_url)` True = este curso não porta a prova agora (D3r3, item 2)."""
         self._reservar_prova = reservar
         self._cancelar_prova = cancelar
         self._confirmar_prova = confirmar
+        self._recusar_prova = recusar
 
     def desarmar_prova_youtube(self) -> None:
         self._reservar_prova = None
         self._cancelar_prova = None
         self._confirmar_prova = None
+        self._recusar_prova = None
+
+    def _prova_recusada(self, curso_url) -> bool:
+        """D3r3, item 2: com a prova armada, o loop recusa ESTE curso como portador?"""
+        recusar = self._recusar_prova
+        if recusar is None:
+            return False
+        try:
+            return bool(recusar(curso_url))
+        except Exception:
+            return False
+
+    def pode_portar_prova_youtube(self, curso_url) -> bool:
+        """D3r3, item 2: algum passe ativável deste curso pode levar a prova do YouTube (o aviso de
+        prova presa conta os portadores possíveis do ciclo)?"""
+        meta = self._meta.get(curso_url)
+        if meta is None:
+            return False
+        spec = _PLATAFORMAS.get(meta.plataforma)
+        passes = spec.passes if spec is not None else ("base",)
+        return any(_passe_ativavel(p, meta.plataforma)
+                   and passe_carrega_prova_youtube(meta.plataforma, p) for p in passes)
 
     def guardar_lock_da_prova_youtube(self, curso_url, pid=None) -> None:
         """D3r2, B1(d): a prova do YouTube em curso é de `curso_url` (PID `pid`, None se ainda

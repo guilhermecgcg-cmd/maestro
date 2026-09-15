@@ -319,14 +319,19 @@ def _saida_de_abort_do_disjuntor(texto) -> bool:
 #   - PORTADOR: vencida a janela, sem prova em curso, a prova vai no próximo disparo de QUALQUER
 #     passe que pode tocar o YouTube (`captura.passe_carrega_prova_youtube`), reservada ANTES do
 #     spawn e gravada no disco antes de o token chegar ao filho;
-#   - RESULTADO: a ÚLTIMA `YOUTUBE_PROVA resultado=ok|bloqueado|nao_tocou` da saída inteira do
-#     motor (stderr, via atexit). ok -> encerra; bloqueado -> reabre degrau+1; nao_tocou ->
-#     mantém, libera a vaga da prova, não mexe no degrau; SEM a linha (motor antigo, SIGKILL,
-#     SIGTERM, os._exit) -> mantém e reabre a janela no MESMO degrau. Substitui a regra
-#     "classe != youtube encerra" (achado 1 da revisão independente: a prova morta com -9/exit 5
-#     encerrava a suspensão e soltava os passes de 3 contas de uma vez). Um exit 4 de classe
-#     youtube SEM a linha (motor anterior ao M4) conta como bloqueado: o abort do bloqueio é a
-#     própria evidência — reabrir no mesmo degrau voltaria ao IP barrado a cada 3 h para sempre;
+#   - RESULTADO: a ÚLTIMA `YOUTUBE_PROVA resultado=ok|bloqueado|sem_sucesso|nao_tocou` da saída
+#     inteira do motor (stderr, via atexit; no motor a precedência é bloqueado > ok > sem_sucesso
+#     > nao_tocou). ok -> encerra; bloqueado -> reabre degrau+1; sem_sucesso (pediu ao YouTube,
+#     nada deu certo, nenhum sinal de bloqueio) -> mantém e reabre a janela no MESMO degrau, sem
+#     soltar outra prova na hora; nao_tocou (nenhum pedido ao YouTube) -> mantém, libera a vaga
+#     da prova, não mexe no degrau; SEM a linha (motor antigo, SIGKILL, SIGTERM, os._exit) ->
+#     mantém e reabre a janela no MESMO degrau. Substitui a regra "classe != youtube encerra"
+#     (achado 1 da revisão independente: a prova morta com -9/exit 5 encerrava a suspensão e
+#     soltava os passes de 3 contas de uma vez). Um exit 4 de classe youtube conta como
+#     bloqueado COM QUALQUER LINHA ou sem ela (D3r2, A1): o abort do bloqueio é a própria
+#     evidência — com `nao_tocou` a vaga era solta e a prova seguinte saía 3 min depois noutra
+#     conta, cada uma abrindo a Hotmart paga; sem a linha (motor anterior ao M4), reabrir no
+#     mesmo degrau voltaria ao IP barrado a cada 3 h para sempre;
 #   - AVISO: vencida há mais de ATHENA_YOUTUBE_ALERTA_VENCIDA_S (6 h) sem prova -> voz, uma vez
 #     por episódio;
 #   - ESPERA NEUTRA (item 7): o portador que saiu 0 sem avanço com a suspensão valendo não é
@@ -341,7 +346,7 @@ _YOUTUBE_DEGRAU_ZERA_S = _env_float("ATHENA_YOUTUBE_DEGRAU_ZERA_S", 172800.0,
 _YOUTUBE_ALERTA_VENCIDA_S = _env_float("ATHENA_YOUTUBE_ALERTA_VENCIDA_S", 21600.0,
                                        minimo=60.0)                            # 6 h
 _AVISO_YOUTUBE_VENCIDA = "suspensão do YouTube vencida sem prova — nenhum passe elegível"
-_RE_PROVA_YOUTUBE = re.compile(r"YOUTUBE_PROVA resultado=(ok|bloqueado|nao_tocou)\b")
+_RE_PROVA_YOUTUBE = re.compile(r"YOUTUBE_PROVA resultado=(ok|bloqueado|sem_sucesso|nao_tocou)\b")
 
 
 def _youtube_janela_s(degrau) -> float:
@@ -399,7 +404,8 @@ def _texto_youtube_suspenso(ate, degrau) -> str:
 
 
 def _resultado_prova_youtube(texto):
-    """A ÚLTIMA `YOUTUBE_PROVA resultado=ok|bloqueado|nao_tocou` da saída do motor, ou None."""
+    """A ÚLTIMA `YOUTUBE_PROVA resultado=ok|bloqueado|sem_sucesso|nao_tocou` da saída do motor,
+    ou None."""
     achados = _RE_PROVA_YOUTUBE.findall(str(texto or ""))
     return achados[-1] if achados else None
 
@@ -423,10 +429,11 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
     """Depois da decisão da morte: abre/reabre/encerra a suspensão global do YouTube.
 
     A MORTE DA PROVA (D3, contrato M4): decide pela ÚLTIMA linha `YOUTUBE_PROVA resultado=` da
-    saída inteira. ok -> encerra; bloqueado -> reabre degrau+1; nao_tocou -> mantém, libera a
-    vaga, degrau intacto; sem a linha -> mantém e reabre no MESMO degrau (um exit 4 de classe
-    youtube sem a linha conta como bloqueado). QUALQUER OUTRA MORTE: só um exit 4 de classe
-    youtube abre a suspensão, e só se ela não estiver valendo (o mesmo bloqueio, outro curso)."""
+    saída inteira. ok -> encerra; bloqueado -> reabre degrau+1; sem_sucesso -> mantém e reabre no
+    MESMO degrau; nao_tocou -> mantém, libera a vaga, degrau intacto; sem a linha -> mantém e
+    reabre no MESMO degrau. Um exit 4 de classe youtube conta como bloqueado com qualquer linha
+    (D3r2, A1). QUALQUER OUTRA MORTE: só um exit 4 de classe youtube abre a suspensão, e só se
+    ela não estiver valendo (o mesmo bloqueio, outro curso)."""
     sy = estado.get(_CHAVE_YOUTUBE)
     bruto = getattr(obito, "stderr_bruto", "") or getattr(obito, "stderr_tail", "") or ""
     exit4 = getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER
@@ -434,9 +441,19 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
     if isinstance(sy, dict) and sy.get("prova_curso") == curso:
         estado.setdefault(curso, {})["_prova_resultado_ciclo"] = agora
         resultado = _resultado_prova_youtube(bruto)
-        if resultado is None and classe == "youtube":
-            resultado = "bloqueado"                    # motor antigo: o abort do bloqueio é a prova
         codigo = getattr(obito, "exit_code", None)
+        if classe == "youtube" and resultado != "bloqueado":
+            # D3r2, A1: o abort do bloqueio do YouTube é a evidência e VENCE a linha. Com
+            # `nao_tocou` (o `--youtube` que sai 4 com "VIERAM COMO INDISPONÍVEIS E ZERO CAPTURAS"
+            # num motor que não registra isso como bloqueio) a vaga era solta sem subir o degrau e
+            # a prova seguinte ia de conta em conta, cada uma abrindo a Hotmart paga. Com `ok` a
+            # precedência do motor (bloqueado > ok) diz que não deveria acontecer: as duas saídas
+            # do MESMO run se contradizem, e o erro barato é esperar um degrau a mais — encerrar
+            # por engano solta todas as contas contra um IP barrado.
+            if resultado is not None:
+                log.warning("prova do YouTube em %s: linha resultado=%s com exit 4 de classe "
+                            "youtube — conta como bloqueado", curso, resultado)
+            resultado = "bloqueado"
         if resultado == "ok":
             for chave in ("ate", "prova_curso", "prova_desde", "aviso_vencida_ate"):
                 sy.pop(chave, None)
@@ -457,14 +474,26 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
             sy.pop("prova_curso", None)
             sy.pop("prova_desde", None)
             sy["ate"] = agora + _youtube_janela_s(int(sy.get("degrau") or 1))
-            log.warning("prova do YouTube em %s morreu sem resultado (exit %s): suspensão mantida, "
-                        "janela reaberta no mesmo degrau até %s", curso, codigo,
-                        time.strftime("%H:%M", time.localtime(float(sy["ate"]))))
-            _registrar(espinha, f"prova do YouTube em {curso} sem resultado (exit {codigo})",
-                       "sem a linha YOUTUBE_PROVA (motor antigo, SIGKILL, SIGTERM, os._exit): "
-                       "a suspensão continua e a janela reabre no mesmo degrau — nunca solta "
-                       "as outras contas", reversivel=True, fonte="deterministico",
-                       curso=curso, origem="athena-local/youtube")
+            ate_txt = time.strftime("%H:%M", time.localtime(float(sy["ate"])))
+            if resultado == "sem_sucesso":
+                log.warning("prova do YouTube em %s sem sucesso (exit %s): pediu e nada deu certo, "
+                            "sem sinal de bloqueio — suspensão mantida, janela reaberta no mesmo "
+                            "degrau até %s", curso, codigo, ate_txt)
+                _registrar(espinha, f"prova do YouTube em {curso} sem sucesso (exit {codigo})",
+                           "pediu ao YouTube e nenhum pedido deu certo, sem sinal de bloqueio "
+                           "(indisponível, privado, removido, rede): a suspensão continua e a "
+                           "janela reabre no mesmo degrau — nenhuma outra prova sai na hora",
+                           reversivel=True, fonte="deterministico", curso=curso,
+                           origem="athena-local/youtube")
+            else:
+                log.warning("prova do YouTube em %s morreu sem resultado (exit %s): suspensão "
+                            "mantida, janela reaberta no mesmo degrau até %s", curso, codigo,
+                            ate_txt)
+                _registrar(espinha, f"prova do YouTube em {curso} sem resultado (exit {codigo})",
+                           "sem a linha YOUTUBE_PROVA (motor antigo, SIGKILL, SIGTERM, os._exit): "
+                           "a suspensão continua e a janela reabre no mesmo degrau — nunca solta "
+                           "as outras contas", reversivel=True, fonte="deterministico",
+                           curso=curso, origem="athena-local/youtube")
         return
     if classe != "youtube":
         return

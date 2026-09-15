@@ -376,6 +376,175 @@ def test_no_loop_aguarda_a_vez_com_decisao_registrada_e_sem_contar_falha(tmp_pat
 
 
 # ==========================================================================
+# 9) REVISÃO DO 45b9134: submódulo do CLI, `--conta`, `--opcao=URL`, zelo na
+#    2ª leitura, re-arme do aviso, pré-filtro antes do shlex, depuradores
+# ==========================================================================
+ED = "https://luanacarolina.entregadigital.app.br/"
+_PLAT[ED] = "entregadigital"
+
+
+@pytest.mark.parametrize("resto, barrada", [
+    ("motor.greenn.cli --course 115070", GREENN),
+    ("motor.memberkit.cli", MK_TRIADE),
+    ("motor.cademi.__main__ --reseed", CAD_ALFA),
+    ("motor.entregadigital.cli https://luanacarolina.appmagic.link", ED),
+    ("motor.greenn.__main__ https://sierramkt.greenn.club/", GREENN),
+])
+def test_submodulo_do_cli_da_plataforma_tambem_barra(tmp_path, resto, barrada):
+    # FALSO NEGATIVO achado na revisão: a regra comparava `s.modulo == modulo` exato, e
+    # `python -m motor.greenn.cli` (o mesmo CLI, chamado pelo submódulo) passava calado.
+    cursos = [_curso(GREENN), _curso(MK_TRIADE), _curso(CAD_ALFA), _curso(ED)]
+    ex, sp = _ex(tmp_path, cursos, TabelaPs((PID_MANUAL, PID_SHELL, f"{PY_REAL} -m {resto}")))
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar(barrada)
+    assert sp.calls == []
+
+
+@pytest.mark.parametrize("resto, ocupado, livre", [
+    ("motor.cademi.cli https://membros.alfaresearch.com.br/", CAD_ALFA, CAD_VIRAL),
+    ("motor.memberkit.__main__ https://comunidade-triade.memberkit.com.br/", MK_TRIADE, MK_LEO),
+])
+def test_submodulo_com_tenant_no_argv_nao_trava_o_outro_tenant(tmp_path, resto, ocupado, livre):
+    ex, sp = _ex(tmp_path, [_curso(ocupado), _curso(livre)],
+                 TabelaPs((PID_MANUAL, PID_SHELL, f"{PY_REAL} -m {resto}")))
+    assert ex.disparar(livre).startswith("local_iniciada")
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar(ocupado)
+    assert len(sp.calls) == 1
+
+
+@pytest.mark.parametrize("argv", [
+    f"{PY_REAL} -m motor.zelador greenn --conta greenn-sierramkt",
+    f"{PY_REAL} -m motor.zelador greenn --conta=greenn-sierramkt",
+])
+def test_conta_explicita_no_argv_ocupa_so_aquela_conta(tmp_path, argv):
+    # Sem URL de tenant e num módulo que não é de plataforma: só o `--conta` diz de quem é.
+    ex, sp = _ex(tmp_path, [_curso(GREENN), _curso(GREENN_OUTRO)],
+                 TabelaPs((PID_MANUAL, PID_SHELL, argv)))
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar(GREENN)
+    assert ex.disparar(GREENN_OUTRO).startswith("local_iniciada")
+    assert len(sp.calls) == 1
+
+
+def test_url_na_forma_opcao_igual_identifica_o_tenant(tmp_path):
+    # `--home-url=https://...`: sem ler o valor depois do `=`, o argv parece "sem tenant" e a
+    # regra 5 travaria TODAS as contas Greenn. Lido, só a do sierramkt espera.
+    argv = f"{PY_REAL} -m motor.greenn --home-url=https://sierramkt.greenn.club/ --course 115070"
+    ex, sp = _ex(tmp_path, [_curso(GREENN), _curso(GREENN_OUTRO)],
+                 TabelaPs((PID_MANUAL, PID_SHELL, argv)))
+    assert ex.disparar(GREENN_OUTRO).startswith("local_iniciada")
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar(GREENN)
+    assert len(sp.calls) == 1
+
+
+def test_zelo_rele_o_ps_com_os_locks_em_disco_antes_de_abrir_o_navegador(tmp_path):
+    leituras = []
+
+    def tabela():
+        leituras.append(1)
+        base = [(os.getpid(), 1, "python -m maestro.athena_local")]
+        return base if len(leituras) == 1 else base + [(PID_MANUAL, 1, MANUAL_INCIDENTE)]
+
+    cursos = [_curso(GREENN, "greenn-principal")]
+    ex, sp = _ex(tmp_path, cursos, tabela)
+    perfil = tmp_path / "aula" / captura._perfil_de_conta("greenn-principal")
+    perfil.mkdir(parents=True)
+    (perfil / "SingletonLock").write_text("host-90001")
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar_zelo("greenn:greenn-principal", cursos[0])
+    assert len(leituras) == 2                              # releu com os locks nas mãos
+    assert sp.calls == [] and _locks(tmp_path) == []       # os locks do zelo foram soltos
+    assert (perfil / "SingletonLock").exists()             # o perfil não foi tocado
+
+
+def test_no_loop_o_aviso_rearma_depois_de_um_disparo(tmp_path):
+    # Episódio 1 (ps ilegível) -> decisão; o ps volta -> dispara; o motor termina produzindo;
+    # episódio 2 com a MESMA assinatura (ps ilegível de novo) -> tem de registrar DE NOVO.
+    cursos = [captura.CursoLocal(GREENN, "greenn-principal", "greenn", total_esperado=18)]
+    sp = _SpawnTee([""] * 3)
+    ps_ok, prog = [False], [0]
+
+    def tabela():
+        if not ps_ok[0]:
+            raise OSError("ps: operation not permitted")
+        return [(os.getpid(), 1, "python -m maestro.athena_local")]
+
+    ex = captura.LocalExecutor(
+        cursos, motor_python=PY, motor_dir=str(tmp_path / "aula"), spawn=sp,
+        lock_dir=str(tmp_path / "locks"), motor_log_dir=str(tmp_path / "logs"),
+        pid_vivo=sp.vivo, pendencias_fn=lambda u, d: None, processos_fn=tabela)
+    alertas, voz, esp, estado, voo = _Alertas(), _Voz(), _Espinha(), {}, {}
+    kw = dict(disjuntor=disjuntor, vigia=_VigiaNoMundo(sp.vivo), causa=causa,
+              alertas=alertas, lock_dir=str(tmp_path / "locks"),
+              autopsia_dir=str(tmp_path / "aut"), boot_ts=0.0, espinha=esp)
+
+    def ciclo(agora):
+        athena_local.ciclo_local(cursos, ex, lambda c: (prog[0], 18), voz, voo, estado,
+                                 agora=agora, **kw)
+
+    def avisos():
+        return [r for r in esp.regs if r[0].startswith("não disparei")]
+
+    ciclo(1000.0)
+    assert len(avisos()) == 1
+    ps_ok[0] = True
+    ciclo(1120.0)
+    assert len(sp.calls) == 1                              # disparou: a conta ficou livre
+    prog[0] = 5                                            # o run produziu ...
+    sp.calls[0]["proc"].encerrar(0)                        # ... e saiu limpo
+    ps_ok[0] = False                                       # novo episódio, mesma assinatura
+    ciclo(1240.0)
+    ciclo(1360.0)
+    assert len(sp.calls) == 1
+    assert len(avisos()) == 2                              # DENTES: o aviso re-armou
+
+
+def test_so_os_candidatos_a_motor_passam_pelo_shlex(tmp_path, monkeypatch):
+    # Custo: a checagem roda 2x por disparo sobre ~500 processos. Só a linha cujo 1º token é
+    # um python E que cita `motor` é tokenizada — as demais saem antes do shlex.
+    chamadas = []
+    tokens_real = captura._tokens
+    monkeypatch.setattr(captura, "_tokens", lambda a: chamadas.append(a) or tokens_real(a))
+    ruido = [(10000 + i, 1, f"/Applications/App {i}.app/Contents/MacOS/App --type=renderer "
+                             f"--field-trial-handle={i}") for i in range(400)]
+    ruido += [(20000 + i, 1, f"{PY_REAL} -m maestro.worker_{i} https://sierramkt.greenn.club/")
+              for i in range(50)]
+    ruido += [(30000 + i, 1, f"grep -r motor.greenn https://sierramkt.greenn.club/ {i}")
+              for i in range(50)]
+    ex, sp = _ex(tmp_path, [_curso(GREENN, "greenn-principal")],
+                 TabelaPs(*ruido, (PID_MANUAL, 1, MANUAL_INCIDENTE)))
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar(GREENN)
+    assert chamadas == [MANUAL_INCIDENTE]                  # 1 candidato, 1 tokenização
+
+
+@pytest.mark.parametrize("argv", [
+    f"{PY_REAL} -m pdb -m motor.greenn https://sierramkt.greenn.club/",
+    f"{PY_REAL} -m cProfile -o /tmp/perfil.out -s cumtime -m motor.greenn https://sierramkt.greenn.club/",
+    f"{PY_REAL} -m coverage run -m motor.greenn.cli --course 115070",
+    f"{PY_REAL} -mtrace --count --module=motor.greenn https://sierramkt.greenn.club/",
+    "/usr/local/bin/python3.12-intel64 -m motor.greenn https://sierramkt.greenn.club/",
+    "/opt/homebrew/bin/python3.13t -m motor.greenn https://sierramkt.greenn.club/",
+])
+def test_motor_sob_depurador_ou_interpretador_com_sufixo_barra(tmp_path, argv):
+    ex, sp = _ex(tmp_path, [_curso(GREENN, "greenn-principal")],
+                 TabelaPs((PID_MANUAL, PID_SHELL, argv)))
+    with pytest.raises(captura.MotorForaDoDaemon):
+        ex.disparar(GREENN)
+    assert sp.calls == []
+
+
+def test_segundo_m_so_vale_depois_de_depurador(tmp_path):
+    # `-m motor.x` depois de um módulo QUALQUER é argumento dele, não o que o python roda.
+    argv = f"{PY_REAL} -m maestro.relatorio -m motor.greenn https://sierramkt.greenn.club/"
+    ex, sp = _ex(tmp_path, [_curso(GREENN, "greenn-principal")],
+                 TabelaPs((PID_MANUAL, PID_SHELL, argv)))
+    assert ex.disparar(GREENN).startswith("local_iniciada")
+
+
+# ==========================================================================
 # 8) FUMAÇA do `ps` REAL (só leitura): a tabela inteira, com o próprio processo
 # ==========================================================================
 def test_fumaca_ps_real_traz_a_tabela_inteira_com_pid_ppid_e_argv(monkeypatch):

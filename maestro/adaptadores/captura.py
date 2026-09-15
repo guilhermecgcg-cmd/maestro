@@ -1424,7 +1424,11 @@ def _sinalizar(pid, sig, grupo):  # pragma: no cover — sinal real
 # casar por perfil daria falso negativo exatamente ali.
 #   1. só PYTHON com `-m motor` / `-m motor.<x>` como opção do INTERPRETADOR, em tokens
 #      (`_modulo_motor`): `grep motor.greenn <url>`, o `zsh -c "python -m ..."` e o
-#      `python script.py -m motor.x` não casam — o python filho do shell casa;
+#      `python script.py -m motor.x` não casam — o python filho do shell casa. Depurador ou
+#      perfilador (`-m pdb`, `-m cProfile -o x`, `-m coverage run`; `_MODULOS_EXECUTORES`)
+#      roda o módulo do 2º `-m`: vale o 2º. Antes de tokenizar, o 1º token tem de ser um
+#      python e a linha tem de citar `motor` (`_candidato_a_motor`): os ~500 processos da
+#      máquina não passam pelo shlex a cada checagem;
 #   2. o HOST de cada URL http(s) do argv (sem `www.`; todo host do hotmart.com vira
 #      `hotmart.com`) contra os hosts dos cursos de cada conta do YAML. Tenant = host: dois
 #      Cademí/Memberkit/Greenn de hosts diferentes nunca se travam; barra final, caminho,
@@ -1435,12 +1439,25 @@ def _sinalizar(pid, sig, grupo):  # pragma: no cover — sinal real
 #   5. módulo de plataforma cujo argv não traz URL de nenhum tenant DELA no YAML nem `--conta`
 #      (o tenant veio do env/default, que o daemon não lê; ou é um tenant fora do YAML, cujo
 #      login pode ser o mesmo) => fail-closed: TODAS as contas da plataforma.
+# "Módulo de plataforma" (regras 4 e 5) = o módulo do spec OU um submódulo dele
+# (`_modulo_da_plataforma`): `motor.greenn.cli` e `motor.cademi.__main__` são o mesmo CLI.
 # O argv vem do `ps` já sem aspas: ele é lido de DUAS formas (espaços; e shlex, se parsear) e
 # as contas das duas leituras se SOMAM — uma aspa solta nunca esconde um motor.
+# LIMITES CONHECIDOS (falso negativo; o lock e a disciplina de quem roda à mão cobrem): motor
+# rodado sem `-m` (`python motor/greenn/cli.py`); interpretador cujo CAMINHO tem espaço (o 1º
+# token do `ps` sai cortado); depurador fora de `_MODULOS_EXECUTORES`; o MESMO tenant aberto
+# por outro host (domínio próprio x subdomínio) com URL no argv; navegador que sobrou depois de
+# o python do motor morrer. `-m motor.x` depois de um módulo que NÃO é depurador é argumento
+# dele e não conta.
 # Módulos que capturam uma plataforma sem ser o CLI dela (os workers da fila: Hotmart).
 _MODULOS_DE_PLATAFORMA_SEM_URL = {"motor.worker": "hotmart",
                                   "motor.worker_residencial": "hotmart"}
-_EXE_PYTHON_RE = re.compile(r"python[0-9.]*t?", re.IGNORECASE)
+# python, python3, python3.12, python3.13t, python3.12-intel64, pythonw, Python (framework)
+_EXE_PYTHON_RE = re.compile(r"python[\w.\-]*", re.IGNORECASE)
+# Módulos que RODAM outro módulo pelo próprio `-m`/`--module` (depuradores e perfiladores).
+_MODULOS_EXECUTORES = frozenset({"pdb", "ipdb", "pudb", "cProfile", "profile", "trace",
+                                 "coverage", "debugpy", "pyinstrument", "memray",
+                                 "viztracer", "scalene"})
 # opções LONGAS do CPython que consomem o token seguinte (as demais não levam argumento)
 _OPCOES_LONGAS_COM_ARG = frozenset({"--check-hash-based-pycs"})
 
@@ -1493,11 +1510,50 @@ def _leituras_do_argv(args):
     return leituras
 
 
+def _e_modulo_motor(nome) -> bool:
+    return nome == "motor" or str(nome).startswith("motor.")
+
+
+def _modulo_da_plataforma(modulo, base) -> bool:
+    """`modulo` é o módulo `base` do spec ou um submódulo dele (`motor.greenn.cli`)?"""
+    return modulo == base or str(modulo).startswith(base + ".")
+
+
+def _candidato_a_motor(args) -> bool:
+    """Pré-filtro BARATO, antes de qualquer tokenização: a linha cita `motor` e o 1º token é um
+    python. Nenhuma linha de motor fica de fora (as duas condições são necessárias para
+    `_modulo_motor` casar em qualquer leitura do argv)."""
+    args = args or ""
+    if "motor" not in args:
+        return False
+    primeiro = args.split(None, 1)[0] if args.strip() else ""
+    return bool(_EXE_PYTHON_RE.fullmatch(os.path.basename(primeiro.strip("\"'"))))
+
+
+def _modulo_do_executor(resto):
+    """O `motor[.x]` que um depurador/perfilador roda: o 1º `-m X`, `-mX`, `--module X` ou
+    `--module=X` do resto do argv que seja um módulo do motor; senão None."""
+    for k, tok in enumerate(resto):
+        if tok in ("-m", "--module"):
+            alvo = resto[k + 1] if k + 1 < len(resto) else ""
+        elif tok.startswith("--module="):
+            alvo = tok.split("=", 1)[1]
+        elif tok.startswith("-m") and not tok.startswith("--") and len(tok) > 2:
+            alvo = tok[2:]
+        else:
+            continue
+        if _e_modulo_motor(alvo):
+            return alvo
+    return None
+
+
 def _modulo_motor(partes):
     """`motor` ou `motor.<x>` se o argv `partes` é um PYTHON rodando `-m motor[.x]` como opção
     do INTERPRETADOR; senão None. Segue o parser de opções do CPython: grupo curto (`-u`,
     `-um motor.x`, `-mmotor.x`), `-X`/`-W` consomem argumento, `-c` e o primeiro não-opção (o
-    script) encerram — `python script.py -m motor.x` não é motor."""
+    script) encerram — `python script.py -m motor.x` não é motor. Se o `-m` é de um depurador
+    ou perfilador (`_MODULOS_EXECUTORES`: `-m pdb -m motor.x`, `-m cProfile -o f -m motor.x`,
+    `-m coverage run -m motor.x`), vale o módulo que ELE roda."""
     if not partes or not _EXE_PYTHON_RE.fullmatch(os.path.basename(partes[0])):
         return None
     i = 1
@@ -1519,7 +1575,9 @@ def _modulo_motor(partes):
             if letra == "c":
                 return None
             if letra == "m":
-                return resto if (resto == "motor" or resto.startswith("motor.")) else None
+                if resto in _MODULOS_EXECUTORES:
+                    return _modulo_do_executor(partes[i + 1:])
+                return resto if _e_modulo_motor(resto) else None
             break                                          # -X/-W: argumento consumido
         i += 1
     return None
@@ -2367,9 +2425,11 @@ class LocalExecutor:
         explicita = _valor_da_opcao(partes, "--conta")
         if explicita:
             contas.add(str(explicita))
-        plataformas = {p for p, s in _PLATAFORMAS.items() if s.modulo == modulo}
-        if modulo in _MODULOS_DE_PLATAFORMA_SEM_URL:
-            plataformas.add(_MODULOS_DE_PLATAFORMA_SEM_URL[modulo])
+        # módulo do spec OU submódulo dele (`motor.greenn.cli`, `motor.cademi.__main__`)
+        plataformas = {p for p, s in _PLATAFORMAS.items()
+                       if _modulo_da_plataforma(modulo, s.modulo)}
+        plataformas |= {p for base, p in _MODULOS_DE_PLATAFORMA_SEM_URL.items()
+                        if _modulo_da_plataforma(modulo, base)}
         for m in self._meta.values():
             spec = _PLATAFORMAS.get(m.plataforma)
             if m.plataforma not in plataformas or spec is None:
@@ -2411,6 +2471,8 @@ class LocalExecutor:
         ppid_de = {pid: ppid for pid, ppid, _ in tabela}
         achados = []
         for pid, _ppid, args in tabela:
+            if not _candidato_a_motor(args):
+                continue                                   # não é python citando motor: sem shlex
             modulos, ocupa, hosts = set(), set(), set()
             for partes in _leituras_do_argv(args):         # as leituras SOMAM (fail-closed)
                 modulo = _modulo_motor(partes)

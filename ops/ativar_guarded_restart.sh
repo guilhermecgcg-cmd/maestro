@@ -11,9 +11,15 @@
 #     andamento. D3r2, A3: o `python[^ ]* -m motor\.` do D3 ainda não via `python -u -m motor.cli`,
 #     `-X dev`/`-W ação` antes do `-m`, nem o `Python` de framework do macOS (argv[0] maiúsculo).
 #   - LOCK: só NÃO segura a janela o de dono explicitamente MANUAL (sonda-p102, motor-anexos,
-#     motor-retentar, manual...) cujo PID não descende do daemon — a prova manual não é afetada pelo
-#     restart e segurava a janela para sempre. O motor desse lock (e o que descende dele) também não
-#     segura. Lock sem dono, ilegível, de PID ausente ou filho do daemon: segura (conservador).
+#     motor-retentar, manual...) com PID inteiro que não descende do daemon — a prova manual não é
+#     afetada pelo restart e segurava a janela para sempre. O motor desse lock (e o que descende dele)
+#     também não segura. Lock sem dono, ilegível, SEM PID ou de PID filho do daemon: segura
+#     (conservador). D3r2, A4: o lock manual cujo PID JÁ NÃO ESTÁ no `ps` (a prova manual morreu e
+#     deixou o lock) também NÃO segura — era o que o código fazia; o cabeçalho dizia o contrário.
+#     Por quê: o restart não tem o que matar num PID morto; um motor que ainda viva daquela prova
+#     (órfão, reparentado ao launchd) não descende do PID aceito e é contado pela tabela de processos
+#     (MOTOR, abaixo) — segura por ser motor; e ninguém apaga o lock manual morto de uma conta que o
+#     daemon não consulta: segurar por ele era voltar ao "preso para sempre".
 #   - Costuras de teste por env (AGR_*), com os caminhos de produção como padrão. AGR_SO_GUARDA=1
 #     decide a janela e sai ANTES de qualquer unload/load.
 set -u

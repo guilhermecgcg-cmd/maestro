@@ -11,9 +11,10 @@ AGORA:
   - motor vivo = `[Pp]ython…` com opções do interpretador antes do `-m motor.` (qualquer braço,
     qualquer nome de interpretador, o `Python` de framework do macOS — D3r2, A3);
   - um lock só é ACEITO (não segura) quando o dono é explicitamente MANUAL (`sonda-p102`,
-    `motor-anexos`, `motor-retentar`, `manual…`) E o PID dele não descende do daemon; o motor
-    desse lock (e o que descende dele) também não segura. Lock sem dono, ilegível, de dono
-    manual mas filho do daemon, ou de PID desconhecido: segura (conservador).
+    `motor-anexos`, `motor-retentar`, `manual…`) E o PID dele não descende do daemon — vivo ou já
+    fora do `ps` (D3r2, A4); o motor desse lock (e o que descende dele) também não segura. Lock sem
+    dono, ilegível, de dono manual mas filho do daemon, ou sem PID: segura (conservador). Um motor
+    vivo que NÃO descende do PID aceito (o órfão da prova manual morta) segura por ser motor.
 
 Dublês: `ps`, `launchctl`, `pgrep` e `sleep` de mentira no PATH (tabela de processos num arquivo)
 e o modo `AGR_SO_GUARDA=1`, que decide a janela e sai ANTES de qualquer unload/load. Nada toca o
@@ -144,6 +145,25 @@ def test_lock_de_prova_manual_fora_do_daemon_nao_segura_para_sempre(tmp_path, do
               "hotmart-principal", "ts": time.time(), "dono": dono}]
     assert _resultado(_rodar(tmp_path, procs, locks)) == "RESULTADO=GUARDA_OK", \
         "a prova manual fora do daemon segurou o restart"
+
+
+# D3r2, A4 (revisão independente): o cabeçalho dizia "lock de PID ausente: segura"; o código aceita o
+# lock manual cujo PID não está no `ps`. Alinhado o CABEÇALHO ao código, não o contrário (o porquê
+# está no cabeçalho do script) — o teste do revisor, que pedia HELD, NÃO foi copiado. O que protege
+# um motor em voo é a tabela de processos: o segundo teste prova que o órfão vivo da prova manual
+# morta ainda segura a janela.
+def test_lock_manual_de_pid_que_ja_morreu_nao_segura_a_janela(tmp_path):
+    locks = [{"pid": 99991, "course_url": "motor-anexos:x", "conta": "c", "ts": time.time(),
+              "dono": "motor-anexos"}]
+    assert _resultado(_rodar(tmp_path, [], locks)) == "RESULTADO=GUARDA_OK"
+
+
+def test_motor_orfao_da_prova_manual_morta_ainda_segura_a_janela(tmp_path):
+    locks = [{"pid": 99991, "course_url": "motor-anexos:x", "conta": "c", "ts": time.time(),
+              "dono": "motor-anexos"}]
+    procs = [(52010, 1, "/Users/g/teste/aula/.venv/bin/python -m motor.cli --anexos "
+                        "https://hotmart.com/pt-br/club/x/products/1")]
+    assert _resultado(_rodar(tmp_path, procs, locks)) == "RESULTADO=HELD"
 
 
 @pytest.mark.parametrize("lock,procs", [

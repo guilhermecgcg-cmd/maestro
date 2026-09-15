@@ -288,6 +288,116 @@ def _saida_de_abort_do_disjuntor(texto) -> bool:
     return bool(_RE_SAIDA_ABORT_DISJUNTOR.search(str(texto or "")))
 
 
+# SUSPENSÃO GLOBAL DOS PASSES DO YOUTUBE (rodada 2, item 7 — incidente REAL de 15/09): o passe
+# `--youtube` do Ciro Gestor abortou com exit 4 classe youtube às 11:07 ("Sign in to confirm
+# you're not a bot": o IP do Mac barrado) e foi redisparado às 11:07:50 e às 11:10:59 — cada
+# retentativa abria a conta Hotmart paga e batia de novo no YouTube, aprofundando o bloqueio.
+# O bloqueio é do IP, não do curso: vale para TODOS os cursos.
+#   - um exit 4 da classe `youtube` ABRE a suspensão: 3 h, dobrando a cada bloqueio novo dentro
+#     de 48 h do anterior, teto 24 h (degraus 3 → 6 → 12 → 24 h);
+#   - enquanto vale, o executor não escolhe o passe `--youtube` para curso nenhum (e não troca
+#     por uma sonda base quando o YouTube era o único trabalho);
+#   - vencida, sai UMA prova (o primeiro passe youtube disparado); os outros esperam o resultado:
+#     sucesso ou abort de outra classe ENCERRA a suspensão; bloqueio de novo REABRE no degrau
+#     seguinte. O degrau zera depois de 48 h sem bloqueio (avaliado no bloqueio seguinte);
+#   - o mesmo bloqueio visto por outro curso com a janela JÁ aberta não sobe degrau;
+#   - persistida no arquivo de estado (chave `youtube`), sobrevive ao reinício.
+# Memberkit/Greenn: o braço de áudio deles consulta o YouTube DENTRO do passe único (`base`) —
+# o daemon não distingue esse passe, e suspender o `base` pararia também as aulas Panda/Vimeo.
+# Um bloqueio visto neles abre a suspensão (o motor sai 4 classe youtube) e o porteiro do
+# próprio motor para o YouTube no resto do passe.
+_CHAVE_YOUTUBE = "__youtube__"         # no `estado` do loop (não é curso); em disco: "youtube"
+_YOUTUBE_SUSPENSAO_S = _env_float("ATHENA_YOUTUBE_SUSPENSAO_S", 10800.0, minimo=60.0,
+                                  maximo=_ESTADO_FUTURO_MAX_S)                 # 3 h
+_YOUTUBE_SUSPENSAO_TETO_S = _env_float("ATHENA_YOUTUBE_SUSPENSAO_TETO_S", 86400.0, minimo=60.0,
+                                       maximo=_ESTADO_FUTURO_MAX_S)            # 24 h
+_YOUTUBE_DEGRAU_ZERA_S = _env_float("ATHENA_YOUTUBE_DEGRAU_ZERA_S", 172800.0,
+                                    minimo=3600.0)                             # 48 h
+
+
+def _youtube_janela_s(degrau) -> float:
+    """A janela do degrau N: base × 2^(N-1), limitada pelo teto."""
+    teto = max(_YOUTUBE_SUSPENSAO_TETO_S, _YOUTUBE_SUSPENSAO_S)
+    return min(_YOUTUBE_SUSPENSAO_S * (2 ** max(int(degrau) - 1, 0)), teto)
+
+
+def _youtube_degrau_max() -> int:
+    """O primeiro degrau cuja janela já é o teto (com os padrões, 4 = 24 h)."""
+    n, teto = 1, max(_YOUTUBE_SUSPENSAO_TETO_S, _YOUTUBE_SUSPENSAO_S)
+    while _youtube_janela_s(n) < teto and n < 32:
+        n += 1
+    return n
+
+
+def _youtube_bloqueado(sy, agora) -> bool:
+    """Os passes do YouTube estão suspensos AGORA? Janela aberta, ou a prova em andamento. Uma
+    prova sem resultado há mais que o teto (resultado perdido) é descartada: libera nova prova."""
+    if not isinstance(sy, dict):
+        return False
+    if sy.get("prova_curso"):
+        if agora - float(sy.get("prova_desde") or 0.0) <= max(_YOUTUBE_SUSPENSAO_TETO_S,
+                                                              _YOUTUBE_SUSPENSAO_S):
+            return True
+        sy.pop("prova_curso", None)
+        sy.pop("prova_desde", None)
+    ate = sy.get("ate")
+    return ate is not None and agora < float(ate)
+
+
+def _youtube_abrir(sy, agora):
+    """(Re)abre a suspensão no degrau certo; devolve (degrau, ate)."""
+    ultimo = sy.get("ultimo_bloqueio")
+    if ultimo is not None and (agora - float(ultimo)) < _YOUTUBE_DEGRAU_ZERA_S:
+        degrau = min(int(sy.get("degrau") or 0) + 1, _youtube_degrau_max())
+    else:
+        degrau = 1                                     # 48 h sem bloqueio: o degrau zera
+    sy["degrau"] = degrau
+    sy["ate"] = agora + _youtube_janela_s(degrau)
+    sy["ultimo_bloqueio"] = agora
+    sy.pop("prova_curso", None)
+    sy.pop("prova_desde", None)
+    return degrau, sy["ate"]
+
+
+def _texto_youtube_suspenso(ate, degrau) -> str:
+    return (f"YouTube bloqueou o IP do Mac — passes do YouTube suspensos até "
+            f"{time.strftime('%H:%M', time.localtime(float(ate)))} (degrau {degrau})")
+
+
+def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
+    """Depois da decisão da morte: abre/reabre/encerra a suspensão global do YouTube."""
+    sy = estado.get(_CHAVE_YOUTUBE)
+    exit4 = getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER
+    classe = (_classe_do_abort(getattr(obito, "stderr_bruto", "")
+                               or getattr(obito, "stderr_tail", "") or "") if exit4 else None)
+    prova = isinstance(sy, dict) and sy.get("prova_curso") == curso
+    if classe != "youtube":
+        if prova:                                      # a prova passou sem bloqueio do YouTube
+            sy.pop("prova_curso", None)
+            sy.pop("prova_desde", None)
+            sy.pop("ate", None)
+            _registrar(espinha, "suspensão dos passes do YouTube encerrada",
+                       f"a prova de {curso} terminou sem bloqueio do YouTube (exit "
+                       f"{getattr(obito, 'exit_code', None)})", reversivel=True,
+                       fonte="deterministico", curso=curso, origem="athena-local/youtube")
+        return
+    if not prova and _youtube_bloqueado(sy, agora):
+        return                                         # o MESMO bloqueio, visto por outro curso
+    sy = estado.setdefault(_CHAVE_YOUTUBE, {})
+    degrau, ate = _youtube_abrir(sy, agora)
+    texto = _texto_youtube_suspenso(ate, degrau)       # UMA vez por abertura
+    log.warning(texto)
+    if voz is not None:
+        try:
+            voz.escalar(Problema("youtube_suspenso", "youtube", texto, "aviso"), texto)
+        except Exception:
+            pass
+    _registrar(espinha, texto, f"exit 4 classe youtube em {curso} — o IP do Mac, não o curso: "
+               f"nenhum passe do YouTube até vencer; depois UMA prova",
+               tipo="escalada", reversivel=True, escalada=True, trava="youtube-global",
+               curso=curso, fonte="deterministico", origem="athena-local/youtube")
+
+
 def _serie_exit4_aberta(st, agora) -> bool:
     """Há série de exit-4 de PLATAFORMA viva — com abort mais novo que a janela de decaimento?"""
     if not st.get("exit4_seguidas"):
@@ -822,7 +932,7 @@ def _anotar_causa_na_autopsia(obito, decisao, plataforma):
 
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
                      autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None,
-                     boot_ts=None):
+                     boot_ts=None, voz=None):
     """Passe de AUTÓPSIA do ciclo: drena os óbitos do executor, roda o vigia (que também
     varre `lock_dir` por mortes de encarnações anteriores), classifica cada óbito pela
     causa-raiz e aplica a decisão ao `st` do curso. Best-effort: um erro aqui NÃO derruba
@@ -896,6 +1006,11 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
         _aplicar_decisao(curso, st, obito, decisao, disjuntor=disjuntor,
                          alertas=alertas, agora=agora, meta_por_curso=meta_por_curso,
                          flap_min=flap_min, espinha=espinha)
+        # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): best-effort — nunca derruba o ciclo
+        try:
+            _observar_youtube(estado, curso, obito, agora=agora, voz=voz, espinha=espinha)
+        except Exception:
+            log.warning("não avaliei a suspensão do YouTube para %s", curso, exc_info=True)
 
 
 def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st, *, espinha=None):
@@ -1233,6 +1348,21 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         st["fase"] = FASE_CAPTURANDO
         if st.pop("exit4_rearmado", None):                 # a UMA tentativa pós-bench DISPAROU:
             st["exit4_ultimo"] = agora                     # o decaimento conta daqui
+        # A PROVA DO YOUTUBE (rodada 2, item 7): a suspensão venceu e este é o primeiro passe
+        # `--youtube` a sair — ele é a prova. Os demais cursos ficam bloqueados JÁ neste ciclo,
+        # até a autópsia dele dizer o resultado.
+        sy = estado.get(_CHAVE_YOUTUBE)
+        if (isinstance(sy, dict) and sy.get("ate") is not None and not sy.get("prova_curso")
+                and str(conf).endswith(":passe=youtube")):
+            sy["prova_curso"] = curso
+            sy["prova_desde"] = agora
+            _bloq = getattr(executor, "bloquear_passe_youtube", None)
+            if callable(_bloq):
+                _bloq(True)
+            _registrar(esp, f"prova do YouTube: {curso}",
+                       "a suspensão venceu — UM passe do YouTube sai; os outros esperam o "
+                       "resultado dele", reversivel=True, fonte="deterministico", curso=curso,
+                       plataforma=plat, origem="athena-local/youtube")
         # Marca-d'água do Notion no disparo: se a saída-limpa não a ultrapassar, o run nada
         # produziu (curso quiescido -> cooldown); se ultrapassar, houve progresso (segue).
         st["_no_notion_no_disparo"] = st.get("ultimo_no_notion")
@@ -1961,6 +2091,47 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
     return saida
 
 
+_ESTADO_YOUTUBE_INSTANTES = ("ate", "ultimo_bloqueio", "prova_desde")
+
+
+def _carregar_estado_youtube(path, *, agora) -> dict:
+    """A suspensão global do YouTube persistida (chave `youtube` do arquivo de estado), ou {}.
+    Tolerante como `_carregar_estado_cursos`: arquivo ausente/ilegível, chave ausente (versão
+    antiga) ou de outro tipo => {}; cada campo é saneado sozinho (instante finito e não além de
+    `_ESTADO_FUTURO_MAX_S`; degrau inteiro >= 1; prova = URL não vazia). Nunca levanta."""
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            dados = json.load(f)
+    except Exception:
+        return {}
+    sy = dados.get("youtube") if isinstance(dados, dict) else None
+    if not isinstance(sy, dict):
+        return {}
+    limpo = {}
+    for chave in _ESTADO_YOUTUBE_INSTANTES:
+        valor = sy.get(chave)
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+            continue
+        try:
+            valor = float(valor)
+        except (OverflowError, ValueError):
+            continue
+        if not math.isfinite(valor) or valor > agora + _ESTADO_FUTURO_MAX_S:
+            continue
+        limpo[chave] = valor
+    degrau = sy.get("degrau")
+    if isinstance(degrau, int) and not isinstance(degrau, bool) and degrau >= 1:
+        limpo["degrau"] = degrau
+    prova = sy.get("prova_curso")
+    if isinstance(prova, str) and prova and "prova_desde" in limpo:
+        limpo["prova_curso"] = prova
+    else:
+        limpo.pop("prova_desde", None)
+    return limpo
+
+
 def _gravar_estado_cursos(path, estado) -> None:
     """Grava as chaves da lista branca de cada curso (troca atômica). Best-effort: uma
     falha vira WARNING no loop.err — a captura segue, só a sobrevivência da escada ao
@@ -1970,7 +2141,7 @@ def _gravar_estado_cursos(path, estado) -> None:
     try:
         cursos = {}
         for curso, st in (estado or {}).items():
-            if not isinstance(st, dict):
+            if curso == _CHAVE_YOUTUBE or not isinstance(st, dict):
                 continue
             linha = {k: st[k] for k in _ESTADO_CURSOS_CHAVES
                      if isinstance(st.get(k), (int, float))
@@ -1982,7 +2153,12 @@ def _gravar_estado_cursos(path, estado) -> None:
             os.makedirs(pasta, exist_ok=True)
         tmp = f"{path}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"versao": 1, "gravado_em": time.time(), "cursos": cursos}, f)
+            registro = {"versao": 1, "gravado_em": time.time(), "cursos": cursos}
+            sy = (estado or {}).get(_CHAVE_YOUTUBE)
+            if isinstance(sy, dict) and sy:                # suspensão global do YouTube (item 7)
+                registro["youtube"] = {k: v for k, v in sy.items()
+                                       if k in _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso")}
+            json.dump(registro, f)
         os.replace(tmp, path)
     except Exception as e:
         log.warning("não gravei o estado dos cursos em %s (%s: %s) — um reinício zeraria "
@@ -2143,7 +2319,15 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     _autopsiar_ciclo(executor, estado, vigia=vigia, causa=causa, disjuntor=disjuntor,
                      alertas=alertas, lock_dir=lock_dir, autopsia_dir=autopsia_dir,
                      agora=agora, meta_por_curso=meta_por_curso, flap_min=flap_min,
-                     llm=llm, espinha=espinha, boot_ts=boot_ts)
+                     llm=llm, espinha=espinha, boot_ts=boot_ts, voz=voz)
+    # (3b) SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): DEPOIS da autópsia (que abre/encerra)
+    # e ANTES das passadas, o executor sabe se pode escolher o passe `--youtube` neste ciclo.
+    _bloquear_youtube = getattr(executor, "bloquear_passe_youtube", None)
+    if callable(_bloquear_youtube):
+        try:
+            _bloquear_youtube(_youtube_bloqueado(estado.get(_CHAVE_YOUTUBE), agora))
+        except Exception:
+            pass
 
     # (4) passada LOCAL + owner. FRONTEIRA DE CICLO do portão de carga: a janela do
     # ESCALONAMENTO (no máx N disparos novos por ciclo na saída da sobrecarga) vira AQUI,
@@ -2355,6 +2539,13 @@ async def rodar(cursos, executor, progresso_fn, voz, *, sleep=asyncio.sleep,
     except Exception:
         log.warning("não restaurei o estado dos cursos — a escada do disjuntor "
                     "recomeça do zero nesta encarnação", exc_info=True)
+    # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o reinício não solta o IP do Mac barrado
+    try:
+        sy = _carregar_estado_youtube(estado_cursos_path, agora=time.time())
+        if sy:
+            estado[_CHAVE_YOUTUBE] = sy
+    except Exception:
+        log.warning("não restaurei a suspensão do YouTube", exc_info=True)
     if "desde" in estado_carga:
         _retomar = getattr(executor, "retomar_sobrecarga", None)
         if callable(_retomar):

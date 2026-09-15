@@ -733,6 +733,13 @@ def _cravar_cadencia_do_motor(env) -> None:
         env[nome] = str(min(valor, _CADENCIA_TETO_S))
 
 
+class PasseYoutubeSuspenso(ContaOcupada):
+    """SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7 da trilha anti-ban): o único trabalho do
+    curso é o passe `--youtube` e o YouTube está bloqueado para o IP do Mac. Aguarda (não é
+    falha: sem disjuntor, tentativa nem escalada) — e NÃO vira sonda `base`, que abriria a
+    conta à toa."""
+
+
 # PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 5) E pela Stoa
 # (motor.stoa: base/--embed/--nao-video). `base` = passe default SEM flag (legenda/vídeo
 # nativo no Hotmart; áudio-nativo na Stoa). Os demais ligam os seletores próprios do
@@ -1496,6 +1503,9 @@ class LocalExecutor:
         # em vez de fixar sempre o 1º). In-memory: perda no restart é benigna (recomeça do
         # início do anel). NÃO afeta o anti-ban (o guard é o lock durável em disco).
         self._passe_cursor = {}
+        # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o loop diz a cada ciclo (e na hora da
+        # prova) se o passe `--youtube` pode ser escolhido. False = comportamento de sempre.
+        self._youtube_bloqueado = False
         # Override de diretório do motor POR PLATAFORMA (ex.: Stoa vive no worktree
         # adaptador-stoa, não em /aula). Default = self._motor_dir para as demais.
         self._motor_dir_por_plataforma = dict(motor_dir_por_plataforma or {})
@@ -2287,7 +2297,12 @@ class LocalExecutor:
         if len(passes) == 1:
             return passes[0]                               # áudio-nativos: NADA muda
         ativaveis = [p for p in passes if _passe_ativavel(p, meta.plataforma)]
-        if len(ativaveis) == 1:
+        # SUSPENSÃO GLOBAL DO YOUTUBE (item 7): o `--youtube` sai do anel enquanto o IP do Mac
+        # está barrado; os passes que não tocam o YouTube seguem.
+        youtube_suspenso = self._youtube_bloqueado and "youtube" in ativaveis
+        if youtube_suspenso:
+            ativaveis = [p for p in ativaveis if p != "youtube"]
+        if len(ativaveis) == 1 and not youtube_suspenso:
             # Um único passe ativável (ex.: Stoa com o gate ATHENA_STOA_PASSES_ATIVO
             # desligado => só "base"): a escolha está decidida — NÃO consulta pendências
             # (poupa a query SQLite e mantém o caminho de execução IDÊNTICO ao de antes
@@ -2304,6 +2319,10 @@ class LocalExecutor:
         else:
             candidatos = [p for p in ativaveis if pend.get(p, 0) > 0]
         if not candidatos:
+            if youtube_suspenso and pend is not None and pend.get("youtube", 0) > 0:
+                raise PasseYoutubeSuspenso(
+                    f"conta {meta.conta!r}: só há passe do YouTube na fila e o YouTube está "
+                    f"suspenso para o IP do Mac — aguardo a janela (sem sonda base)")
             return "base"                                  # nada elegível: sonda base
         return self._proximo_no_anel(meta.conta, passes, candidatos)
 
@@ -2317,6 +2336,11 @@ class LocalExecutor:
                 self._passe_cursor[conta] = (idx + 1) % len(passes)
                 return passes[idx]
         return candidatos[0]                               # inalcançável (candidatos ⊆ passes)
+
+    def bloquear_passe_youtube(self, bloqueado) -> None:
+        """SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o loop liga/desliga a escolha do
+        passe `--youtube` para TODOS os cursos (a decisão e o estado moram no loop)."""
+        self._youtube_bloqueado = bool(bloqueado)
 
     def _checar_host_e_credencial(self, meta, spec):
         """Última linha de defesa do host e da credencial (LEVANTA RuntimeError => nada é

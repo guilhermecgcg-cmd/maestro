@@ -194,7 +194,9 @@ _ESPERA_EXIT4_S = _env_float("ATHENA_ESPERA_EXIT4_S", 600.0, minimo=0.0)        
 _BENCH_EXIT4_EXPIRA_S = _env_float("ATHENA_BENCH_EXIT4_EXPIRA_S", 86400.0,
                                    minimo=3600.0)                               # 24 h
 
-# CLASSE DO ABORT, lida da cauda que a autópsia JÁ tem (as últimas 40 linhas do motor-log):
+# CLASSE DO ABORT, lida da SAÍDA INTEIRA que a autópsia já tem — `Obito.stderr_bruto`, os
+# últimos 64 KB (rodada 2: nas 40 linhas do `stderr_tail`, o ruído de encerramento — httpx,
+# yt-dlp, call log do Playwright — empurrava a frase para fora e o local virava parede):
 #   1. a LINHA DE MÁQUINA do motor `ABORT_DISJUNTOR tipo=local|plataforma|youtube` (a última
 #      vence) — contrato estável, preferido à prosa;
 #   2. senão a PROSA do próprio motor (motor/orchestrator.py e os CLIs), a ocorrência MAIS
@@ -645,7 +647,8 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
     # `escalar_token` fica FORA da série (mesma razão do exit-5): a chave é da API downstream,
     # benchar engoliria o alerta "troque o token"; sem avanço no Notion a escada já espaça.
     if getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER:
-        classe = _classe_do_abort(getattr(obito, "stderr_tail", "") or "")
+        classe = _classe_do_abort(getattr(obito, "stderr_bruto", "")
+                                  or getattr(obito, "stderr_tail", "") or "")
         espera = max(_ESPERA_EXIT4_S, 1.0)
         st["exit4_ate"] = agora + espera
         motivo_causa = (f"{motivo_causa or 'circuit-breaker do motor (exit 4)'} — classe: "

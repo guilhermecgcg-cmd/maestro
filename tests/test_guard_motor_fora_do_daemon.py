@@ -525,6 +525,10 @@ def test_so_os_candidatos_a_motor_passam_pelo_shlex(tmp_path, monkeypatch):
     f"{PY_REAL} -m cProfile -o /tmp/perfil.out -s cumtime -m motor.greenn https://sierramkt.greenn.club/",
     f"{PY_REAL} -m coverage run -m motor.greenn.cli --course 115070",
     f"{PY_REAL} -mtrace --count --module=motor.greenn https://sierramkt.greenn.club/",
+    f"{PY_REAL} -m trace --count -C /tmp/cov --module motor.greenn https://sierramkt.greenn.club/",
+    f"{PY_REAL} -m memray run -o /tmp/m.bin -m motor.greenn https://sierramkt.greenn.club/",
+    f"{PY_REAL} -m debugpy --listen 5678 --wait-for-client -m motor.greenn https://sierramkt.greenn.club/",
+    f"{PY_REAL} -m pdb -c continue -m motor.greenn https://sierramkt.greenn.club/",
     "/usr/local/bin/python3.12-intel64 -m motor.greenn https://sierramkt.greenn.club/",
     "/opt/homebrew/bin/python3.13t -m motor.greenn https://sierramkt.greenn.club/",
 ])
@@ -534,6 +538,24 @@ def test_motor_sob_depurador_ou_interpretador_com_sufixo_barra(tmp_path, argv):
     with pytest.raises(captura.MotorForaDoDaemon):
         ex.disparar(GREENN)
     assert sp.calls == []
+
+
+@pytest.mark.parametrize("resto", [
+    # FALSOS POSITIVOS da revisão do fcaf5c3: nenhum destes roda motor, e cada um travava a conta
+    "-m coverage run -m pytest -m motor.greenn",                   # marcador do pytest
+    "-m coverage run meu_script.py -m motor.greenn",               # script do coverage
+    "-m cProfile -m maestro.relatorio -m motor.greenn https://sierramkt.greenn.club/",
+    "-m pdb meu_script.py -m motor.greenn https://sierramkt.greenn.club/",
+    "-m pdb -c continue meu_script.py -m motor.greenn https://sierramkt.greenn.club/",
+    "-m coverage report -m motor.greenn",                          # `report -m` = linhas faltando
+    "-m coverage -m motor.greenn https://sierramkt.greenn.club/",  # sem `run`: coverage só erra
+])
+def test_depois_do_depurador_so_o_primeiro_m_decide(tmp_path, resto):
+    ex, sp = _ex(tmp_path, [_curso(GREENN), _curso(GREENN_OUTRO)],
+                 TabelaPs((PID_MANUAL, PID_SHELL, f"{PY_REAL} {resto}")))
+    assert ex.disparar(GREENN).startswith("local_iniciada")
+    assert ex.disparar(GREENN_OUTRO).startswith("local_iniciada")
+    assert len(sp.calls) == 2
 
 
 def test_segundo_m_so_vale_depois_de_depurador(tmp_path):

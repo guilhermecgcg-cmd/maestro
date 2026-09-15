@@ -1426,7 +1426,10 @@ def _sinalizar(pid, sig, grupo):  # pragma: no cover — sinal real
 #      (`_modulo_motor`): `grep motor.greenn <url>`, o `zsh -c "python -m ..."` e o
 #      `python script.py -m motor.x` não casam — o python filho do shell casa. Depurador ou
 #      perfilador (`-m pdb`, `-m cProfile -o x`, `-m coverage run`; `_MODULOS_EXECUTORES`)
-#      roda o módulo do 2º `-m`: vale o 2º. Antes de tokenizar, o 1º token tem de ser um
+#      roda o módulo do SEU 1º `-m`/`--module`: vale esse e só esse — um script, um
+#      subcomando que não é o `run`, ou um `-m` de outro módulo antes dele encerra
+#      (`-m coverage run -m pytest -m motor.x` é marcador do pytest, não motor; ver
+#      `_modulo_do_executor`). Antes de tokenizar, o 1º token tem de ser um
 #      python e a linha tem de citar `motor` (`_candidato_a_motor`): os ~500 processos da
 #      máquina não passam pelo shlex a cada checagem;
 #   2. o HOST de cada URL http(s) do argv (sem `www.`; todo host do hotmart.com vira
@@ -1445,19 +1448,47 @@ def _sinalizar(pid, sig, grupo):  # pragma: no cover — sinal real
 # as contas das duas leituras se SOMAM — uma aspa solta nunca esconde um motor.
 # LIMITES CONHECIDOS (falso negativo; o lock e a disciplina de quem roda à mão cobrem): motor
 # rodado sem `-m` (`python motor/greenn/cli.py`); interpretador cujo CAMINHO tem espaço (o 1º
-# token do `ps` sai cortado); depurador fora de `_MODULOS_EXECUTORES`; o MESMO tenant aberto
-# por outro host (domínio próprio x subdomínio) com URL no argv; navegador que sobrou depois de
-# o python do motor morrer. `-m motor.x` depois de um módulo que NÃO é depurador é argumento
-# dele e não conta.
+# token do `ps` sai cortado); depurador fora de `_MODULOS_EXECUTORES`, ou com uma opção que
+# consome valor e não está na tabela dele (o valor parece o script: encerra sem casar);
+# depurador chamado pelo SCRIPT DE CONSOLE em vez de `-m` (`/…/python /…/bin/coverage run -m
+# motor.greenn`, e igual com pyinstrument/memray/viztracer/scalene — o python roda um script,
+# não um `-m`); `ipython -m motor.x` (idem, e o executável não é `python*`); o MESMO tenant
+# aberto por outro host (domínio próprio x subdomínio) com URL no argv; navegador que sobrou
+# depois de o python do motor morrer. `-m motor.x` depois de um módulo que NÃO é depurador é
+# argumento dele e não conta.
 # Módulos que capturam uma plataforma sem ser o CLI dela (os workers da fila: Hotmart).
 _MODULOS_DE_PLATAFORMA_SEM_URL = {"motor.worker": "hotmart",
                                   "motor.worker_residencial": "hotmart"}
 # python, python3, python3.12, python3.13t, python3.12-intel64, pythonw, Python (framework)
 _EXE_PYTHON_RE = re.compile(r"python[\w.\-]*", re.IGNORECASE)
-# Módulos que RODAM outro módulo pelo próprio `-m`/`--module` (depuradores e perfiladores).
-_MODULOS_EXECUTORES = frozenset({"pdb", "ipdb", "pudb", "cProfile", "profile", "trace",
-                                 "coverage", "debugpy", "pyinstrument", "memray",
-                                 "viztracer", "scalene"})
+# Módulos que RODAM outro módulo pelo próprio `-m`/`--module` (depuradores e perfiladores):
+# nome -> (opções dele que CONSOMEM o token seguinte, subcomando obrigatório antes do `-m`).
+# As demais opções são flags. Um token solto que não é valor dessas opções é o SCRIPT (ou um
+# subcomando que não roda módulo): o que vier depois é argumento dele.
+_OPCOES_PDB = frozenset({"-c", "--command", "-p", "--pid"})
+_OPCOES_PROFILE = frozenset({"-o", "--outfile", "-s", "--sort"})
+_MODULOS_EXECUTORES = {
+    "pdb": (_OPCOES_PDB, None),
+    "ipdb": (_OPCOES_PDB, None),
+    "pudb": (_OPCOES_PDB | {"--pre-run"}, None),
+    "cProfile": (_OPCOES_PROFILE, None),
+    "profile": (_OPCOES_PROFILE, None),
+    "trace": (frozenset({"-f", "--file", "-C", "--coverdir", "--ignore-module",
+                         "--ignore-dir"}), None),
+    "coverage": (frozenset({"--concurrency", "--context", "--data-file", "--debug",
+                            "--include", "--omit", "--rcfile", "--source"}), "run"),
+    "memray": (frozenset({"-o", "--output", "-p", "--live-port"}), "run"),
+    "debugpy": (frozenset({"--listen", "--connect", "--log-to", "--pid"}), None),
+    "pyinstrument": (frozenset({"-o", "--outfile", "-r", "--renderer", "-p",
+                                "--render-option", "--interval", "--load", "--load-prev",
+                                "--target-description", "--show", "--show-regex"}), None),
+    "viztracer": (frozenset({"-o", "--output_file", "--output_dir", "--tracer_entries",
+                             "--max_stack_depth", "--exclude_files", "--include_files",
+                             "--min_duration"}), None),
+    "scalene": (frozenset({"--outfile", "--profile-interval", "--cpu-percent-threshold",
+                           "--cpu-sampling-rate", "--malloc-threshold", "--program-path",
+                           "--profile-only", "--profile-exclude", "--pid"}), None),
+}
 # opções LONGAS do CPython que consomem o token seguinte (as demais não levam argumento)
 _OPCOES_LONGAS_COM_ARG = frozenset({"--check-hash-based-pycs"})
 
@@ -1521,8 +1552,11 @@ def _modulo_da_plataforma(modulo, base) -> bool:
 
 def _candidato_a_motor(args) -> bool:
     """Pré-filtro BARATO, antes de qualquer tokenização: a linha cita `motor` e o 1º token é um
-    python. Nenhuma linha de motor fica de fora (as duas condições são necessárias para
-    `_modulo_motor` casar em qualquer leitura do argv)."""
+    python. As duas condições são necessárias para `_modulo_motor` casar em qualquer leitura
+    do argv, com UMA ressalva: um argv[0] com aspas no meio ou barra invertida LITERAIS no
+    nome do executável (`/opt/py\\thon`) — o shlex as removeria e casaria, este filtro não. O
+    `ps` imprime o argv sem aspas nem escapes, então só um executável com esses caracteres
+    no próprio nome escapa (limite conhecido)."""
     args = args or ""
     if "motor" not in args:
         return False
@@ -1530,20 +1564,37 @@ def _candidato_a_motor(args) -> bool:
     return bool(_EXE_PYTHON_RE.fullmatch(os.path.basename(primeiro.strip("\"'"))))
 
 
-def _modulo_do_executor(resto):
-    """O `motor[.x]` que um depurador/perfilador roda: o 1º `-m X`, `-mX`, `--module X` ou
-    `--module=X` do resto do argv que seja um módulo do motor; senão None."""
-    for k, tok in enumerate(resto):
+def _modulo_do_executor(executor, resto):
+    """O `motor[.x]` que o depurador/perfilador `executor` roda, lendo o `resto` do argv como
+    ELE lê: só o 1º `-m X`/`-mX`/`--module X`/`--module=X` decide — se não é do motor, None.
+    Antes dele, um token solto que não é valor de opção conhecida (`_MODULOS_EXECUTORES`) é o
+    script — ou, no coverage/memray, o subcomando, que tem de ser o `run` — e encerra: None.
+    `-m coverage run -m pytest -m motor.x`, `-m pdb script.py -m motor.x` e `-m coverage
+    report -m` não são motor; `-m pdb -m motor.x`, `-m cProfile -o f -m motor.x` e `-m
+    coverage run -m motor.x` são."""
+    valor, subcomando = _MODULOS_EXECUTORES[executor]
+    falta_subcomando = subcomando is not None
+    k = 0
+    while k < len(resto):
+        tok = resto[k]
+        alvo = None
         if tok in ("-m", "--module"):
             alvo = resto[k + 1] if k + 1 < len(resto) else ""
         elif tok.startswith("--module="):
             alvo = tok.split("=", 1)[1]
         elif tok.startswith("-m") and not tok.startswith("--") and len(tok) > 2:
             alvo = tok[2:]
-        else:
-            continue
-        if _e_modulo_motor(alvo):
-            return alvo
+        if alvo is not None:
+            if falta_subcomando:
+                return None                                # `-m` antes do `run`: não roda módulo
+            return alvo if _e_modulo_motor(alvo) else None  # só o PRIMEIRO `-m` decide
+        if tok == "--" or not tok.startswith("-"):
+            if falta_subcomando and tok == subcomando:
+                falta_subcomando = False
+                k += 1
+                continue
+            return None                                    # script, ou subcomando sem módulo
+        k += 2 if ("=" not in tok and tok in valor) else 1  # opção com valor pula o valor
     return None
 
 
@@ -1576,7 +1627,7 @@ def _modulo_motor(partes):
                 return None
             if letra == "m":
                 if resto in _MODULOS_EXECUTORES:
-                    return _modulo_do_executor(partes[i + 1:])
+                    return _modulo_do_executor(resto, partes[i + 1:])
                 return resto if _e_modulo_motor(resto) else None
             break                                          # -X/-W: argumento consumido
         i += 1

@@ -69,7 +69,10 @@ _ABORTO_YOUTUBE = (
     "\nO QUE FAZER (a Hotmart não está envolvida):\n"
     "1. ATUALIZE O YT-DLP no venv do motor.\n"
     "2. Se já está atualizado: espere ~1 hora.\n")
-_PROVA_CAPTUROU = "Stats: total=15 ok=15 audio=0 falhou=0\n"
+# D3 (contrato com o motor M4): a prova que capturou diz `YOUTUBE_PROVA resultado=ok` ao sair.
+# Reescrito, não ajustado: sem a linha, a saída limpa da prova ENCERRAVA a suspensão — é
+# exatamente a regra que o contrato substitui (sem a linha a suspensão continua).
+_PROVA_CAPTUROU = "Stats: total=15 ok=15 audio=0 falhou=0\nYOUTUBE_PROVA resultado=ok\n"
 
 
 _MUNDOS = []                                                         # tabelas de processo dos _Mac

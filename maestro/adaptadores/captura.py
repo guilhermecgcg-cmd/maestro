@@ -761,6 +761,27 @@ class PasseYoutubeSuspenso(ContaOcupada):
     conta à toa."""
 
 
+# A PROVA DO YOUTUBE (D3 — contrato com o motor M4, aula 8e4023f `motor/youtube_suspensao.py`).
+# O motor lê o arquivo de estado do daemon (ATHENA_ESTADO_CURSOS_PATH) A CADA pedido ao YouTube:
+# com `ate` presente (vencido ou não) ou prova em curso, nenhum processo pede nada — exceto o que
+# traz ATHENA_YOUTUBE_PROVA == str(prova_desde). Vencida a janela, o próximo disparo de um passe
+# que PODE tocar o YouTube leva a prova: o `--youtube` do Hotmart e o `base` das plataformas cujo
+# motor resolve player YouTube (memberkit, greenn, entregadigital — as do contrato — e nutror,
+# hubla, alpaclass, que o M4 também cobre: os três baixam YouTube com yt-dlp). Nenhuma sonda
+# dedicada. Um token herdado do ambiente do daemon NUNCA chega ao filho.
+ENV_PROVA_YOUTUBE = "ATHENA_YOUTUBE_PROVA"
+ENV_ESTADO_CURSOS = "ATHENA_ESTADO_CURSOS_PATH"
+_PLATAFORMAS_PROVA_NO_BASE = ("memberkit", "greenn", "entregadigital", "nutror", "hubla",
+                              "alpaclass")
+
+
+def passe_carrega_prova_youtube(plataforma, passe) -> bool:
+    """O passe `passe` desta plataforma pode tocar o YouTube (e portanto levar a prova)?"""
+    if passe == "youtube":
+        return plataforma == "hotmart"
+    return passe == "base" and plataforma in _PLATAFORMAS_PROVA_NO_BASE
+
+
 # PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 5) E pela Stoa
 # (motor.stoa: base/--embed/--nao-video). `base` = passe default SEM flag (legenda/vídeo
 # nativo no Hotmart; áudio-nativo na Stoa). Os demais ligam os seletores próprios do
@@ -1770,7 +1791,7 @@ class LocalExecutor:
                  motor_dir_por_plataforma=None, motor_log_dir=None, pendencias_fn=None,
                  portao_carga=None, zelo_timeout_s=_ZELO_TIMEOUT_PADRAO_S,
                  zelo_grace_s=_ZELO_GRACE_PADRAO_S, sinal_fn=None, comando_fn=None,
-                 processos_fn=None):
+                 processos_fn=None, estado_cursos_path=None):
         self._meta = {c.url: c for c in cursos}
         # MOTOR FORA DO DAEMON (incidente 15/09): leitor da tabela de processos ->
         # [(pid, ppid, args)]. None = o `ps` REAL (`_listar_processos`, resolvido a cada
@@ -1804,6 +1825,11 @@ class LocalExecutor:
         # SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o loop diz a cada ciclo (e na hora da
         # prova) se o passe `--youtube` pode ser escolhido. False = comportamento de sempre.
         self._youtube_bloqueado = False
+        # A PROVA DO YOUTUBE (D3): o arquivo de estado que o motor M4 lê (vai no env do filho) e,
+        # quando o loop arma, quem reserva/cancela a prova no disparo (`armar_prova_youtube`).
+        self._estado_cursos_path = estado_cursos_path
+        self._reservar_prova = None
+        self._cancelar_prova = None
         # Override de diretório do motor POR PLATAFORMA (ex.: Stoa vive no worktree
         # adaptador-stoa, não em /aula). Default = self._motor_dir para as demais.
         self._motor_dir_por_plataforma = dict(motor_dir_por_plataforma or {})
@@ -2674,6 +2700,8 @@ class LocalExecutor:
                 f"conta {meta.conta!r} foi ocupada durante o disparo de {curso_url} (lock de "
                 f"{atual.get('course_url') or 'dono desconhecido'}, PID {atual.get('pid')}) "
                 f"— recuso, sem abrir navegador nem mexer no perfil (anti-ban: 1 por conta)")
+        token_prova = None
+        cancelar_prova = None
         try:
             # MOTOR FORA DO DAEMON, 2ª leitura (incidente 15/09): entre a 1ª e aqui couberam o
             # portão de carga e a escolha do passe (SQLite, até ~10 s). Com a intenção NOSSA em
@@ -2691,6 +2719,27 @@ class LocalExecutor:
                                         else os.path.join(cwd, perfil))
             # carimbo do disparo ANTES do spawn (que trunca o .err): o reap só aceita como
             # evidência deste run um .err que não seja mais velho que isto (`_cauda_do_err`).
+            # A PROVA DO YOUTUBE (D3): com a conta travada por NÓS e logo antes do spawn, o
+            # disparo de um passe que pode tocar o YouTube reserva a prova armada pelo loop — que
+            # a grava no arquivo de estado ANTES de devolver o token. Assim o filho já encontra
+            # `prova_desde` no primeiro pedido ao YouTube.
+            if (self._reservar_prova is not None
+                    and passe_carrega_prova_youtube(meta.plataforma, passe)):
+                # a reserva DESARMA o executor (uma prova por janela): o cancelamento é guardado
+                # ANTES, para um spawn que falha ainda devolver a vaga da prova
+                cancelar_prova = self._cancelar_prova
+                try:
+                    token_prova = self._reservar_prova(curso_url, passe)
+                except Exception:
+                    token_prova = None
+                if token_prova is not None:
+                    env[ENV_PROVA_YOUTUBE] = str(token_prova)
+                elif passe == "youtube":
+                    # sem a prova gravada o motor M4 não pede nada ao YouTube: o `--youtube`
+                    # só abriria a Hotmart à toa. Aguarda (a intenção é solta no `except`).
+                    raise PasseYoutubeSuspenso(
+                        f"conta {meta.conta!r}: a prova do YouTube não pôde ser reservada (o "
+                        f"estado não foi gravado) — o --youtube não sai sem ela")
             self._disparo_ts[curso_url] = time.time()
             proc = self._spawn(cmd, env=env, cwd=cwd)
         except Exception:
@@ -2700,6 +2749,11 @@ class LocalExecutor:
             # a NOSSA intenção: nunca apaga o lock de outro dono.
             self._remover_lock_se_nosso(meta.conta, intencao)
             self._disparo_ts.pop(curso_url, None)
+            if token_prova is not None and cancelar_prova is not None:
+                try:
+                    cancelar_prova(curso_url)              # a prova não subiu: devolve a vaga
+                except Exception:
+                    pass
             raise
         self._procs[curso_url] = proc
         # PROMOVE o lock de intenção a lock DEFINITIVO, com o PID real do processo de
@@ -2768,6 +2822,21 @@ class LocalExecutor:
         """SUSPENSÃO GLOBAL DO YOUTUBE (rodada 2, item 7): o loop liga/desliga a escolha do
         passe `--youtube` para TODOS os cursos (a decisão e o estado moram no loop)."""
         self._youtube_bloqueado = bool(bloqueado)
+
+    def armar_prova_youtube(self, reservar, cancelar=None) -> None:
+        """A PROVA DO YOUTUBE (D3): a janela venceu e não há prova em curso. O próximo disparo de
+        um passe que pode tocar o YouTube chama `reservar(curso_url, passe)` antes do spawn e, se
+        receber um token, o põe no env do filho; um spawn que falha chama `cancelar(curso_url)`."""
+        self._reservar_prova = reservar
+        self._cancelar_prova = cancelar
+
+    def desarmar_prova_youtube(self) -> None:
+        self._reservar_prova = None
+        self._cancelar_prova = None
+
+    def plataforma_de(self, curso_url):
+        """O rótulo `plataforma:` do YAML deste curso (None se desconhecido)."""
+        return getattr(self._meta.get(curso_url), "plataforma", None)
 
     def _checar_host_e_credencial(self, meta, spec):
         """Última linha de defesa do host e da credencial (LEVANTA RuntimeError => nada é
@@ -2909,6 +2978,12 @@ class LocalExecutor:
         # INVIOLÁVEL anti-ban (15/09): concorrência <= 2 e piso de espaçamento entre as
         # aulas — vence o ambiente herdado e o extra_env, como o Groq.
         _cravar_cadencia_do_motor(env)
+        # A PROVA DO YOUTUBE (D3): o token só entra no disparo que o loop reservou (em
+        # `disparar`, depois daqui) — um herdado do ambiente do daemon nunca chega ao filho. E o
+        # filho lê o MESMO arquivo de estado que o daemon grava.
+        env.pop(ENV_PROVA_YOUTUBE, None)
+        if self._estado_cursos_path:
+            env[ENV_ESTADO_CURSOS] = str(self._estado_cursos_path)
         # ISOLAMENTO DE NAVEGADOR (anti-ban): Stoa/Kajabi no Chromium EMBUTIDO (não colide
         # com o Chrome do sistema do Hotmart no singleton do macOS); Hotmart/Memberkit
         # seguem channel=chrome. Popar quando não-chromium GARANTE channel=chrome mesmo que

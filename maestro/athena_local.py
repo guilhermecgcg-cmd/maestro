@@ -898,6 +898,23 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                            reversivel=True, fonte="guard", curso=curso, plataforma=plat,
                            origem="athena-local/portao-carga")
             return None
+        except captura.MotorForaDoDaemon as e:
+            # MOTOR FORA DO DAEMON (incidente 15/09): um motor rodado à mão na MESMA conta,
+            # sem lock — ou o `ps` ilegível (fail-closed). Aguarda a vez como a ContaOcupada:
+            # nada de tentativa, disjuntor, flap ou escalada por curso. Mas a recusa fica
+            # REGISTRADA, uma vez por episódio (a assinatura: os PIDs, ou ps-ilegível) — sem
+            # o registro, o daemon calado parece travado.
+            st.pop("adiado_carga_avisado", None)
+            assinatura = str(getattr(e, "assinatura", "") or e)
+            if st.get("fora_do_daemon_avisado") != assinatura:
+                st["fora_do_daemon_avisado"] = assinatura
+                _registrar(esp, f"não disparei {curso}: {getattr(e, 'motivo', e)}",
+                           "anti-ban 1 motor por conta: há motor vivo que o daemon não "
+                           "disparou (ou o ps não pôde ser lido) — aguardo a vez; NÃO é "
+                           "falha (não conta disjuntor, flap nem tentativa); reavalio a "
+                           "cada ciclo", reversivel=True, fonte="guard", curso=curso,
+                           plataforma=plat, origem="athena-local/anti-ban")
+            return None
         except captura.ContaOcupada:
             st.pop("adiado_carga_avisado", None)           # não é mais adiamento por carga
             return None                                    # anti-ban: aguarda a vez (não é falha)
@@ -914,6 +931,7 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                        origem="athena-local/passada")
             return Acao("", False, True, pedido)
         st.pop("adiado_carga_avisado", None)               # o portão deixou passar: re-arma
+        st.pop("fora_do_daemon_avisado", None)             # a conta ficou livre: re-arma
         if not conf:
             pedido = (f"[{projeto_nome}] disparo LOCAL de {curso} SEM confirmação — "
                       f"não assumo sucesso")

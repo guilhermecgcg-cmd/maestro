@@ -416,6 +416,27 @@ class AguardaAutopsia(ContaOcupada):
     `ContaOcupada`: quem só conhece o "aguarda a vez" já trata como espera (não é falha)."""
 
 
+class MotorForaDoDaemon(ContaOcupada):
+    """Disparo RECUSADO porque a CONTA tem um MOTOR VIVO que o daemon não disparou e que não
+    segura lock (rodado à mão num terminal ou por outra sessão) — ou porque a tabela de
+    processos não pôde ser lida (fail-closed: na dúvida, a conta está ocupada).
+
+    Incidente 15/09: `python -m motor.greenn https://sierramkt.greenn.club/ --course 115070`
+    rodou à mão das 09:49 às 09:53:50 sem lock; o `disparar` só lia o lock, achou a conta
+    livre e subiu o motor Greenn do daemon na MESMA conta (tentativas 5 e 6) — dois motores,
+    e uma aula virou audio_erro (um apagou o áudio que o outro transcrevia).
+
+    Herda de `ContaOcupada`: "aguarda a vez" — não é falha, não conta disjuntor, flap nem
+    tentativa. `motivo` = o texto da recusa (sem o argv inteiro do processo, que pode trazer
+    segredo). `assinatura` identifica o episódio (os PIDs, ou "ps-ilegivel") para a passada
+    registrar a decisão UMA vez por episódio, não uma linha por ciclo."""
+
+    def __init__(self, motivo, *, assinatura=""):
+        super().__init__(motivo)
+        self.motivo = motivo
+        self.assinatura = assinatura or motivo
+
+
 @dataclass(frozen=True)
 class CursoLocal:
     """Um curso desejado no modelo DOMÉSTICO. `conta` é a chave de serialização
@@ -1390,6 +1411,169 @@ def _sinalizar(pid, sig, grupo):  # pragma: no cover — sinal real
         pass
 
 
+# --- MOTOR FORA DO DAEMON (incidente 15/09) ----------------------------------------------
+# O lock durável só enxerga quem GRAVA lock: o próprio daemon, a sonda p102, o reseed/zelador
+# e os passes `motor.cli --anexos/--retentar`. Um motor rodado À MÃO (`python -m motor.<x>
+# <url>` num terminal ou por outra sessão) não grava — e o `disparar` lia só o lock: conta
+# "livre", segundo motor na MESMA conta. Defesa em profundidade NO DAEMON, sem depender da
+# disciplina de quem roda à mão: antes do spawn, a tabela de processos do SO (`ps`, só leitura).
+#
+# CASAMENTO processo -> conta, só pelo ARGV. O ambiente do processo NUNCA é lido: carrega
+# GROQ_API_KEY/tokens, e o perfil (CHROME_USER_DATA_DIR) de um run manual nem é o do daemon —
+# no incidente, o run à mão usava o perfil default e o daemon o `.chrome-profile-<conta>`:
+# casar por perfil daria falso negativo exatamente ali.
+#   1. só PYTHON com `-m motor` / `-m motor.<x>` como opção do INTERPRETADOR, em tokens
+#      (`_modulo_motor`): `grep motor.greenn <url>`, o `zsh -c "python -m ..."` e o
+#      `python script.py -m motor.x` não casam — o python filho do shell casa;
+#   2. o HOST de cada URL http(s) do argv (sem `www.`; todo host do hotmart.com vira
+#      `hotmart.com`) contra os hosts dos cursos de cada conta do YAML. Tenant = host: dois
+#      Cademí/Memberkit/Greenn de hosts diferentes nunca se travam; barra final, caminho,
+#      query e `--course` não mudam o host;
+#   3. `--conta X` no argv (motor.zelador) => a conta X;
+#   4. módulo de plataforma com perfil FIXO no spec (Hotmart `.chrome-profile`, Stoa, Kajabi):
+#      as contas dela partilham o navegador => o motor ocupa TODAS, com ou sem URL;
+#   5. módulo de plataforma cujo argv não traz URL de nenhum tenant DELA no YAML nem `--conta`
+#      (o tenant veio do env/default, que o daemon não lê; ou é um tenant fora do YAML, cujo
+#      login pode ser o mesmo) => fail-closed: TODAS as contas da plataforma.
+# O argv vem do `ps` já sem aspas: ele é lido de DUAS formas (espaços; e shlex, se parsear) e
+# as contas das duas leituras se SOMAM — uma aspa solta nunca esconde um motor.
+# Módulos que capturam uma plataforma sem ser o CLI dela (os workers da fila: Hotmart).
+_MODULOS_DE_PLATAFORMA_SEM_URL = {"motor.worker": "hotmart",
+                                  "motor.worker_residencial": "hotmart"}
+_EXE_PYTHON_RE = re.compile(r"python[0-9.]*t?", re.IGNORECASE)
+# opções LONGAS do CPython que consomem o token seguinte (as demais não levam argumento)
+_OPCOES_LONGAS_COM_ARG = frozenset({"--check-hash-based-pycs"})
+
+
+class ProcessosIlegiveis(RuntimeError):
+    """A tabela de processos não pôde ser lida ou não merece confiança (fail-closed)."""
+
+
+def _parse_ps(texto):
+    """Saída de `ps -o pid=,ppid=,args=` -> [(pid, ppid, args)], LINHA A LINHA (o args tem
+    espaços; nunca se divide a saída inteira por espaço). Uma linha fora do formato
+    => ProcessosIlegiveis: se o formato mudou, a AUSÊNCIA de motor não prova nada."""
+    tabela = []
+    for linha in (texto or "").splitlines():
+        if not linha.strip():
+            continue
+        partes = linha.split(None, 2)
+        try:
+            pid, ppid = int(partes[0]), int(partes[1])
+        except (IndexError, ValueError):
+            raise ProcessosIlegiveis(f"linha do ps fora do formato: {linha[:60]!r}") from None
+        tabela.append((pid, ppid, partes[2] if len(partes) > 2 else ""))
+    return tabela
+
+
+def _listar_processos():  # pragma: no cover — subprocesso real (ps), só leitura
+    """TODOS os processos da máquina (`-ax`), argv sem corte (`-ww`), com o PPID."""
+    import subprocess
+    r = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,args="], capture_output=True,
+                       text=True, timeout=10)
+    if r.returncode != 0:
+        raise ProcessosIlegiveis(f"ps saiu com código {r.returncode}")
+    return _parse_ps(r.stdout)
+
+
+def _tokens(args):
+    try:
+        return shlex.split(args or "")
+    except ValueError:
+        return (args or "").split()
+
+
+def _leituras_do_argv(args):
+    """As leituras possíveis do argv que o `ps` devolve JÁ SEM ASPAS: por espaços (a fiel ao
+    que o `ps` imprime) e, se diferir, a do shlex. Quem casa processo -> conta SOMA as duas."""
+    leituras = [(args or "").split()]
+    alternativa = _tokens(args)
+    if alternativa != leituras[0]:
+        leituras.append(alternativa)
+    return leituras
+
+
+def _modulo_motor(partes):
+    """`motor` ou `motor.<x>` se o argv `partes` é um PYTHON rodando `-m motor[.x]` como opção
+    do INTERPRETADOR; senão None. Segue o parser de opções do CPython: grupo curto (`-u`,
+    `-um motor.x`, `-mmotor.x`), `-X`/`-W` consomem argumento, `-c` e o primeiro não-opção (o
+    script) encerram — `python script.py -m motor.x` não é motor."""
+    if not partes or not _EXE_PYTHON_RE.fullmatch(os.path.basename(partes[0])):
+        return None
+    i = 1
+    while i < len(partes):
+        tok = partes[i]
+        if tok in ("-", "--") or not tok.startswith("-"):
+            return None                                    # script / stdin: não é `-m`
+        if tok.startswith("--"):
+            i += 2 if tok in _OPCOES_LONGAS_COM_ARG else 1
+            continue
+        for j in range(1, len(tok)):
+            letra = tok[j]
+            if letra not in "mXWc":
+                continue
+            resto = tok[j + 1:]
+            if not resto:
+                i += 1
+                resto = partes[i] if i < len(partes) else ""
+            if letra == "c":
+                return None
+            if letra == "m":
+                return resto if (resto == "motor" or resto.startswith("motor.")) else None
+            break                                          # -X/-W: argumento consumido
+        i += 1
+    return None
+
+
+def _chave_host(url):
+    """O host que identifica o TENANT de uma URL: minúsculo, sem `www.` nem ponto final; todo
+    host do Hotmart vira `hotmart.com` (a conta Hotmart é o perfil, não o subdomínio). ""
+    quando não há host."""
+    try:
+        host = (urlparse(str(url or "")).hostname or "").strip().lower().rstrip(".")
+    except ValueError:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    if any(host == h or host.endswith("." + h) for h in HOSTS_HOTMART):
+        return HOSTS_HOTMART[0]
+    return host
+
+
+def _hosts_do_argv(partes):
+    hosts = set()
+    for tok in partes:
+        for pedaco in (tok, tok.partition("=")[2]):
+            if pedaco.lower().startswith(("http://", "https://")):
+                host = _chave_host(pedaco)
+                if host:
+                    hosts.add(host)
+    return hosts
+
+
+def _valor_da_opcao(partes, nome):
+    for i, tok in enumerate(partes):
+        if tok == nome and i + 1 < len(partes):
+            return partes[i + 1]
+        if tok.startswith(nome + "="):
+            return tok[len(nome) + 1:]
+    return None
+
+
+def _dono_rastreado(pid, ppid_de, rastreados):
+    """As contas do processo RASTREADO mais próximo na linha de ascendência de `pid` (ele
+    mesmo incluído), ou None se nenhum ancestral é rastreado."""
+    atual, vistos = pid, set()
+    while atual not in vistos:
+        if atual in rastreados:
+            return rastreados[atual]
+        vistos.add(atual)
+        if atual not in ppid_de:
+            return None
+        atual = ppid_de[atual]
+    return None
+
+
 class LocalExecutor:
     """Executor DOMÉSTICO: CHAMA O MOTOR DIRETO no Mac (subprocesso), em vez de
     enfileirar. Mesmo contrato do FilaExecutor: `disparar(url) -> confirmação truthy`,
@@ -1431,8 +1615,13 @@ class LocalExecutor:
                  extra_env=None, lock_dir=None, pid_vivo=None,
                  motor_dir_por_plataforma=None, motor_log_dir=None, pendencias_fn=None,
                  portao_carga=None, zelo_timeout_s=_ZELO_TIMEOUT_PADRAO_S,
-                 zelo_grace_s=_ZELO_GRACE_PADRAO_S, sinal_fn=None, comando_fn=None):
+                 zelo_grace_s=_ZELO_GRACE_PADRAO_S, sinal_fn=None, comando_fn=None,
+                 processos_fn=None):
         self._meta = {c.url: c for c in cursos}
+        # MOTOR FORA DO DAEMON (incidente 15/09): leitor da tabela de processos ->
+        # [(pid, ppid, args)]. None = o `ps` REAL (`_listar_processos`, resolvido a cada
+        # consulta): em produção o guard nasce LIGADO sem ninguém precisar lembrar de ligá-lo.
+        self._processos_fn = processos_fn
         # ZELADOR DE SESSÃO (P7): zelos que ESTA encarnação spawnou, POR CHAVE de unidade —
         # separados de `_procs` DE PROPÓSITO: o fim de um zelo NUNCA vira óbito de captura
         # (sem autópsia, sem disjuntor, sem flap). `drenar_zelos` os colhe.
@@ -1881,6 +2070,9 @@ class LocalExecutor:
         contas = [str(meta.conta)] + sorted({str(c) for c in parceiras} - {str(meta.conta)})
         if not self.contas_livres(contas):
             raise ContaOcupada(f"conta(s) {', '.join(contas)} com lock — o zelo espera a vez")
+        # o zelo abre NAVEGADOR na conta: um motor manual vivo nela (ou nas parceiras) barra
+        # igual à captura (incidente 15/09) — e de novo com os locks nas mãos, abaixo.
+        self._recusar_motor_fora_do_daemon(contas, f"o zelo de {meta.conta!r}")
         _, env, cwd = self._montar(meta)
         perfil = env.get("CHROME_USER_DATA_DIR") or ""
         perfil_abs = perfil if (not perfil or os.path.isabs(perfil)) else os.path.join(cwd, perfil)
@@ -1908,6 +2100,9 @@ class LocalExecutor:
                 if not self._criar_lock_exclusivo(c, token):
                     raise ContaOcupada(f"conta {c!r} ocupada no mesmo instante — zelo desiste")
                 feitos.append((c, token))
+            # 2ª leitura com os locks NOSSOS em disco, antes de tocar o perfil ou spawnar (a
+            # recusa cai no `except` abaixo, que solta os locks).
+            self._recusar_motor_fora_do_daemon(contas, f"o zelo de {meta.conta!r}")
             _limpar_singleton_orfao(perfil_abs)
             inicio_wall = time.time()
             proc = self._spawn(cmd, env=env, cwd=cwd)
@@ -2131,6 +2326,115 @@ class LocalExecutor:
         `aguardando_autopsia` (a passada) e `disparar` (o ponto único) consultam."""
         return self._obitos.get(str(conta))
 
+    # --- MOTOR FORA DO DAEMON (incidente 15/09) ------------------------------------------
+    def _pids_rastreados(self) -> dict:
+        """{pid -> {contas}} dos processos que o guard JÁ conhece: os filhos desta encarnação
+        (`_procs`, `_zelos`) e o PID vivo de cada lock do lock_dir (encarnação anterior do
+        daemon, sonda p102, reseed/zelador, `motor.cli --anexos`). Só leitura."""
+        rastreados = {}
+        for url, proc in self._procs.items():
+            pid, meta = getattr(proc, "pid", None), self._meta.get(url)
+            if isinstance(pid, int) and meta is not None:
+                rastreados.setdefault(pid, set()).add(str(meta.conta))
+        for z in self._zelos.values():
+            pid = getattr(z["proc"], "pid", None)
+            if isinstance(pid, int):
+                rastreados.setdefault(pid, set()).update(str(c) for c in z["tokens"])
+        try:
+            nomes = os.listdir(self._lock_dir)
+        except OSError:
+            nomes = []
+        for nome in nomes:
+            if not nome.endswith(".lock"):
+                continue
+            try:
+                with open(os.path.join(self._lock_dir, nome)) as f:
+                    dados = json.load(f)
+            except (OSError, ValueError):
+                continue
+            pid = dados.get("pid") if isinstance(dados, dict) else None
+            if (isinstance(pid, int) and not isinstance(pid, bool)
+                    and dados.get("conta") is not None and self._pid_vivo(pid)):
+                rastreados.setdefault(pid, set()).add(str(dados["conta"]))
+        return rastreados
+
+    def _contas_do_motor(self, modulo, partes) -> set:
+        """As contas do YAML que o motor `modulo`, com argv `partes`, ocupa — as regras do
+        bloco MOTOR FORA DO DAEMON (junto de `_modulo_motor`): host da URL, `--conta`,
+        plataforma de perfil fixo, plataforma sem URL no argv."""
+        hosts = _hosts_do_argv(partes)
+        contas = {str(m.conta) for m in self._meta.values() if _chave_host(m.url) in hosts}
+        explicita = _valor_da_opcao(partes, "--conta")
+        if explicita:
+            contas.add(str(explicita))
+        plataformas = {p for p, s in _PLATAFORMAS.items() if s.modulo == modulo}
+        if modulo in _MODULOS_DE_PLATAFORMA_SEM_URL:
+            plataformas.add(_MODULOS_DE_PLATAFORMA_SEM_URL[modulo])
+        for m in self._meta.values():
+            spec = _PLATAFORMAS.get(m.plataforma)
+            if m.plataforma not in plataformas or spec is None:
+                continue
+            perfil_fixo = any(k == "CHROME_USER_DATA_DIR" for k, _ in spec.env)
+            # o argv aponta um tenant DESTA plataforma que o YAML conhece? Senão o tenant veio
+            # do env/default (ou é um fora do YAML): não dá para saber a conta => todas.
+            tenant_conhecido = any(_chave_host(o.url) in hosts for o in self._meta.values()
+                                   if o.plataforma == m.plataforma)
+            if perfil_fixo or (not tenant_conhecido and not explicita):
+                contas.add(str(m.conta))
+        return contas
+
+    def _recusar_motor_fora_do_daemon(self, contas, alvo):
+        """LEVANTA `MotorForaDoDaemon` se alguma das `contas` tem motor VIVO que o guard não
+        rastreia (rodado à mão, sem lock) — ou se a tabela de processos não pôde ser lida
+        (fail-closed; nada fica preso: a próxima chamada relê).
+
+        Rastreado = filho desta encarnação, PID de lock vivo, e todo DESCENDENTE deles. Um
+        rastreado de OUTRA conta já é contado pelo lock dela: não conta de novo aqui (sem
+        isso, o filho do daemon na conta A travaria a B sempre que as duas casam o mesmo
+        motor). Um rastreado da PRÓPRIA conta só chega aqui se o lock dela sumiu com ele vivo
+        — o lock não o conta mais, então o ps conta. Não é o daemon inteiro que se exclui: ele
+        também lança `claude -p` e `sh -c`, e um motor rodado por um desses é tão estranho
+        quanto o do terminal. Só leitura: nunca mata, nunca toca lock nem perfil."""
+        contas = {str(c) for c in contas}
+        rotulo = ", ".join(repr(c) for c in sorted(contas))
+        try:
+            tabela = [(int(pid), int(ppid), str(args or ""))
+                      for pid, ppid, args in (self._processos_fn or _listar_processos)()]
+            if not any(pid == os.getpid() for pid, _, _ in tabela):
+                raise ProcessosIlegiveis("a tabela não traz nem o próprio daemon")
+        except Exception as e:
+            raise MotorForaDoDaemon(
+                f"não li a tabela de processos ({type(e).__name__}) — fail-closed: conta(s) "
+                f"{rotulo} tratada(s) como ocupada(s); não disparo {alvo} e releio no "
+                f"próximo ciclo", assinatura="ps-ilegivel") from None
+        rastreados = self._pids_rastreados()
+        ppid_de = {pid: ppid for pid, ppid, _ in tabela}
+        achados = []
+        for pid, _ppid, args in tabela:
+            modulos, ocupa, hosts = set(), set(), set()
+            for partes in _leituras_do_argv(args):         # as leituras SOMAM (fail-closed)
+                modulo = _modulo_motor(partes)
+                if modulo is None:
+                    continue
+                modulos.add(modulo)
+                ocupa |= self._contas_do_motor(modulo, partes) & contas
+                hosts |= _hosts_do_argv(partes)
+            if not ocupa:
+                continue
+            dono = _dono_rastreado(pid, ppid_de, rastreados)
+            if dono is not None and not (dono & ocupa):
+                continue                                   # filho/lock de OUTRA conta
+            # o argv inteiro NÃO vai para a mensagem (vira decisão registrada): pode ter segredo
+            achados.append((pid, f"PID {pid} {'/'.join(sorted(modulos))} "
+                                 f"({','.join(sorted(hosts)) or 'sem URL no argv'})"))
+        if achados:
+            achados.sort()
+            raise MotorForaDoDaemon(
+                f"motor vivo fora do daemon na(s) conta(s) {rotulo}: "
+                f"{'; '.join(d for _, d in achados)} — não disparo {alvo} (anti-ban: 1 motor "
+                f"por conta; aguarda a vez)",
+                assinatura="pids:" + ",".join(str(p) for p, _ in achados))
+
     def disparar(self, curso_url):
         self._reap()
         meta = self._meta.get(curso_url)
@@ -2160,6 +2464,11 @@ class LocalExecutor:
                 f"conta {meta.conta!r} já captura {lock.get('course_url')} (PID "
                 f"{lock.get('pid')} vivo) — recuso 2ª captura simultânea de {curso_url} "
                 f"(anti-ban: 1 por conta, sobrevive a restart do loop)")
+        # MOTOR FORA DO DAEMON (incidente 15/09): o lock só enxerga quem GRAVA lock. Um motor
+        # rodado à mão na MESMA conta não grava — e daqui em diante nada mais o via: o daemon
+        # subia o 2º motor na conta. Depois da idempotência/lock (causa já nomeada) e ANTES
+        # do portão de carga (se a conta está ocupada, a causa de não disparar é ELA).
+        self._recusar_motor_fora_do_daemon([meta.conta], curso_url)
         # PORTÃO DE CARGA (incidente 10/09): máquina sobrecarregada (carga/memória) ou no
         # teto de motores => ADIA, antes de escolher o passe (não avança o rodízio), gravar
         # lock ou spawnar. Vem DEPOIS da idempotência e do anti-ban: se a conta já está
@@ -2205,6 +2514,11 @@ class LocalExecutor:
                 f"{atual.get('course_url') or 'dono desconhecido'}, PID {atual.get('pid')}) "
                 f"— recuso, sem abrir navegador nem mexer no perfil (anti-ban: 1 por conta)")
         try:
+            # MOTOR FORA DO DAEMON, 2ª leitura (incidente 15/09): entre a 1ª e aqui couberam o
+            # portão de carga e a escolha do passe (SQLite, até ~10 s). Com a intenção NOSSA em
+            # disco e ANTES de tocar o perfil ou spawnar, relê o `ps`: um motor manual que subiu
+            # nessa janela também barra. A recusa cai no `except` abaixo (solta a intenção).
+            self._recusar_motor_fora_do_daemon([meta.conta], curso_url)
             # SINGLETON ÓRFÃO: se um run anterior DESTA conta crashou, pode ter deixado o
             # SingletonLock no perfil — e o próximo run falharia na largada mesmo sem
             # concorrência. SÓ AGORA, com o lock exclusivo NOSSO em disco, está provado que

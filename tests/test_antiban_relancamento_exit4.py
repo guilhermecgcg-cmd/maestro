@@ -168,11 +168,14 @@ def test_tres_exit4_seguidos_com_notion_subindo_bencham_o_curso_e_a_conta_segue(
     assert "exit-4" in bench[-1][1] and not casa_ancora_de_morte(bench[-1][1]), bench
     assert d.alertas.sessoes == []                         # INVARIANTE: não é reseed
 
-    # dias depois (a escada teria vencido): NÃO relança
-    d.ciclo(t + 7 * 86400, n)
+    # horas depois (a escada teria vencido), ainda dentro da janela do bench: NÃO relança.
+    # (Reescrito na revisão de 15/09: afirmava "7 dias depois não relança" — o bench sem
+    # prazo era parte do defeito; a expiração tem teste próprio em
+    # test_antiban_exit4_classe_e_expiracao.py.)
+    d.ciclo(t + 20 * 3600, n)
     assert d.disparos() == 3, "o curso benchado voltou a ser disparado"
     # o Notion do tenant sobe por OUTRA via (outro curso da mesma conta): não desbencha
-    d.ciclo(t + 7 * 86400 + 120, n + 30, cursos=(VIRAL, IRMAO))
+    d.ciclo(t + 20 * 3600 + 120, n + 30, cursos=(VIRAL, IRMAO))
     assert d.disparos() == 3 and d.st.get("benched_exit4") is True
     assert d.disparos(IRMAO) == 1                          # e a CONTA segue nos demais cursos
 
@@ -218,22 +221,29 @@ def test_exit4_por_credencial_de_api_nao_conta_para_o_bench(tmp_path):
 # ==========================================================================
 # 4) a série e a espera atravessam o reinício do daemon; o bench (latch) não
 # ==========================================================================
-def test_serie_de_exit4_e_a_espera_atravessam_o_reinicio_mas_o_bench_nao(tmp_path):
+def test_serie_espera_e_prazo_do_bench_atravessam_o_reinicio(tmp_path):
+    # Reescrito na revisão de 15/09: antes o bench NÃO atravessava o reinício (latch sem
+    # destravamento além do boot) e cada reinício concedia uma tentativa. Com PRAZO
+    # (`benched_exit4_ate`), persistir é seguro — ele se solta sozinho — e um reinício do
+    # vigia externo não encurta mais o castigo. Os booleanos continuam fora da lista branca:
+    # o latch é RECONSTRUÍDO do prazo.
     path = str(tmp_path / "estado_cursos.json")
     athena_local._gravar_estado_cursos(path, {VIRAL: {
         "disj_falhas": 3, "disj_bloqueado_ate": T0 + 600.0, "exit4_seguidas": 3,
-        "exit4_ate": T0 + 600.0, "benched_exit4": True, "irredutivel": True}})
+        "exit4_ultimo": T0, "exit4_ate": T0 + 600.0, "benched_exit4_ate": T0 + 86400.0,
+        "benched_exit4": True, "irredutivel": True}})
     st = athena_local._carregar_estado_cursos(path, agora=T0)[VIRAL]
     assert st == {"disj_falhas": 3, "disj_bloqueado_ate": T0 + 600.0, "exit4_seguidas": 3,
-                  "exit4_ate": T0 + 600.0}, st
+                  "exit4_ultimo": T0, "exit4_ate": T0 + 600.0,
+                  "benched_exit4_ate": T0 + 86400.0}, st
 
-    # encarnação nova: UMA tentativa quando a janela vence; outro exit-4 bencha NA HORA,
-    # em vez de conceder uma série nova de 3 a cada reinício
+    # encarnação nova: o bench vale até o prazo; vencido, UMA tentativa; outro abort de
+    # plataforma rebencha NA HORA, em vez de conceder uma série nova de 3
     d = _Daemon(tmp_path, estado={VIRAL: st})
-    d.ciclo(T0 + 300, 120)
-    assert d.disparos() == 0                               # dentro da espera persistida
-    d.ciclo(T0 + 700, 120)
+    d.ciclo(T0 + 3600, 120)
+    assert d.disparos() == 0, "o reinício soltou o bench antes do prazo"
+    d.ciclo(T0 + 86400 + 60, 120)
     assert d.disparos() == 1
     d.ex.matar(VIRAL, exit_code=4, stderr=_ABORT_EXIT4)
-    d.ciclo(T0 + 820, 126)
+    d.ciclo(T0 + 86400 + 180, 126)
     assert d.st.get("benched_exit4") is True

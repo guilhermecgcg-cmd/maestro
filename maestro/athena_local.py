@@ -47,6 +47,7 @@ PENDENTE / o que ficou por LIGAR (honesto):
     final do motor na cauda, e por morta no reinício do Mac pelo lock anterior ao boot.
 """
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -233,6 +234,34 @@ def _classe_do_abort(cauda) -> str:
         if i > pos:
             classe, pos = candidata, i
     return classe
+
+
+# MORTE SÓ-DE-LOCK QUE ABORTOU NO DISJUNTOR (rodada 2, item 2): a captura ÓRFÃ (disparada por
+# uma encarnação anterior do loop, que levou o Popen) chega sem exit code, e o bloco do exit 4
+# só age com `exit_code == 4` — a órfã que abortou na parede era relançada no ciclo da própria
+# autópsia. A saída inteira decide se foi o `SystemExit(4)` do disjuntor:
+#   - a linha de máquina `ABORT_DISJUNTOR tipo=…`;
+#   - o cabeçalho que os CLIs imprimem logo antes do `SystemExit(4)` (motor 2cf9d04): "RUN
+#     INTERROMPIDO POR EXCESSO DE FALHAS", "PASSE --youtube PARADO POR BLOQUEIO DO YOUTUBE",
+#     "YOUTUBE SUSPENSO NO PASSE", "VÍDEO(S) [DO YOUTUBE] VIERAM COMO INDISPONÍVEIS";
+#   - "RUN ABORTADO com N/M aulas concluídas:" SÓ com mensagem de disjuntor na mesma linha.
+#     SOZINHA ela não basta: o `run_course` a loga no `except (SessionLostError,
+#     CircuitBreakerError, LockPerdido)` — sessão morta, sonda inconclusiva (subclasse de
+#     SessionLostError, exit 5) e lock perdido também a imprimem.
+_RE_SAIDA_ABORT_DISJUNTOR = re.compile(
+    r"ABORT_DISJUNTOR\s+tipo="
+    r"|RUN INTERROMPIDO POR EXCESSO DE FALHAS"
+    r"|PARADO POR BLOQUEIO DO YOUTUBE"
+    r"|YOUTUBE SUSPENSO NO PASSE"
+    r"|VÍDEO\(S\)(?: DO YOUTUBE)? VIERAM COMO INDISPONÍVEIS"
+    r"|RUN ABORTADO com \d+/\d+ aulas concluídas: [^\n]*?"
+    r"(?:nas últimas \d+ aulas|NENHUMA funcionou|É a Claude ou o Notion falhando"
+    r"|NÃO é a plataforma do curso e NÃO é a conta)")
+
+
+def _saida_de_abort_do_disjuntor(texto) -> bool:
+    """A saída (sem exit code observável) é a de um `SystemExit(4)` do disjuntor do motor?"""
+    return bool(_RE_SAIDA_ABORT_DISJUNTOR.search(str(texto or "")))
 
 
 def _serie_exit4_aberta(st, agora) -> bool:
@@ -798,6 +827,15 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
         if not curso:
             continue
         st = estado.setdefault(curso, {})
+        # ÓRFÃ QUE ABORTOU NO DISJUNTOR (rodada 2, item 2): sem exit code, a saída inteira diz
+        # se foi o exit 4 — e aí ela é autopsiada COMO exit 4 (causa, espera, série, bench),
+        # em vez de cair no "desconhecida" e ser relançada no ciclo da autópsia.
+        if getattr(obito, "exit_code", None) is None and _saida_de_abort_do_disjuntor(
+                getattr(obito, "stderr_bruto", "") or getattr(obito, "stderr_tail", "") or ""):
+            try:
+                obito = dataclasses.replace(obito, exit_code=_EXIT_CIRCUIT_BREAKER)
+            except TypeError:
+                pass                                       # dublê que não é dataclass: segue
         try:
             # `plataforma=` (item 4 da r15): o abort por excesso de falhas do motor diz
             # "Algo está sistematicamente errado do lado da Hotmart" em TODA plataforma.

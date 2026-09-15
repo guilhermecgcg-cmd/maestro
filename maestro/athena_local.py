@@ -236,6 +236,12 @@ _PROSA_CLASSE_EXIT4 = (
     ("local", "É a Claude ou o Notion falhando"),
     ("youtube", "NÃO é a plataforma do curso e NÃO é a conta"),
     ("youtube", "restrita pelo YouTube"),
+    # D3, item 5 (achado 2 da revisão independente): a PAREDE também tem âncora e compete por
+    # POSIÇÃO. Sem elas a parede era só o padrão: numa saída de 64 KB com uma frase local
+    # antiga 400 linhas acima e a parede impressa por último, a local era a única encontrada e
+    # vencia. As frases são as do `CircuitBreakerError` tipo plataforma do motor (2cf9d04+).
+    ("plataforma", "sistematicamente errado do lado d"),
+    ("plataforma", "Continuar martelando é o caminho do banimento"),
 )
 _ROTULO_CLASSE_EXIT4 = {
     "plataforma": "parede da plataforma do curso (o disjuntor do motor contou erros das aulas)",

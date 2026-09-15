@@ -26,6 +26,7 @@ nulo e o coordenador fica "aguardando reivindicação" — sem erro, sem escalar
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -693,6 +694,40 @@ _PLATAFORMAS = {
 # config dele; é fiação interna do supervisor). O seam de spawn injetado (testes) ignora
 # a chave, então o contrato `(cmd, *, env, cwd)` fica intacto.
 _ENV_STDERR_TEE = "_ATHENA_MOTOR_STDERR"
+
+# CADÊNCIA DO MOTOR (anti-ban 15/09, achado F1): nenhum CLI disparado pelo daemon passava
+# pacer ao `run_course`, e ninguém definia TEXT_CONCURRENCY — o semáforo do motor ficava em
+# 4: quatro páginas de aula abertas ao mesmo tempo na conta paga, uma atrás da outra. O
+# daemon crava em TODO disparo (`_montar`, junto dos INVIOLÁVEIS): concorrência
+# ATHENA_MOTOR_CONCORRENCIA (default 1, TETO 2 — vence o TEXT_CONCURRENCY herdado do
+# `aula/.env` que o launch.sh carrega e o extra_env) e a cadência do `motor.pacing` com PISO
+# nos defaults dele (3 s + até 2 s de jitter entre os STARTs de aula): herdar 0/lixo não
+# desliga a cadência; herdar mais que o piso vale. A concorrência age já em todos os CLIs
+# (todos leem TEXT_CONCURRENCY); a cadência, no motor que monta o pacer por padrão no
+# `run_course` (branch antiban-motor) — num motor antigo a env é inerte, nunca nociva.
+_CONCORRENCIA_MOTOR_PADRAO = 1
+_CONCORRENCIA_MOTOR_TETO = 2
+_CADENCIA_PISOS_S = (("CAPTURE_PACING_MIN_S", 3.0), ("CAPTURE_PACING_JITTER_S", 2.0))
+
+
+def _cravar_cadencia_do_motor(env) -> None:
+    """Aplica o contrato de concorrência/cadência sobre o `env` do disparo (muta). Nunca
+    levanta: valor ilegível cai no padrão (concorrência) ou no piso (cadência)."""
+    bruto = str(env.get("ATHENA_MOTOR_CONCORRENCIA") or "").strip()
+    try:
+        n = int(bruto) if bruto else _CONCORRENCIA_MOTOR_PADRAO
+    except ValueError:
+        n = _CONCORRENCIA_MOTOR_PADRAO
+    env["TEXT_CONCURRENCY"] = str(min(max(n, 1), _CONCORRENCIA_MOTOR_TETO))
+    for nome, piso in _CADENCIA_PISOS_S:
+        bruto = str(env.get(nome) or "").strip()
+        try:
+            valor = float(bruto) if bruto else piso
+        except ValueError:
+            valor = piso
+        if not math.isfinite(valor) or valor < piso:        # 0, negativo, nan, inf
+            valor = piso
+        env[nome] = str(valor)
 
 
 # PASSE -> flag de CLI do motor. Consumido pelo Hotmart (motor.cli, os 5) E pela Stoa
@@ -2417,6 +2452,9 @@ class LocalExecutor:
         env["WHISPER_BACKEND"] = "groq"                    # INVIOLÁVEL Groq (vence extra_env)
         if self._groq_key:
             env["GROQ_API_KEY"] = self._groq_key
+        # INVIOLÁVEL anti-ban (15/09): concorrência <= 2 e piso de espaçamento entre as
+        # aulas — vence o ambiente herdado e o extra_env, como o Groq.
+        _cravar_cadencia_do_motor(env)
         # ISOLAMENTO DE NAVEGADOR (anti-ban): Stoa/Kajabi no Chromium EMBUTIDO (não colide
         # com o Chrome do sistema do Hotmart no singleton do macOS); Hotmart/Memberkit
         # seguem channel=chrome. Popar quando não-chromium GARANTE channel=chrome mesmo que

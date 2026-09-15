@@ -120,6 +120,9 @@ class Obito:
     # a saída SEM o corte de linhas (últimos `_STDERR_BRUTO_CHARS`), para quem precisa ler
     # além das 40 linhas (a classe do exit 4). Fora do JSON e do repr.
     stderr_bruto: str = field(default="", repr=False, compare=False)
+    # o PID do filho que morreu (da fonte ou do lock). D3r2, B1: só a morte do PID da prova do
+    # YouTube decide a prova. Fora da comparação; vai ao JSON (a autópsia diz QUAL processo).
+    pid: Optional[int] = field(default=None, compare=False)
 
 
 # --------------------------------------------------------------------------
@@ -421,13 +424,14 @@ def autopsia(lock_dir, stderr_por_conta, *, pid_vivo=None, agora=None,
             flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s)
             obitos.append(Obito(conta=conta, curso=curso, exit_code=0,
                                 stderr_tail=stderr_tail, flaps_na_janela=flaps,
-                                ts=ts_iso, saida_limpa=True, stderr_bruto=stderr_bruto))
+                                ts=ts_iso, saida_limpa=True, stderr_bruto=stderr_bruto,
+                                pid=pid))
             continue
 
         flaps = _contar_flaps_anteriores(autopsia_dir, conta, agora, janela_s) + 1
         obito = Obito(conta=conta, curso=curso, exit_code=fonte.exit_code,
                       stderr_tail=stderr_tail, flaps_na_janela=flaps, ts=ts_iso,
-                      stderr_bruto=stderr_bruto,
+                      stderr_bruto=stderr_bruto, pid=pid,
                       lock_mtime=lock_mtime, boot_ts=boot_do_mac,
                       lock_antes_do_boot=lock_antes_do_boot)
         path = _gravar_autopsia(autopsia_dir, obito, ts_epoch=agora,

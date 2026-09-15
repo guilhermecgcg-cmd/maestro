@@ -334,6 +334,12 @@ def _saida_de_abort_do_disjuntor(texto) -> bool:
 #     mesmo degrau voltaria ao IP barrado a cada 3 h para sempre;
 #   - AVISO: vencida há mais de ATHENA_YOUTUBE_ALERTA_VENCIDA_S (6 h) sem prova -> voz, uma vez
 #     por episódio;
+#   - PID DA PROVA (D3r2, B1): o PID do processo da prova vai ao estado e ao disco logo depois do
+#     spawn (`prova_pid`; o motor M4 e o daemon anterior leem só as chaves que nomeiam e o
+#     ignoram). Só a morte DESSE PID decide a prova; o curso da prova não é redisparado enquanto
+#     ela não tem resultado; o lock de PID morto da prova não é apagado antes da autópsia (a conta
+#     fica travada e o .err dela intacto) e, se o lock sumir mesmo assim, a autópsia lê o .err da
+#     conta pelo PID da prova;
 #   - ESPERA NEUTRA (item 7): o portador que saiu 0 sem avanço com a suspensão valendo não é
 #     "curso quiescido" (sem cooldown) nem "captura ESTAGNADA": espera a janela vencer.
 _CHAVE_YOUTUBE = "__youtube__"         # no `estado` do loop (não é curso); em disco: "youtube"
@@ -363,6 +369,15 @@ def _youtube_degrau_max() -> int:
     return n
 
 
+_CHAVES_DA_PROVA = ("prova_curso", "prova_desde", "prova_pid")
+
+
+def _youtube_soltar_prova(sy):
+    """Apaga a prova em curso (curso, instante e PID): ela terminou, venceu ou não subiu."""
+    for chave in _CHAVES_DA_PROVA:
+        sy.pop(chave, None)
+
+
 def _youtube_bloqueado(sy, agora) -> bool:
     """Os passes do YouTube estão suspensos AGORA? Janela aberta, ou a prova em andamento. Uma
     prova sem resultado há mais que o teto (resultado perdido) é descartada: libera nova prova."""
@@ -374,8 +389,7 @@ def _youtube_bloqueado(sy, agora) -> bool:
             return True
         # D3: a prova sem resultado além do teto é a prova SEM LINHA — a suspensão continua e a
         # janela reabre no MESMO degrau (antes a prova era só descartada: liberava outra na hora)
-        sy.pop("prova_curso", None)
-        sy.pop("prova_desde", None)
+        _youtube_soltar_prova(sy)
         sy["ate"] = agora + _youtube_janela_s(int(sy.get("degrau") or 1))
         return True
     ate = sy.get("ate")
@@ -393,8 +407,7 @@ def _youtube_abrir(sy, agora, *, subir=False):
     sy["degrau"] = degrau
     sy["ate"] = agora + _youtube_janela_s(degrau)
     sy["ultimo_bloqueio"] = agora
-    sy.pop("prova_curso", None)
-    sy.pop("prova_desde", None)
+    _youtube_soltar_prova(sy)
     return degrau, sy["ate"]
 
 
@@ -438,7 +451,19 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
     bruto = getattr(obito, "stderr_bruto", "") or getattr(obito, "stderr_tail", "") or ""
     exit4 = getattr(obito, "exit_code", None) == _EXIT_CIRCUIT_BREAKER
     classe = _classe_do_abort(bruto) if exit4 else None
-    if isinstance(sy, dict) and sy.get("prova_curso") == curso:
+    e_a_prova = isinstance(sy, dict) and sy.get("prova_curso") == curso
+    if e_a_prova:
+        # D3r2, B1(b): só a morte do PID da PROVA decide a prova. Outra morte do mesmo curso (na
+        # revisão: o run redisparado sem token depois de a órfã sumir) não pediu nada ao YouTube e,
+        # lida como resultado, trocava o bloqueado da prova por "sem linha". PID desconhecido de
+        # um dos lados (estado de antes do D3r2, queda entre o spawn e a anotação): vale o curso.
+        prova_pid, obito_pid = sy.get("prova_pid"), getattr(obito, "pid", None)
+        if (isinstance(prova_pid, int) and isinstance(obito_pid, int)
+                and obito_pid != prova_pid):
+            log.warning("a morte do PID %s em %s não é a da prova do YouTube (PID %s): a prova "
+                        "segue sem resultado", obito_pid, curso, prova_pid)
+            e_a_prova = False
+    if e_a_prova:
         estado.setdefault(curso, {})["_prova_resultado_ciclo"] = agora
         resultado = _resultado_prova_youtube(bruto)
         codigo = getattr(obito, "exit_code", None)
@@ -455,7 +480,7 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
                             "youtube — conta como bloqueado", curso, resultado)
             resultado = "bloqueado"
         if resultado == "ok":
-            for chave in ("ate", "prova_curso", "prova_desde", "aviso_vencida_ate"):
+            for chave in ("ate", "aviso_vencida_ate") + _CHAVES_DA_PROVA:
                 sy.pop(chave, None)
             _registrar(espinha, "suspensão dos passes do YouTube encerrada",
                        f"a prova de {curso} pediu ao YouTube e conseguiu (exit {codigo})",
@@ -464,15 +489,13 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
         elif resultado == "bloqueado":
             _anunciar_suspensao_youtube(sy, agora, curso, voz=voz, espinha=espinha, subir=True)
         elif resultado == "nao_tocou":
-            sy.pop("prova_curso", None)
-            sy.pop("prova_desde", None)
+            _youtube_soltar_prova(sy)
             _registrar(espinha, f"prova do YouTube em {curso} não tocou o YouTube",
                        "a suspensão continua; a próxima prova vai no próximo disparo elegível "
                        "(degrau intacto)", reversivel=True, fonte="deterministico", curso=curso,
                        origem="athena-local/youtube")
         else:
-            sy.pop("prova_curso", None)
-            sy.pop("prova_desde", None)
+            _youtube_soltar_prova(sy)
             sy["ate"] = agora + _youtube_janela_s(int(sy.get("degrau") or 1))
             ate_txt = time.strftime("%H:%M", time.localtime(float(sy["ate"])))
             if resultado == "sem_sucesso":
@@ -1059,6 +1082,45 @@ def _anotar_causa_na_autopsia(obito, decisao, plataforma):
         pass
 
 
+# Folga do .err da prova órfã sem lock — a mesma do `vigia._ERR_FOLGA_S`: o `_spawn_popen` trunca o
+# .err logo antes do Popen, DEPOIS da reserva (`prova_desde` é o instante do ciclo que a reservou).
+_ERR_FOLGA_PROVA_S = 5.0
+
+
+def _fonte_da_prova_sem_lock(executor, sy):
+    """(conta, fonte) para a autópsia da PROVA DO YOUTUBE ÓRFÃ cujo lock sumiu, ou None.
+
+    D3r2, B1(d): o lock de PID morto da prova não é mais apagado antes da autópsia
+    (`LocalExecutor.guardar_lock_da_prova_youtube`). Se ele sumir mesmo assim (apagado à mão, um
+    daemon anterior), o vigia — que só acha a morte de uma órfã pelo lock — deixava a prova sem
+    resultado até o teto de 24 h. Com o PID da prova conhecido e NENHUM lock na conta, a fonte leva
+    o PID (o vigia sonda a vida dele) e o .err da conta SE ele não é mais velho que a prova: um .err
+    anterior (tee que falhou neste disparo) pode trazer a linha `ok` de OUTRA prova. Com lock na
+    conta, None: é o caminho de sempre do vigia."""
+    if not isinstance(sy, dict) or not sy.get("prova_curso"):
+        return None
+    pid = sy.get("prova_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    conta_de = getattr(executor, "conta_de", None)
+    lock_path_de = getattr(executor, "_lock_path", None)
+    stderr_path_de = getattr(executor, "_stderr_path", None)
+    if not (callable(conta_de) and callable(lock_path_de) and callable(stderr_path_de)):
+        return None
+    curso = sy["prova_curso"]
+    conta = conta_de(curso)
+    if not conta or os.path.exists(lock_path_de(conta)):
+        return None
+    fonte = {"pid": pid, "curso": curso, "stderr_tail": ""}
+    err = stderr_path_de(conta)
+    try:
+        if os.path.getmtime(err) >= float(sy.get("prova_desde") or 0.0) - _ERR_FOLGA_PROVA_S:
+            fonte = {"pid": pid, "curso": curso, "stderr_path": err}
+    except OSError:
+        pass
+    return str(conta), fonte
+
+
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
                      autopsia_dir, agora, meta_por_curso, flap_min, llm, espinha=None,
                      boot_ts=None, voz=None):
@@ -1078,6 +1140,15 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
             stderr_por_conta = drenar() or {}
         except Exception:
             stderr_por_conta = {}
+    # A PROVA DO YOUTUBE ÓRFÃ SEM LOCK (D3r2, B1(d)): ver `_fonte_da_prova_sem_lock`. O óbito
+    # drenado da conta (filho desta encarnação) tem precedência.
+    try:
+        orfa = _fonte_da_prova_sem_lock(executor, estado.get(_CHAVE_YOUTUBE))
+    except Exception:
+        orfa = None
+    if orfa is not None and orfa[0] not in {str(c) for c in stderr_por_conta}:
+        stderr_por_conta = dict(stderr_por_conta)
+        stderr_por_conta[orfa[0]] = orfa[1]
     extra = {}
     stderr_path_de = getattr(executor, "_stderr_path", None)
     if callable(stderr_path_de):
@@ -1439,6 +1510,13 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         # disjuntor de propósito (revisão 15/09): um curso benchado/de escada fechada escala
         # pela Voz no ciclo da autópsia, como antes; a espera só segura o DISPARO.
         if agora < float(st.get("exit4_ate", 0.0) or 0.0):
+            return None
+        # A PROVA SEM RESULTADO (D3r2, B1(c)): o curso da prova não é redisparado enquanto ela não
+        # tem resultado. A órfã (o Popen se perdeu num reinício) que morre no meio do ciclo só é
+        # autopsiada no ciclo seguinte: redisparado agora, o run novo — sem token, que não pode
+        # tocar o YouTube — truncaria o .err dela e viraria o "resultado" da prova.
+        sy_prova = estado.get(_CHAVE_YOUTUBE)
+        if isinstance(sy_prova, dict) and sy_prova.get("prova_curso") == curso:
             return None
         # ESPERA NEUTRA (D3, item 7): enquanto a suspensão do YouTube bloqueia (janela aberta ou
         # prova em curso), o curso cujo trabalho era todo YouTube suspenso não é redisparado —
@@ -2261,13 +2339,15 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
 
 
 _ESTADO_YOUTUBE_INSTANTES = ("ate", "ultimo_bloqueio", "prova_desde", "aviso_vencida_ate")
+_ESTADO_YOUTUBE_CHAVES = _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso", "prova_pid")
 
 
 def _carregar_estado_youtube(path, *, agora) -> dict:
     """A suspensão global do YouTube persistida (chave `youtube` do arquivo de estado), ou {}.
     Tolerante como `_carregar_estado_cursos`: arquivo ausente/ilegível, chave ausente (versão
     antiga) ou de outro tipo => {}; cada campo é saneado sozinho (instante finito e não além de
-    `_ESTADO_FUTURO_MAX_S`; degrau inteiro >= 1; prova = URL não vazia). Nunca levanta."""
+    `_ESTADO_FUTURO_MAX_S`; degrau inteiro >= 1; prova = URL não vazia; PID da prova = inteiro > 0,
+    só junto da prova). Nunca levanta."""
     if not path:
         return {}
     try:
@@ -2296,6 +2376,9 @@ def _carregar_estado_youtube(path, *, agora) -> dict:
     prova = sy.get("prova_curso")
     if isinstance(prova, str) and prova and "prova_desde" in limpo:
         limpo["prova_curso"] = prova
+        pid = sy.get("prova_pid")                      # D3r2, B1: só com a prova, inteiro > 0
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+            limpo["prova_pid"] = pid
     else:
         limpo.pop("prova_desde", None)
     return limpo
@@ -2327,7 +2410,7 @@ def _gravar_estado_cursos(path, estado):
             sy = (estado or {}).get(_CHAVE_YOUTUBE)
             if isinstance(sy, dict) and sy:                # suspensão global do YouTube (item 7)
                 registro["youtube"] = {k: v for k, v in sy.items()
-                                       if k in _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso")}
+                                       if k in _ESTADO_YOUTUBE_CHAVES}
             json.dump(registro, f)
         os.replace(tmp, path)
         return True
@@ -2509,8 +2592,7 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
         sy["prova_curso"] = curso
         sy["prova_desde"] = desde
         if persistir_estado is not None and persistir_estado() is False:
-            sy.pop("prova_curso", None)                # sem o disco o motor não a reconheceria
-            sy.pop("prova_desde", None)
+            _youtube_soltar_prova(sy)                  # sem o disco o motor não a reconheceria
             return None
         _bloq = getattr(executor, "bloquear_passe_youtube", None)
         if callable(_bloq):
@@ -2527,19 +2609,40 @@ def ciclo_local(cursos, executor, progresso_fn, voz, voo, estado, *, agora=None,
     def _cancelar_prova_youtube(curso):
         sy = estado.get(_CHAVE_YOUTUBE)
         if isinstance(sy, dict) and sy.get("prova_curso") == curso:
-            sy.pop("prova_curso", None)
-            sy.pop("prova_desde", None)
+            _youtube_soltar_prova(sy)
             if persistir_estado is not None:
                 persistir_estado()
+
+    def _confirmar_prova_youtube(curso, pid):
+        # D3r2, B1(a): o PID do processo da prova, logo depois do spawn — no estado e no disco. Só
+        # a morte DESTE PID decide a prova, e o lock dele não é apagado antes da autópsia.
+        sy = estado.get(_CHAVE_YOUTUBE)
+        if (not isinstance(sy, dict) or sy.get("prova_curso") != curso
+                or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0):
+            return
+        sy["prova_pid"] = pid
+        _guardar = getattr(executor, "guardar_lock_da_prova_youtube", None)
+        if callable(_guardar):
+            _guardar(curso, pid)
+        if persistir_estado is not None:
+            persistir_estado()                         # falhou: o fim do ciclo grava de novo
 
     try:
         _bloquear_youtube = getattr(executor, "bloquear_passe_youtube", None)
         if callable(_bloquear_youtube):
             _bloquear_youtube(_yt_bloqueado)
+        # D3r2, B1(d): o lock de PID morto da prova em curso fica até a autópsia dela
+        _guardar = getattr(executor, "guardar_lock_da_prova_youtube", None)
+        if callable(_guardar):
+            if isinstance(_sy, dict) and _sy.get("prova_curso"):
+                _guardar(_sy["prova_curso"], _sy.get("prova_pid"))
+            else:
+                _guardar(None)
         if isinstance(_sy, dict) and _sy.get("ate") is not None and not _yt_bloqueado:
             _armar = getattr(executor, "armar_prova_youtube", None)
             if callable(_armar):
-                _armar(_reservar_prova_youtube, _cancelar_prova_youtube)
+                _armar(_reservar_prova_youtube, _cancelar_prova_youtube,
+                       _confirmar_prova_youtube)
         else:
             _desarmar = getattr(executor, "desarmar_prova_youtube", None)
             if callable(_desarmar):

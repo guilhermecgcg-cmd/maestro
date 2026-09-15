@@ -1830,6 +1830,10 @@ class LocalExecutor:
         self._estado_cursos_path = estado_cursos_path
         self._reservar_prova = None
         self._cancelar_prova = None
+        self._confirmar_prova = None
+        # D3r2, B1(d): (curso, pid) da prova em curso — o lock de PID MORTO dela não é apagado
+        # antes da autópsia (ver `_ler_lock`). None = nenhuma prova.
+        self._lock_da_prova = None
         # Override de diretório do motor POR PLATAFORMA (ex.: Stoa vive no worktree
         # adaptador-stoa, não em /aula). Default = self._motor_dir para as demais.
         self._motor_dir_por_plataforma = dict(motor_dir_por_plataforma or {})
@@ -1900,10 +1904,24 @@ class LocalExecutor:
             # a completude-por-Notion ou o disjuntor/stall do owner escalam esse curso).
             return data
         if not self._pid_vivo(data.get("pid")):
-            if limpar:
+            # A PROVA DO YOUTUBE ÓRFÃ (D3r2, B1(d)): o lock de PID morto da prova em curso é a
+            # evidência da autópsia dela (o vigia lê o .err da conta no ciclo seguinte). Apagado
+            # aqui — pela passada ou pelo pulso cheio, DEPOIS da autópsia deste ciclo — o resultado
+            # da prova se perdia, e a conta ficava livre para um disparo que truncaria o .err.
+            # Mantido, a leitura segue dizendo "nenhuma captura viva" (None), mas nenhum lock novo
+            # nasce por cima dele (a criação é exclusiva) até a autópsia resolver a prova.
+            if limpar and not self._e_lock_da_prova(data):
                 self._remover_lock(path)          # PID morto -> lock obsoleto -> libera
             return None
         return data
+
+    def _e_lock_da_prova(self, data) -> bool:
+        """O lock (`data`) é o da prova do YouTube em curso (`guardar_lock_da_prova_youtube`)? Com o
+        PID da prova desconhecido (queda entre o spawn e a anotação), vale o curso."""
+        guarda = self._lock_da_prova
+        if not guarda or data.get("course_url") != guarda[0]:
+            return False
+        return guarda[1] is None or data.get("pid") == guarda[1]
 
     def _escrever_lock(self, conta, curso_url, pid):
         """SOBRESCREVE o lock da conta (troca atômica, `os.replace`). NÃO é aquisição: no
@@ -2702,6 +2720,7 @@ class LocalExecutor:
                 f"— recuso, sem abrir navegador nem mexer no perfil (anti-ban: 1 por conta)")
         token_prova = None
         cancelar_prova = None
+        confirmar_prova = None
         try:
             # MOTOR FORA DO DAEMON, 2ª leitura (incidente 15/09): entre a 1ª e aqui couberam o
             # portão de carga e a escolha do passe (SQLite, até ~10 s). Com a intenção NOSSA em
@@ -2728,6 +2747,7 @@ class LocalExecutor:
                 # a reserva DESARMA o executor (uma prova por janela): o cancelamento é guardado
                 # ANTES, para um spawn que falha ainda devolver a vaga da prova
                 cancelar_prova = self._cancelar_prova
+                confirmar_prova = self._confirmar_prova
                 try:
                     token_prova = self._reservar_prova(curso_url, passe)
                 except Exception:
@@ -2762,6 +2782,12 @@ class LocalExecutor:
         # atômica por cima da NOSSA intenção: ninguém mais cria lock enquanto ela existe
         # (todos criam exclusivo) e ninguém apaga lock alheio de intenção.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
+        if token_prova is not None and confirmar_prova is not None:
+            # D3r2, B1(a): o PID da prova vai ao estado (e ao disco) do loop logo depois do spawn
+            try:
+                confirmar_prova(curso_url, getattr(proc, "pid", None))
+            except Exception:
+                pass
         # um motor SUBIU: conta na janela da rampa do portão (só pesa na saída da sobrecarga)
         self._avisar_portao("registrar_disparo")
         return f"local_iniciada:{curso_url}:passe={passe}"
@@ -2823,16 +2849,24 @@ class LocalExecutor:
         passe `--youtube` para TODOS os cursos (a decisão e o estado moram no loop)."""
         self._youtube_bloqueado = bool(bloqueado)
 
-    def armar_prova_youtube(self, reservar, cancelar=None) -> None:
+    def armar_prova_youtube(self, reservar, cancelar=None, confirmar=None) -> None:
         """A PROVA DO YOUTUBE (D3): a janela venceu e não há prova em curso. O próximo disparo de
         um passe que pode tocar o YouTube chama `reservar(curso_url, passe)` antes do spawn e, se
-        receber um token, o põe no env do filho; um spawn que falha chama `cancelar(curso_url)`."""
+        receber um token, o põe no env do filho; um spawn que falha chama `cancelar(curso_url)`;
+        o spawn que sobe chama `confirmar(curso_url, pid)` (D3r2, B1: o PID da prova)."""
         self._reservar_prova = reservar
         self._cancelar_prova = cancelar
+        self._confirmar_prova = confirmar
 
     def desarmar_prova_youtube(self) -> None:
         self._reservar_prova = None
         self._cancelar_prova = None
+        self._confirmar_prova = None
+
+    def guardar_lock_da_prova_youtube(self, curso_url, pid=None) -> None:
+        """D3r2, B1(d): a prova do YouTube em curso é de `curso_url` (PID `pid`, None se ainda
+        desconhecido) — o lock de PID MORTO dela fica até a autópsia. `curso_url` None: nenhuma."""
+        self._lock_da_prova = (curso_url, pid) if curso_url else None
 
     def plataforma_de(self, curso_url):
         """O rótulo `plataforma:` do YAML deste curso (None se desconhecido)."""

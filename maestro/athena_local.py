@@ -83,58 +83,11 @@ FASE_CONCLUIDO = captura.FASE_CONCLUIDO
 # NUNCA um latch permanente. Anti-ban intacto: reseed continua irredutível.
 _CAUSAS_IRREDUTIVEIS = ("escalar_reseed",)
 
-# BENCH do exit-5 (anti-flap): exit 5 = sonda de sessão INCONCLUSIVA / erro de infra
-# (contrato do motor — NÃO é sessão morta). Uma URL MALFORMADA no YAML (ex.:
-# …/products/X/agent) torna a sonda inconclusiva PARA SEMPRE: cada disparo morre
-# exit-5, a causa diz `relancar`, e o curso flapa infinito. Após N mortes exit-5
-# SEGUIDAS no MESMO curso (mesma URL — o `st` é chaveado por URL), o curso é
-# BENCHED (irredutível: o disjuntor para de re-tentar SÓ este curso) + ALERTA ESSENCIAL
-# com a URL (dedup por curso; r6 — antes só-log, e o curso parava calado).
-# INVIOLÁVEL ANTI-BAN: o bench NÃO é reseed nem relogin (sonda inconclusiva
-# ≠ sessão morta confirmada — esta segue a escalada normal de reseed, que tem
-# precedência sobre o bench); e é POR-CURSO: os demais cursos, inclusive da MESMA
-# conta, seguem. N=3 espelha o _FLAP_MIN (1 exit-5 é transitório comum de rede;
-# 3 seguidos — espaçados pelo recozimento do backoff — não é blip, é a URL).
-# A contagem zera em: saída limpa, avanço real no Notion (que também DESBENCHA:
-# se outra via produziu progresso, never-stop reavalia), ou morte de outra causa.
-_EXIT_SONDA_INCONCLUSIVA = 5           # contrato do motor (ver causa.py)
-_BENCH_EXIT5_MIN = int(os.getenv("ATHENA_BENCH_EXIT5_MIN", "3"))
 
-# COOLDOWN de curso QUIESCIDO por SAÍDA LIMPA: quando o motor sai LIMPO (exit 0) sem
-# produzir nada novo (Notion não avançou), o curso está concluído/sem-pendência para o
-# denominador que temos. Em vez de re-spawnar a cada ciclo (o que floodava o vigia com
-# saídas-limpas e queimava sessão à toa), o curso entra num COOLDOWN: fica quieto por
-# esta janela e só é reavaliado ao expirar. NÃO é permanente (never-stop): se novo
-# conteúdo aparecer, um ciclo pós-cooldown o retoma; e QUALQUER avanço real no Notion —
-# ou pendência capturável NOVA no tracker (acima do baseline do arme; ex.: reseed) —
-# limpa o cooldown na hora. Default 6h; env ATHENA_COOLDOWN_CONCLUIDO_S calibra.
-_COOLDOWN_SAIDA_LIMPA_S = float(os.getenv("ATHENA_COOLDOWN_CONCLUIDO_S", "21600"))  # 6h
-
-# COOLDOWN de curso SEM PENDÊNCIA CAPTURÁVEL (higiene 2): o tracker prova que só restam
-# aulas TERMINAIS (no_notion/sem_conteudo/falhou…), mesmo com o Notion < total (aulas
-# terminais nunca chegam ao Notion). É "essencialmente pronto" — não re-disparar NEM
-# escalar exit-4 a cada ciclo (falso-positivo invistodireito 533/547). Cooldown LONGO
-# (mais que a saída-limpa: aqui o tracker PROVA que não há trabalho, então revisitar é
-# ainda mais raro). QUALQUER avanço no Notion / pendência nova limpa na hora (never-stop).
-# INVARIANTE: pendência REAL (parede/throttle => aula pendente/in-flight) NÃO cai aqui.
-_COOLDOWN_SEM_PENDENCIA_S = float(os.getenv("ATHENA_COOLDOWN_SEM_PENDENCIA_S", "86400"))  # 24h
-
-# PORTÃO DE CARGA (maestro.carga; incidente 10/09): o LocalExecutor ADIA o disparo quando o
-# Mac está sobrecarregado. Adiar é auto-tratado — o aviso agregado por ciclo fica SÓ-LOG;
-# se a sobrecarga PERSISTIR por esta janela (nada sendo capturado), o aviso vira ESSENCIAL
-# (1 ping por janela de dedup do Alertas) + 1 escalada na espinha por episódio. 0 = nunca
-# escala (só-log sempre). Default 1h.
-_CARGA_ALERTA_S = float(os.getenv("ATHENA_CARGA_ALERTA_S", "3600"))
-
-# EPISÓDIO DE SOBRECARGA EM DISCO (achado r6): o `desde` do episódio vai para um arquivo
-# pequeno (ATHENA_CARGA_EPISODIO_PATH, default ~/.athena-local/carga_episodio.json) e o
-# `rodar` o retoma no boot — reinícios curtos (vigia externo, launchd) não zeram mais o
-# relógio do aviso ESSENCIAL. LACUNA: se a última observação de adiamento ficou mais longe
-# que isto do boot, o loop esteve fora tempo demais para chamar de "o mesmo episódio" —
-# recomeça do zero (honesto). Default 30 min (o vigia externo mata após 900 s sem pulso).
-_CARGA_EPISODIO_LACUNA_S = float(os.getenv("ATHENA_CARGA_EPISODIO_LACUNA_S", "1800"))
-
-
+# ENVS NUMÉRICAS TOLERANTES (rodada 2, item 6): definidas ANTES da primeira leitura do módulo,
+# e TODA leitura numérica de ambiente deste arquivo passa por elas — um typo no launch.sh
+# (ATHENA_BENCH_EXIT5_MIN="três") derrubava o import, e o launchd ficava relançando um daemon
+# que morria na largada. O teste varre o fonte: nenhum int()/float() cru de env sobra.
 def _env_int(nome, padrao, *, minimo=None, maximo=None):
     """Env numérica TOLERANTE: valor ausente/vazio/ilegível => `padrao` (com WARNING no
     caso ilegível); abaixo de `minimo` => `minimo` e acima de `maximo` => `maximo` (com
@@ -187,9 +140,63 @@ def _env_float(nome, padrao, *, minimo=None, maximo=None):
 # para trás) não pode bloquear um curso por anos. Qualquer instante além de `agora + isto` é
 # DESCARTADO na leitura (`_carregar_estado_cursos`) — 24h é o teto da escada e 24h é o
 # cooldown sem-pendência, mais uma folga generosa. É também o TETO das envs que geram prazos
-# persistidos (rodada 2, item 3): um prazo configurado acima dele era jogado fora no primeiro
-# reinício — o bench de exit 4 de 5 dias soltava o curso na hora em que o vigia reiniciava o loop.
+# persistidos (rodada 2, itens 3 e 6: espera/expiração do exit 4 e os dois cooldowns): um prazo
+# configurado acima dele era jogado fora no primeiro reinício — o bench de exit 4 de 5 dias
+# soltava o curso na hora em que o vigia reiniciava o loop.
 _ESTADO_FUTURO_MAX_S = 2 * 86400.0
+
+# BENCH do exit-5 (anti-flap): exit 5 = sonda de sessão INCONCLUSIVA / erro de infra
+# (contrato do motor — NÃO é sessão morta). Uma URL MALFORMADA no YAML (ex.:
+# …/products/X/agent) torna a sonda inconclusiva PARA SEMPRE: cada disparo morre
+# exit-5, a causa diz `relancar`, e o curso flapa infinito. Após N mortes exit-5
+# SEGUIDAS no MESMO curso (mesma URL — o `st` é chaveado por URL), o curso é
+# BENCHED (irredutível: o disjuntor para de re-tentar SÓ este curso) + ALERTA ESSENCIAL
+# com a URL (dedup por curso; r6 — antes só-log, e o curso parava calado).
+# INVIOLÁVEL ANTI-BAN: o bench NÃO é reseed nem relogin (sonda inconclusiva
+# ≠ sessão morta confirmada — esta segue a escalada normal de reseed, que tem
+# precedência sobre o bench); e é POR-CURSO: os demais cursos, inclusive da MESMA
+# conta, seguem. N=3 espelha o _FLAP_MIN (1 exit-5 é transitório comum de rede;
+# 3 seguidos — espaçados pelo recozimento do backoff — não é blip, é a URL).
+# A contagem zera em: saída limpa, avanço real no Notion (que também DESBENCHA:
+# se outra via produziu progresso, never-stop reavalia), ou morte de outra causa.
+_EXIT_SONDA_INCONCLUSIVA = 5           # contrato do motor (ver causa.py)
+_BENCH_EXIT5_MIN = _env_int("ATHENA_BENCH_EXIT5_MIN", 3, minimo=1)
+
+# COOLDOWN de curso QUIESCIDO por SAÍDA LIMPA: quando o motor sai LIMPO (exit 0) sem
+# produzir nada novo (Notion não avançou), o curso está concluído/sem-pendência para o
+# denominador que temos. Em vez de re-spawnar a cada ciclo (o que floodava o vigia com
+# saídas-limpas e queimava sessão à toa), o curso entra num COOLDOWN: fica quieto por
+# esta janela e só é reavaliado ao expirar. NÃO é permanente (never-stop): se novo
+# conteúdo aparecer, um ciclo pós-cooldown o retoma; e QUALQUER avanço real no Notion —
+# ou pendência capturável NOVA no tracker (acima do baseline do arme; ex.: reseed) —
+# limpa o cooldown na hora. Default 6h; env ATHENA_COOLDOWN_CONCLUIDO_S calibra.
+_COOLDOWN_SAIDA_LIMPA_S = _env_float("ATHENA_COOLDOWN_CONCLUIDO_S", 21600.0, minimo=0.0,
+                                     maximo=_ESTADO_FUTURO_MAX_S)              # 6h
+
+# COOLDOWN de curso SEM PENDÊNCIA CAPTURÁVEL (higiene 2): o tracker prova que só restam
+# aulas TERMINAIS (no_notion/sem_conteudo/falhou…), mesmo com o Notion < total (aulas
+# terminais nunca chegam ao Notion). É "essencialmente pronto" — não re-disparar NEM
+# escalar exit-4 a cada ciclo (falso-positivo invistodireito 533/547). Cooldown LONGO
+# (mais que a saída-limpa: aqui o tracker PROVA que não há trabalho, então revisitar é
+# ainda mais raro). QUALQUER avanço no Notion / pendência nova limpa na hora (never-stop).
+# INVARIANTE: pendência REAL (parede/throttle => aula pendente/in-flight) NÃO cai aqui.
+_COOLDOWN_SEM_PENDENCIA_S = _env_float("ATHENA_COOLDOWN_SEM_PENDENCIA_S", 86400.0, minimo=0.0,
+                                       maximo=_ESTADO_FUTURO_MAX_S)            # 24h
+
+# PORTÃO DE CARGA (maestro.carga; incidente 10/09): o LocalExecutor ADIA o disparo quando o
+# Mac está sobrecarregado. Adiar é auto-tratado — o aviso agregado por ciclo fica SÓ-LOG;
+# se a sobrecarga PERSISTIR por esta janela (nada sendo capturado), o aviso vira ESSENCIAL
+# (1 ping por janela de dedup do Alertas) + 1 escalada na espinha por episódio. 0 = nunca
+# escala (só-log sempre). Default 1h.
+_CARGA_ALERTA_S = _env_float("ATHENA_CARGA_ALERTA_S", 3600.0, minimo=0.0)
+
+# EPISÓDIO DE SOBRECARGA EM DISCO (achado r6): o `desde` do episódio vai para um arquivo
+# pequeno (ATHENA_CARGA_EPISODIO_PATH, default ~/.athena-local/carga_episodio.json) e o
+# `rodar` o retoma no boot — reinícios curtos (vigia externo, launchd) não zeram mais o
+# relógio do aviso ESSENCIAL. LACUNA: se a última observação de adiamento ficou mais longe
+# que isto do boot, o loop esteve fora tempo demais para chamar de "o mesmo episódio" —
+# recomeça do zero (honesto). Default 30 min (o vigia externo mata após 900 s sem pulso).
+_CARGA_EPISODIO_LACUNA_S = _env_float("ATHENA_CARGA_EPISODIO_LACUNA_S", 1800.0, minimo=0.0)
 
 
 # RELANÇAMENTO APÓS O CIRCUIT-BREAKER (exit 4) — trilha anti-ban aprovada pelo dono (15/09).
@@ -463,7 +470,7 @@ def _registrar(espinha, o_que, por_que, **kw):
 # rotulado `medido=False` — a regra inviolável nº2 da espinha (nunca somar
 # presumido com medido). Uma classificação de causa-raiz é 1 chamada headless
 # curta; o proxy é conservador e serve só ao teto/observabilidade, jamais à fatura.
-_CUSTO_PROXY_CLAUDE_P_USD = float(os.getenv("ATHENA_CUSTO_PROXY_CLAUDE_P_USD", "0.02"))
+_CUSTO_PROXY_CLAUDE_P_USD = _env_float("ATHENA_CUSTO_PROXY_CLAUDE_P_USD", 0.02, minimo=0.0)
 
 
 def _safe_ativo(executor, curso_url) -> bool:
@@ -1247,7 +1254,7 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
 # ===========================================================================
 # Frescor do heartbeat: acima disso, com run "ativo", o run está TRAVADO (processo
 # vivo mas parado) — matar é seguro (sistema não tem sessão/anti-ban). Default 15min.
-_HEARTBEAT_LIMIAR_S = float(os.getenv("ATHENA_SISTEMA_HEARTBEAT_S", "900"))
+_HEARTBEAT_LIMIAR_S = _env_float("ATHENA_SISTEMA_HEARTBEAT_S", 900.0, minimo=1.0)
 # Proxy conservador de custo quando o resultado.json não traz custo (nunca deve,
 # mas fail-safe): 0 medido, 0 presumido — o resultado.json é a fonte-verdade.
 
@@ -1295,7 +1302,7 @@ def _build_mais_recente(raiz):
 _BUDGET_MODO = os.getenv("ATHENA_BUDGET_MODO", "alerta")
 # Proxy de custo do brainstorm `claude -p` antes de escalar — SEMPRE medido=False
 # (regra inviolável nº2: jamais somar presumido com medido).
-_CUSTO_PROXY_BRAINSTORM_USD = float(os.getenv("ATHENA_CUSTO_PROXY_BRAINSTORM_USD", "0.05"))
+_CUSTO_PROXY_BRAINSTORM_USD = _env_float("ATHENA_CUSTO_PROXY_BRAINSTORM_USD", 0.05, minimo=0.0)
 
 # Classes de trava do ledger que são DEFEITO DE ENGENHARIA → reconstruir (§E.1).
 _TRAVAS_ENGENHARIA = frozenset({
@@ -2736,7 +2743,7 @@ def main():  # pragma: no cover — I/O real (monta os seams concretos e roda o 
     estado_cursos_path = os.getenv("ATHENA_ESTADO_CURSOS_PATH",
                                    os.path.join(base, "estado_cursos.json"))
     lock_dir_efetivo = lock_dir or os.path.join(base, "locks")
-    batimento_intervalo = float(os.getenv("ATHENA_BATIMENTO_S", "1800"))
+    batimento_intervalo = _env_float("ATHENA_BATIMENTO_S", 1800.0, minimo=0.0)
     # DIAGNÓSTICO por LLM da causa-raiz DESCONHECIDA: OFF por padrão (fail-closed ->
     # escalar_humano). Ligar com ATHENA_CAUSA_LLM=1 faz uma morte de causa desconhecida
     # chamar `claude -p` (subprocesso REAL, custo/tempo) para classificar. Deixado como

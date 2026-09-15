@@ -285,6 +285,8 @@ def _serie_exit4_aberta(st, agora) -> bool:
     """Há série de exit-4 de PLATAFORMA viva — com abort mais novo que a janela de decaimento?"""
     if not st.get("exit4_seguidas"):
         return False
+    if st.get("exit4_rearmado"):          # a UMA tentativa pós-bench ainda não rodou: não decai
+        return True
     ultimo = st.get("exit4_ultimo")
     return ultimo is not None and (agora - float(ultimo)) < _BENCH_EXIT4_EXPIRA_S
 
@@ -312,6 +314,8 @@ def _serie_exit4_aberta(st, agora) -> bool:
 #   exit4_ate                         último, p/ decair) + a espera pós-exit-4 (15/09).
 #                                     CONTADOR e JANELA: sem eles cada reinício concedia
 #                                     uma série nova de 3 aborts a um curso em laço.
+#   exit4_rearmado                    a UMA tentativa pós-bench ainda não DISPAROU (rodada 2,
+#                                     item 4): a série não decai enquanto ela espera a conta.
 #   benched_exit4_ate                 o PRAZO do bench de exit-4. Com prazo, persistir é
 #                                     seguro (ele se solta sozinho); o latch booleano é
 #                                     reconstruído dele na passada — um reinício do vigia
@@ -328,7 +332,7 @@ def _serie_exit4_aberta(st, agora) -> bool:
 # JSONs de autópsia em disco na janela, não um contador em memória.)
 _ESTADO_CURSOS_CHAVES = ("disj_falhas", "disj_bloqueado_ate", "cooldown_ate",
                          "_pend_no_cooldown", "ultimo_no_notion", "exit4_seguidas",
-                         "exit4_ultimo", "exit4_ate", "benched_exit4_ate")
+                         "exit4_ultimo", "exit4_ate", "benched_exit4_ate", "exit4_rearmado")
 # TETO DE SANIDADE do futuro: `_ESTADO_FUTURO_MAX_S`, definido junto das envs (lá em cima)
 # porque é também o teto das envs que geram prazos persistidos.
 
@@ -557,6 +561,7 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
         st.pop("exit5_seguidas", None)   # um run limpo prova a sonda sã: zera o bench
         st.pop("exit4_seguidas", None)   # e o run que terminou sem abortar zera a série do exit-4
         st.pop("exit4_ultimo", None)
+        st.pop("exit4_rearmado", None)
         return
 
     # MORTE SEM FALHA da captura (causa: `sem_falha` — reinício/desligamento do Mac
@@ -698,7 +703,10 @@ def _aplicar_decisao(curso, st, obito, decisao, *, disjuntor, alertas, agora,
                         f"{_ROTULO_CLASSE_EXIT4[classe]}; relanço só depois de {int(espera)} s")
         if classe == "plataforma" and acao != "escalar_token":
             ultimo = st.get("exit4_ultimo")
-            recente = ultimo is not None and (agora - float(ultimo)) < _BENCH_EXIT4_EXPIRA_S
+            # a UMA tentativa pós-bench (item 4 da rodada 2) nunca decai: a espera pela conta
+            # não é tempo de curso são
+            recente = bool(st.pop("exit4_rearmado", None)) or (
+                ultimo is not None and (agora - float(ultimo)) < _BENCH_EXIT4_EXPIRA_S)
             n4 = (int(st.get("exit4_seguidas", 0) or 0) + 1) if recente else 1  # DECAI
             st["exit4_seguidas"] = n4
             st["exit4_ultimo"] = agora
@@ -1114,6 +1122,10 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                 st.pop("esgotado_avisado", None)           # o próximo fechamento escala de novo
                 st["exit4_seguidas"] = max(_BENCH_EXIT4_MIN - 1, 0)
                 st["exit4_ultimo"] = agora
+                # PENDENTE até DISPARAR (rodada 2, item 4): com a conta ocupada por outro curso
+                # por mais que a janela, a série decairia antes de a tentativa rodar e o abort
+                # dela viraria série nova. O relógio do decaimento só recomeça no disparo.
+                st["exit4_rearmado"] = 1
                 # E17: bench de exit-4 expirou — UMA tentativa (never-stop com prazo).
                 _registrar(esp, f"bench exit-4 de {curso} expirou — UMA tentativa",
                            f"prazo de {int(_BENCH_EXIT4_EXPIRA_S)} s vencido; o próximo abort "
@@ -1200,6 +1212,8 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
             return Acao("", False, True, pedido)
         st["tentativas"] = st.get("tentativas", 0) + 1
         st["fase"] = FASE_CAPTURANDO
+        if st.pop("exit4_rearmado", None):                 # a UMA tentativa pós-bench DISPAROU:
+            st["exit4_ultimo"] = agora                     # o decaimento conta daqui
         # Marca-d'água do Notion no disparo: se a saída-limpa não a ultrapassar, o run nada
         # produziu (curso quiescido -> cooldown); se ultrapassar, houve progresso (segue).
         st["_no_notion_no_disparo"] = st.get("ultimo_no_notion")
@@ -1913,7 +1927,7 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
             if valor != valor or valor in (float("inf"), float("-inf")):
                 continue                               # NaN/inf
             if chave in ("disj_falhas", "ultimo_no_notion", "_pend_no_cooldown",
-                         "exit4_seguidas"):             # contadores; os demais são instantes
+                         "exit4_seguidas", "exit4_rearmado"):  # contadores; os demais: instantes
                 if valor < 0:
                     continue
                 limpo[chave] = int(valor)

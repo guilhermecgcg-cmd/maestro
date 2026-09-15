@@ -1360,12 +1360,13 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
                 # deste ciclo) saiu 0 sem avanço com a suspensão do YouTube valendo — o motor M4
                 # deixou as aulas do YouTube retentáveis (`youtube_suspenso`, contadas em
                 # `falhou`) e saiu 0. Não é curso quiescido: sem cooldown; ele espera a janela.
-                sy_espera = estado.get(_CHAVE_YOUTUBE)
+                # SÓ com a suspensão BLOQUEANDO AGORA (D3r2, A2): com a janela vencida (e a reserva
+                # da prova falhando, a gravação do estado fora), a espera era solta na MESMA passada
+                # e o portador saía de novo sem token a cada ciclo — 6 disparos do Memberkit em 15
+                # min contra a plataforma paga. Aí é o cooldown normal de curso quiescido.
                 espera_youtube = (not avancou and st.get("_portador_youtube")
                                   and st.get("_prova_resultado_ciclo") != agora
-                                  and isinstance(sy_espera, dict)
-                                  and (sy_espera.get("ate") is not None
-                                       or sy_espera.get("prova_curso")))
+                                  and _youtube_bloqueado(estado.get(_CHAVE_YOUTUBE), agora))
                 if espera_youtube:
                     st["espera_youtube"] = 1
                     _registrar(esp, f"{curso} espera a suspensão do YouTube",

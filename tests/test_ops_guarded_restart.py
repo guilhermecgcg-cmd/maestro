@@ -8,7 +8,8 @@ O ACHADO (`~/.athena-local/ativar_guarded_restart.sh`, copiado para `ops/`):
     `motor.cli --anexos`/`--retentar`), que o restart do daemon não afeta, segurava para sempre.
 
 AGORA:
-  - motor vivo = `python[^ ]* -m motor\\.` (qualquer braço, qualquer nome de interpretador);
+  - motor vivo = `[Pp]ython…` com opções do interpretador antes do `-m motor.` (qualquer braço,
+    qualquer nome de interpretador, o `Python` de framework do macOS — D3r2, A3);
   - um lock só é ACEITO (não segura) quando o dono é explicitamente MANUAL (`sonda-p102`,
     `motor-anexos`, `motor-retentar`, `manual…`) E o PID dele não descende do daemon; o motor
     desse lock (e o que descende dele) também não segura. Lock sem dono, ilegível, de dono
@@ -104,6 +105,34 @@ def test_motor_de_qualquer_braco_segura_a_janela(tmp_path):
               "https://luanacarolina.entregadigital.app.br/")]
     assert _resultado(_rodar(tmp_path, procs, [])) == "RESULTADO=HELD", \
         "motor.entregadigital rodando e o guard deu a janela"
+
+
+# D3r2, A3 (revisão independente): `python[^ ]* -m motor\.` não via o motor com opção do
+# interpretador antes do `-m` (`python -u -m motor.cli`) nem o Python de framework do macOS
+# (argv[0] "Python"). Os dois primeiros casos são os testes do revisor, copiados.
+@pytest.mark.parametrize("args", [
+    "/Users/g/teste/aula/.venv/bin/python -u -m motor.cli "
+    "https://hotmart.com/pt-br/club/x/products/1",
+    "/Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/"
+    "Python -m motor.memberkit https://x",
+    "/Users/g/teste/aula/.venv/bin/python3.14 -X dev -W ignore::DeprecationWarning "
+    "-m motor.kiwify https://x",
+    "/opt/homebrew/bin/python3.14t -B -m motor.instagram https://x",
+    "/Users/g/teste/aula/.venv/bin/python -mmotor.cli https://x",
+], ids=["opcao-u", "python-de-framework", "opcoes-com-argumento", "free-threaded", "m-colado"])
+def test_motor_com_opcao_do_interpretador_ou_python_de_framework_segura_a_janela(tmp_path, args):
+    assert _resultado(_rodar(tmp_path, [(41010, PID_DAEMON, args)], [])) == "RESULTADO=HELD", args
+
+
+@pytest.mark.parametrize("args", [
+    "/usr/bin/python3 -m http.server 8000",
+    "/Users/g/teste/aula/.venv/bin/python -m pytest tests/test_motor.py",
+    "/Users/g/teste/aula/.venv/bin/python -c import motor.cli",
+    "/Users/g/teste/aula/.venv/bin/python " + "-B -X dev " * 40 + "-c pass",
+], ids=["outro-modulo", "pytest-com-motor-no-caminho", "motor-sem-dash-m",
+        "muitas-opcoes-sem-motor"])
+def test_python_que_nao_roda_motor_nao_segura_a_janela(tmp_path, args):
+    assert _resultado(_rodar(tmp_path, [(41020, 700, args)], [])) == "RESULTADO=GUARDA_OK", args
 
 
 @pytest.mark.parametrize("dono", ["sonda-p102", "motor-anexos", "motor-retentar",

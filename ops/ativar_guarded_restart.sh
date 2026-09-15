@@ -5,9 +5,11 @@
 # feito (exit 2). ANTI-BAN: nunca mata um motor em voo.
 #
 # D3, item 8 (15/09):
-#   - MOTOR VIVO = `python[^ ]* -m motor\.`. Antes só `python -m motor\.cli`: motor.entregadigital,
-#     motor.kiwify, motor.instagram (e o `python3.14 -m ...` do venv) eram invisíveis e o restart podia
-#     acontecer com captura em andamento.
+#   - MOTOR VIVO = `[Pp]ython…` + opções do interpretador + `-m motor.` (ver MOTOR abaixo). Antes só
+#     `python -m motor\.cli`: motor.entregadigital, motor.kiwify, motor.instagram (e o
+#     `python3.14 -m ...` do venv) eram invisíveis e o restart podia acontecer com captura em
+#     andamento. D3r2, A3: o `python[^ ]* -m motor\.` do D3 ainda não via `python -u -m motor.cli`,
+#     `-X dev`/`-W ação` antes do `-m`, nem o `Python` de framework do macOS (argv[0] maiúsculo).
 #   - LOCK: só NÃO segura a janela o de dono explicitamente MANUAL (sonda-p102, motor-anexos,
 #     motor-retentar, manual...) cujo PID não descende do daemon — a prova manual não é afetada pelo
 #     restart e segurava a janela para sempre. O motor desse lock (e o que descende dele) também não
@@ -79,8 +81,12 @@ for nome in nomes:
         continue
     locks_que_seguram += 1
 
+# D3r2, A3: opções do interpretador antes do `-m` (`-u`, `-B`, `-X dev`, `-W ação`, `-mmotor.x`) e o
+# `Python` de framework do macOS também são motor. As alternativas não se sobrepõem (sem backtracking
+# explosivo numa linha com muitas opções). Errar para o lado de segurar só adia o restart.
+MOTOR = re.compile(r"[Pp]ython[^ /]*(?: +-[XW] +[^ ]+| +-[A-Za-z]+)* +-m *motor\.")
 motores = [p for p, (_ppid, args) in tabela.items()
-           if re.search(r"python[^ ]* -m motor\.", args) and not descende_de(p, aceitos)]
+           if MOTOR.search(args) and not descende_de(p, aceitos)]
 print(len(motores), locks_que_seguram)
 PY
 }

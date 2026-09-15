@@ -333,7 +333,8 @@ def _saida_de_abort_do_disjuntor(texto) -> bool:
 #     conta, cada uma abrindo a Hotmart paga; sem a linha (motor anterior ao M4), reabrir no
 #     mesmo degrau voltaria ao IP barrado a cada 3 h para sempre;
 #   - AVISO: vencida há mais de ATHENA_YOUTUBE_ALERTA_VENCIDA_S (6 h) sem prova -> voz, uma vez
-#     por episódio;
+#     por episódio; e a PROVA sem resultado há mais que isso (D3r2, Q3) -> voz com o PID dela, uma
+#     vez por prova;
 #   - PID DA PROVA (D3r2, B1): o PID do processo da prova vai ao estado e ao disco logo depois do
 #     spawn (`prova_pid`; o motor M4 e o daemon anterior leem só as chaves que nomeiam e o
 #     ignoram). Só a morte DESSE PID decide a prova; o curso da prova não é redisparado enquanto
@@ -369,7 +370,7 @@ def _youtube_degrau_max() -> int:
     return n
 
 
-_CHAVES_DA_PROVA = ("prova_curso", "prova_desde", "prova_pid")
+_CHAVES_DA_PROVA = ("prova_curso", "prova_desde", "prova_pid", "aviso_prova_desde")
 
 
 def _youtube_soltar_prova(sy):
@@ -526,11 +527,46 @@ def _observar_youtube(estado, curso, obito, *, agora, voz, espinha):
     _anunciar_suspensao_youtube(sy, agora, curso, voz=voz, espinha=espinha, subir=False)
 
 
+def _avisar_prova_youtube_sem_resultado(sy, *, agora, voz, espinha):
+    """A PROVA DO YOUTUBE SEM RESULTADO há mais de ATHENA_YOUTUBE_ALERTA_VENCIDA_S (D3r2, Q3): voz,
+    UMA vez por prova (o episódio é o `prova_desde`, persistido em `aviso_prova_desde`). A órfã sem
+    autópsia deixava as contas esperando caladas até o teto de 24 h, que ainda reabria a janela no
+    mesmo degrau: ~27 h de YouTube parado sem ninguém saber. Processo pendurado ou perdido é coisa
+    que só o dono confere — daí o PID no aviso."""
+    desde = sy.get("prova_desde")
+    if desde is None:
+        return
+    desde = float(desde)
+    if agora - desde <= _YOUTUBE_ALERTA_VENCIDA_S or sy.get("aviso_prova_desde") == desde:
+        return
+    sy["aviso_prova_desde"] = desde
+    pid, curso = sy.get("prova_pid"), sy.get("prova_curso")
+    alvo = f"o processo {pid}" if pid else f"o processo da prova em {curso} (PID desconhecido)"
+    texto = f"prova do YouTube sem resultado há {int((agora - desde) // 3600)}h — conferir {alvo}"
+    log.warning(texto)
+    if voz is not None:
+        try:
+            voz.escalar(Problema("youtube_prova_sem_resultado", "youtube", texto, "aviso"), texto)
+        except Exception:
+            pass
+    teto_h = int(max(_YOUTUBE_SUSPENSAO_TETO_S, _YOUTUBE_SUSPENSAO_S) // 3600)
+    _registrar(espinha, texto,
+               f"a prova de {curso} saiu às {time.strftime('%d/%m %H:%M', time.localtime(desde))} "
+               f"e nenhuma autópsia trouxe o resultado: nenhum passe do YouTube sai até ele voltar "
+               f"ou até o teto de {teto_h} h (aí a janela reabre no mesmo degrau)",
+               tipo="escalada", reversivel=True, escalada=True, curso=curso,
+               fonte="deterministico", origem="athena-local/youtube")
+
+
 def _avisar_youtube_vencida(estado, *, agora, voz, espinha):
     """Suspensão VENCIDA há mais de ATHENA_YOUTUBE_ALERTA_VENCIDA_S sem prova (nenhum passe
-    elegível disparou): voz, UMA vez por episódio (o episódio é o `ate` vencido)."""
+    elegível disparou): voz, UMA vez por episódio (o episódio é o `ate` vencido). Com uma prova em
+    curso, o aviso é o da prova sem resultado (`_avisar_prova_youtube_sem_resultado`)."""
     sy = estado.get(_CHAVE_YOUTUBE)
-    if not isinstance(sy, dict) or sy.get("ate") is None or sy.get("prova_curso"):
+    if isinstance(sy, dict) and sy.get("prova_curso"):
+        _avisar_prova_youtube_sem_resultado(sy, agora=agora, voz=voz, espinha=espinha)
+        return
+    if not isinstance(sy, dict) or sy.get("ate") is None:
         return
     ate = float(sy["ate"])
     if agora - ate <= _YOUTUBE_ALERTA_VENCIDA_S or sy.get("aviso_vencida_ate") == ate:
@@ -2339,7 +2375,8 @@ def _carregar_estado_cursos(path, *, agora) -> dict:
     return saida
 
 
-_ESTADO_YOUTUBE_INSTANTES = ("ate", "ultimo_bloqueio", "prova_desde", "aviso_vencida_ate")
+_ESTADO_YOUTUBE_INSTANTES = ("ate", "ultimo_bloqueio", "prova_desde", "aviso_vencida_ate",
+                             "aviso_prova_desde")
 _ESTADO_YOUTUBE_CHAVES = _ESTADO_YOUTUBE_INSTANTES + ("degrau", "prova_curso", "prova_pid")
 
 

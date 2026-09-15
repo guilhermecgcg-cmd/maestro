@@ -30,7 +30,7 @@ import pytest
 from maestro import athena_local, causa, disjuntor, vigia
 from maestro.adaptadores import captura
 from tests.test_antiban_d3_prova_youtube import (  # noqa: F401
-    CIRO, ENV_PROVA, H, MK, OUTRO, _abrir_suspensao, _linha, _Mac3, _prova_do_ciro,
+    AVISO_VENCIDA, CIRO, ENV_PROVA, H, MK, OUTRO, _abrir_suspensao, _linha, _Mac3, _prova_do_ciro,
     _SpawnQueLeOEstado, _STATS_OK)
 from tests.test_antiban_r2_suspensao_youtube import (  # noqa: F401 (fixture autouse)
     _ABORTO_YOUTUBE, _MUNDOS, _passe_youtube_ligado)
@@ -308,3 +308,31 @@ def test_err_mais_velho_que_a_prova_nao_vira_resultado_dela(tmp_path):
     assert disco.get("ate") == t + 120 + 3 * H and disco.get("degrau") == 1, (
         f"um .err velho decidiu a prova: {disco}")
     assert "prova_curso" not in disco, disco
+
+
+# ==========================================================================
+# Q3: a prova sem resultado há mais de 6 h avisa, uma vez por prova, com o PID
+# ==========================================================================
+_AVISO_PROVA = "prova do YouTube sem resultado"
+
+
+def test_prova_sem_resultado_ha_mais_de_6h_avisa_uma_vez_com_o_pid_mesmo_depois_de_reiniciar(
+        tmp_path):
+    # a revisão: a órfã sem autópsia deixava as contas esperando CALADAS por ~27 h (24 h de teto +
+    # 3 h da janela reaberta), e o aviso da suspensão vencida saía cedo quando havia prova
+    pend = {CIRO: {"youtube": 15}, OUTRO: {"youtube": 8}}
+    mac = _Mac3(tmp_path, pend)
+    t = _prova_do_ciro(mac)                                # a prova fica pendurada, sem resultado
+    pid = mac.chamadas(CIRO)[-1]["proc"].pid
+    mac.ciclo(t + 5 * H, [OUTRO])
+    assert mac.avisos(_AVISO_PROVA) == []
+    mac.ciclo(t + 6 * H + 120, [OUTRO])
+    assert mac.avisos(_AVISO_PROVA) == [
+        f"prova do YouTube sem resultado há 6h — conferir o processo {pid}"], mac.voz.escaladas
+    mac.ciclo(t + 7 * H, [OUTRO])                          # a mesma prova: não repete
+    assert len(mac.avisos(_AVISO_PROVA)) == 1
+    mac2 = _reiniciar(mac, pend, t + 7 * H + 60)           # nem depois de o daemon reiniciar
+    mac2.ciclo(t + 8 * H, [OUTRO])
+    assert mac2.avisos(_AVISO_PROVA) == [], mac2.voz.escaladas
+    assert mac.avisos(AVISO_VENCIDA) == [] and mac2.avisos(AVISO_VENCIDA) == []
+    assert mac2.youtube(OUTRO) == [] and mac2.disco().get("prova_curso") == CIRO

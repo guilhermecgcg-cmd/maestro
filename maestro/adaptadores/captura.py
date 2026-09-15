@@ -766,13 +766,19 @@ class PasseYoutubeSuspenso(ContaOcupada):
 # com `ate` presente (vencido ou não) ou prova em curso, nenhum processo pede nada — exceto o que
 # traz ATHENA_YOUTUBE_PROVA == str(prova_desde). Vencida a janela, o próximo disparo de um passe
 # que PODE tocar o YouTube leva a prova: o `--youtube` do Hotmart e o `base` das plataformas cujo
-# motor resolve player YouTube (memberkit, greenn, entregadigital — as do contrato — e nutror,
-# hubla, alpaclass, que o M4 também cobre: os três baixam YouTube com yt-dlp). Nenhuma sonda
-# dedicada. Um token herdado do ambiente do daemon NUNCA chega ao filho.
+# motor resolve player YouTube (memberkit, greenn, nutror, alpaclass). Nenhuma sonda dedicada. Um
+# token herdado do ambiente do daemon NUNCA chega ao filho.
+#
+# D3r3, item 1 (revisão do motor M4, NO-GO): ENTREGA DIGITAL e HUBLA saíram da lista. Na prova, o
+# motor delas continuava pedindo ao YouTube DEPOIS do bloqueio (uma aula bot atrás da outra): a
+# prova que devia ser UM pedido virava uma rajada contra o IP barrado. Voltam só depois que o motor
+# provar, em revisão, "prova ED/Hubla com 3 aulas bot → exatamente 1 pedido, linha `bloqueado`,
+# exit 4 youtube". Até lá o `base` delas sai SEM token durante a suspensão (o M4 barra o YouTube no
+# próprio motor e as aulas ficam retentáveis) e, não sendo portador, a saída limpa sem avanço é o
+# cooldown de sempre — nunca a espera neutra pela janela.
 ENV_PROVA_YOUTUBE = "ATHENA_YOUTUBE_PROVA"
 ENV_ESTADO_CURSOS = "ATHENA_ESTADO_CURSOS_PATH"
-_PLATAFORMAS_PROVA_NO_BASE = ("memberkit", "greenn", "entregadigital", "nutror", "hubla",
-                              "alpaclass")
+_PLATAFORMAS_PROVA_NO_BASE = ("memberkit", "greenn", "nutror", "alpaclass")
 
 
 def passe_carrega_prova_youtube(plataforma, passe) -> bool:

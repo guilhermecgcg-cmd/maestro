@@ -1879,6 +1879,34 @@ class LocalExecutor:
         slug = hashlib.sha256(str(conta).encode("utf-8")).hexdigest()[:16]
         return os.path.join(self._motor_log_dir, slug + ".err")
 
+    # DONO DO .err (D3r3, revisão do D3r2, achado 1): o .err é POR CONTA e truncado a cada disparo
+    # dela, e nada nele diz de qual run é. A autópsia da prova do YouTube órfã sem lock precisa
+    # provar que a saída é do run da prova (e não de outro curso da conta) antes de lê-la.
+    def _dono_do_err_path(self, conta) -> str:
+        return self._stderr_path(conta) + ".dono"
+
+    def _gravar_dono_do_err(self, conta, curso_url, pid):
+        """{pid, course_url, ts} do disparo que acabou de tee'ar no .err da conta (logo depois do
+        spawn). Best-effort, troca atômica: sem ele (falhou ou a queda veio antes), o dono lido é o
+        do disparo anterior e a autópsia da prova órfã não prova o .err — o lado seguro."""
+        caminho = self._dono_do_err_path(conta)
+        try:
+            os.makedirs(os.path.dirname(caminho), exist_ok=True)
+            with open(caminho + ".tmp", "w") as f:
+                json.dump({"pid": pid, "course_url": curso_url, "ts": time.time()}, f)
+            os.replace(caminho + ".tmp", caminho)
+        except OSError:
+            pass
+
+    def dono_do_err(self, conta) -> dict:
+        """Quem escreveu por último o .err da conta ({pid, course_url, ts}), ou {}."""
+        try:
+            with open(self._dono_do_err_path(conta)) as f:
+                dados = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return dados if isinstance(dados, dict) else {}
+
     def _ler_lock(self, conta, *, limpar=True):
         """Lê o lock da conta e devolve o dict {pid, course_url, conta} SE o PID ainda
         roda; senão devolve None e REMOVE o lock obsoleto (processo morreu -> conta
@@ -2789,6 +2817,8 @@ class LocalExecutor:
         # atômica por cima da NOSSA intenção: ninguém mais cria lock enquanto ela existe
         # (todos criam exclusivo) e ninguém apaga lock alheio de intenção.
         self._escrever_lock(meta.conta, curso_url, getattr(proc, "pid", None))
+        # o DONO do .err (D3r3): este disparo passa a ser o dono da saída tee'ada da conta
+        self._gravar_dono_do_err(meta.conta, curso_url, getattr(proc, "pid", None))
         if token_prova is not None and confirmar_prova is not None:
             # D3r2, B1(a): o PID da prova vai ao estado (e ao disco) do loop logo depois do spawn
             try:

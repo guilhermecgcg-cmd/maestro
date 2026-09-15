@@ -337,10 +337,11 @@ def _saida_de_abort_do_disjuntor(texto) -> bool:
 #     vez por prova;
 #   - PID DA PROVA (D3r2, B1): o PID do processo da prova vai ao estado e ao disco logo depois do
 #     spawn (`prova_pid`; o motor M4 e o daemon anterior leem só as chaves que nomeiam e o
-#     ignoram). Só a morte DESSE PID decide a prova; o curso da prova não é redisparado enquanto
-#     ela não tem resultado; o lock de PID morto da prova não é apagado antes da autópsia (a conta
-#     fica travada e o .err dela intacto) e, se o lock sumir mesmo assim, a autópsia lê o .err da
-#     conta pelo PID da prova;
+#     ignoram). Só a morte DESSE PID decide a prova; nenhum curso da CONTA da prova é disparado
+#     enquanto ela não tem resultado (D3r3: antes era só o curso); o lock de PID morto da prova não
+#     é apagado antes da autópsia (a conta fica travada e o .err dela intacto) e, se o lock sumir
+#     mesmo assim, a autópsia lê o .err da conta pelo PID da prova — só se o DONO do .err gravado no
+#     disparo é esse PID; sem essa prova, é prova sem linha e nenhuma causa vai ao curso (D3r3);
 #   - RODÍZIO DO PORTADOR (D3r3, item 2): 3 `sem_sucesso` SEGUIDOS nas provas de um curso (só ok e
 #     bloqueado zeram) o tiram da lista de PORTADORES por 24 h — só de portar a prova: os passes
 #     normais dele seguem. Depois de qualquer resultado não-ok, a próxima prova prefere OUTRO
@@ -872,6 +873,19 @@ def _safe_ativo(executor, curso_url) -> bool:
         return False
 
 
+def _mesma_conta(executor, curso_a, curso_b) -> bool:
+    """Os dois cursos são da MESMA conta (a unidade do anti-ban e do .err)? Executor sem `conta_de`
+    ou conta desconhecida: False (o bloqueio fica só no curso, como antes)."""
+    conta_de = getattr(executor, "conta_de", None)
+    if not callable(conta_de):
+        return False
+    try:
+        conta_a, conta_b = conta_de(curso_a), conta_de(curso_b)
+    except Exception:
+        return False
+    return bool(conta_a) and conta_a == conta_b
+
+
 def _aguardando_autopsia(executor, curso_url) -> bool:
     """A conta do curso tem óbito colhido e ainda não autopsiado? Fail-open: executor sem
     a sonda (dublês antigos / FilaExecutor) ou sonda que levanta => False (comportamento de
@@ -1218,15 +1232,19 @@ _ERR_FOLGA_PROVA_S = 5.0
 
 
 def _fonte_da_prova_sem_lock(executor, sy):
-    """(conta, fonte) para a autópsia da PROVA DO YOUTUBE ÓRFÃ cujo lock sumiu, ou None.
+    """(conta, fonte, provada) para a autópsia da PROVA DO YOUTUBE ÓRFÃ cujo lock sumiu, ou None.
 
     D3r2, B1(d): o lock de PID morto da prova não é mais apagado antes da autópsia
     (`LocalExecutor.guardar_lock_da_prova_youtube`). Se ele sumir mesmo assim (apagado à mão, um
     daemon anterior), o vigia — que só acha a morte de uma órfã pelo lock — deixava a prova sem
     resultado até o teto de 24 h. Com o PID da prova conhecido e NENHUM lock na conta, a fonte leva
-    o PID (o vigia sonda a vida dele) e o .err da conta SE ele não é mais velho que a prova: um .err
-    anterior (tee que falhou neste disparo) pode trazer a linha `ok` de OUTRA prova. Com lock na
-    conta, None: é o caminho de sempre do vigia."""
+    o PID (o vigia sonda a vida dele). Com lock na conta, None: é o caminho de sempre do vigia.
+
+    `provada` (D3r3, revisão do D3r2, achado 1): o .err da conta é do run da prova — o DONO dele,
+    gravado pelo executor a cada disparo (`dono_do_err`), é o PID e o curso da prova, e o .err não é
+    mais velho que ela. Só então a fonte leva o .err. Um .err de outro curso da conta, de um disparo
+    anterior (tee que falhou), ou sem dono (disparo de um daemon anterior) não se prova: a fonte vai
+    sem saída e quem chama resolve a prova SEM LINHA, sem causa no curso."""
     if not isinstance(sy, dict) or not sy.get("prova_curso"):
         return None
     pid = sy.get("prova_pid")
@@ -1241,14 +1259,49 @@ def _fonte_da_prova_sem_lock(executor, sy):
     conta = conta_de(curso)
     if not conta or os.path.exists(lock_path_de(conta)):
         return None
-    fonte = {"pid": pid, "curso": curso, "stderr_tail": ""}
     err = stderr_path_de(conta)
+    dono_de = getattr(executor, "dono_do_err", None)
+    dono = dono_de(conta) if callable(dono_de) else {}
+    do_run_da_prova = (isinstance(dono, dict) and dono.get("pid") == pid
+                       and dono.get("course_url") == curso)
     try:
-        if os.path.getmtime(err) >= float(sy.get("prova_desde") or 0.0) - _ERR_FOLGA_PROVA_S:
-            fonte = {"pid": pid, "curso": curso, "stderr_path": err}
+        fresco = os.path.getmtime(err) >= float(sy.get("prova_desde") or 0.0) - _ERR_FOLGA_PROVA_S
     except OSError:
-        pass
-    return str(conta), fonte
+        fresco = False
+    if do_run_da_prova and fresco:
+        return str(conta), {"pid": pid, "curso": curso, "stderr_path": err}, True
+    return str(conta), {"pid": pid, "curso": curso, "stderr_tail": ""}, False
+
+
+class _MorteSemSaida:
+    """A morte da prova órfã cujo .err não se prova do run dela: sem código de saída e sem saída."""
+    exit_code = None
+    stderr_bruto = ""
+    stderr_tail = ""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+
+def _resolver_prova_orfa_sem_err(estado, fonte, *, vigia, agora, voz, espinha):
+    """D3r3 (revisão do D3r2, achado 1): a prova órfã sem lock cujo .err NÃO se prova do run dela.
+    Com o PID dela morto, a prova é resolvida como SEM LINHA — a suspensão segue e a janela reabre
+    no mesmo degrau — e NENHUMA causa vai ao curso da prova: nem autópsia em disco (flap), nem
+    disjuntor, nem exit 4. A saída que está no .err é de outro run: lida, ela trocava o bloqueado da
+    prova (degrau 1 em vez de 2) e punha a morte alheia no curso errado."""
+    pid_vivo = getattr(vigia, "_pid_vivo", None)
+    if not callable(pid_vivo) or pid_vivo(fonte["pid"]):
+        return
+    curso = fonte["curso"]
+    log.warning("prova do YouTube órfã em %s (PID %s) morreu sem lock e o .err da conta não é do "
+                "run dela: resolvida sem linha, nenhuma causa aplicada ao curso", curso, fonte["pid"])
+    _registrar(espinha, f"prova órfã do YouTube em {curso} sem o .err dela",
+               "o lock sumiu e o .err da conta é de outro run (outro PID/curso, sem dono ou mais "
+               "velho que a prova): prova sem linha — a janela reabre no mesmo degrau — e nenhuma "
+               "causa vai ao curso da prova", reversivel=True, fonte="deterministico", curso=curso,
+               origem="athena-local/youtube")
+    _observar_youtube(estado, curso, _MorteSemSaida(fonte["pid"]), agora=agora, voz=voz,
+                      espinha=espinha)
 
 
 def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock_dir,
@@ -1276,9 +1329,13 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
         orfa = _fonte_da_prova_sem_lock(executor, estado.get(_CHAVE_YOUTUBE))
     except Exception:
         orfa = None
+    orfa_sem_err = None
     if orfa is not None and orfa[0] not in {str(c) for c in stderr_por_conta}:
-        stderr_por_conta = dict(stderr_por_conta)
-        stderr_por_conta[orfa[0]] = orfa[1]
+        if orfa[2]:                                    # o .err é do run da prova: autópsia normal
+            stderr_por_conta = dict(stderr_por_conta)
+            stderr_por_conta[orfa[0]] = orfa[1]
+        else:                                          # não se prova: sem linha, sem causa (abaixo)
+            orfa_sem_err = orfa[1]
     extra = {}
     stderr_path_de = getattr(executor, "_stderr_path", None)
     if callable(stderr_path_de):
@@ -1341,6 +1398,12 @@ def _autopsiar_ciclo(executor, estado, *, vigia, causa, disjuntor, alertas, lock
             _observar_youtube(estado, curso, obito, agora=agora, voz=voz, espinha=espinha)
         except Exception:
             log.warning("não avaliei a suspensão do YouTube para %s", curso, exc_info=True)
+    if orfa_sem_err is not None:
+        try:
+            _resolver_prova_orfa_sem_err(estado, orfa_sem_err, vigia=vigia, agora=agora, voz=voz,
+                                         espinha=espinha)
+        except Exception:
+            log.warning("não resolvi a prova órfã do YouTube sem o .err dela", exc_info=True)
 
 
 def _escalar_plataforma_nova(projeto_nome, voz, curso_url, st, *, espinha=None):
@@ -1642,12 +1705,14 @@ def _passada_local_fn(executor, progresso_fn, voz, estado, *, projeto_nome, disj
         # pela Voz no ciclo da autópsia, como antes; a espera só segura o DISPARO.
         if agora < float(st.get("exit4_ate", 0.0) or 0.0):
             return None
-        # A PROVA SEM RESULTADO (D3r2, B1(c)): o curso da prova não é redisparado enquanto ela não
-        # tem resultado. A órfã (o Popen se perdeu num reinício) que morre no meio do ciclo só é
-        # autopsiada no ciclo seguinte: redisparado agora, o run novo — sem token, que não pode
-        # tocar o YouTube — truncaria o .err dela e viraria o "resultado" da prova.
+        # A PROVA SEM RESULTADO (D3r2, B1(c); D3r3: a CONTA): nenhum curso da conta da prova é
+        # disparado enquanto ela não tem resultado. A órfã (o Popen se perdeu num reinício) que
+        # morre no meio do ciclo só é autopsiada no ciclo seguinte: um run novo NA MESMA CONTA — o
+        # do próprio curso, ou de outro curso dela (revisão do D3r2, achado 1: com o lock apagado à
+        # mão, o outro curso subia) — truncaria o .err dela e viraria o "resultado" da prova.
         sy_prova = estado.get(_CHAVE_YOUTUBE)
-        if isinstance(sy_prova, dict) and sy_prova.get("prova_curso") == curso:
+        prova_curso = sy_prova.get("prova_curso") if isinstance(sy_prova, dict) else None
+        if prova_curso and (prova_curso == curso or _mesma_conta(executor, prova_curso, curso)):
             return None
         # ESPERA NEUTRA (D3, item 7): enquanto a suspensão do YouTube bloqueia (janela aberta ou
         # prova em curso), o curso cujo trabalho era todo YouTube suspenso não é redisparado —

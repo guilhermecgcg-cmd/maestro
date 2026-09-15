@@ -8,8 +8,9 @@ O ACHADO (`~/.athena-local/ativar_guarded_restart.sh`, copiado para `ops/`):
     `motor.cli --anexos`/`--retentar`), que o restart do daemon não afeta, segurava para sempre.
 
 AGORA:
-  - motor vivo = `[Pp]ython…` com opções do interpretador antes do `-m motor.` (qualquer braço,
-    qualquer nome de interpretador, o `Python` de framework do macOS — D3r2, A3);
+  - motor vivo = um token com "python" (sem diferenciar maiúsculas) e depois `-m` + `motor.…`
+    (qualquer braço, qualquer opção do interpretador, o `Python` de framework do macOS — D3r2, A3;
+    varredura linear dos tokens, a regra do contador da outra sessão — D3r3);
   - um lock só é ACEITO (não segura) quando o dono é explicitamente MANUAL (`sonda-p102`,
     `motor-anexos`, `motor-retentar`, `manual…`) E o PID dele não descende do daemon — vivo ou já
     fora do `ps` (D3r2, A4); o motor desse lock (e o que descende dele) também não segura. Lock sem
@@ -24,6 +25,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import time
 
 import pytest
@@ -111,29 +113,106 @@ def test_motor_de_qualquer_braco_segura_a_janela(tmp_path):
 # D3r2, A3 (revisão independente): `python[^ ]* -m motor\.` não via o motor com opção do
 # interpretador antes do `-m` (`python -u -m motor.cli`) nem o Python de framework do macOS
 # (argv[0] "Python"). Os dois primeiros casos são os testes do revisor, copiados.
-@pytest.mark.parametrize("args", [
-    "/Users/g/teste/aula/.venv/bin/python -u -m motor.cli "
-    "https://hotmart.com/pt-br/club/x/products/1",
-    "/Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/"
-    "Python -m motor.memberkit https://x",
-    "/Users/g/teste/aula/.venv/bin/python3.14 -X dev -W ignore::DeprecationWarning "
-    "-m motor.kiwify https://x",
-    "/opt/homebrew/bin/python3.14t -B -m motor.instagram https://x",
-    "/Users/g/teste/aula/.venv/bin/python -mmotor.cli https://x",
-], ids=["opcao-u", "python-de-framework", "opcoes-com-argumento", "free-threaded", "m-colado"])
+# D3r3 (revisão independente do D3r2, achado 2): a expressão regular do A3 ainda perdia
+# `-Xfrozen_modules=off`, `-Wignore::DeprecationWarning` e `--check-hash-based-pycs never`, e tinha
+# backtracking exponencial (36 `-X` = 9 s). Virou `e_motor`, uma varredura linear dos tokens.
+_LINHAS_DE_MOTOR = {
+    "opcao-u": "/Users/g/teste/aula/.venv/bin/python -u -m motor.cli "
+               "https://hotmart.com/pt-br/club/x/products/1",
+    "python-de-framework": "/Library/Frameworks/Python.framework/Versions/3.14/Resources/"
+                           "Python.app/Contents/MacOS/Python -m motor.memberkit https://x",
+    "opcoes-com-argumento": "/Users/g/teste/aula/.venv/bin/python3.14 -X dev -W "
+                            "ignore::DeprecationWarning -m motor.kiwify https://x",
+    "free-threaded": "/opt/homebrew/bin/python3.14t -B -m motor.instagram https://x",
+    "m-colado": "/Users/g/teste/aula/.venv/bin/python -mmotor.cli https://x",
+    "X-colado-com-igual": "/Users/g/teste/aula/.venv/bin/python3.14 -Xfrozen_modules=off "
+                          "-m motor.cli https://x",
+    "W-colado": "/Users/g/teste/aula/.venv/bin/python -Wignore::DeprecationWarning "
+                "-m motor.hubla https://x",
+    "opcao-longa-com-valor": "/Users/g/teste/aula/.venv/bin/python --check-hash-based-pycs never "
+                             "-m motor.greenn https://x",
+    "caminho-com-espaco": "/Users/g/Library/Application Support/uv/python3.14 -m motor.cli "
+                          "https://x",
+}
+_LINHAS_SEM_MOTOR = {
+    "outro-modulo": "/usr/bin/python3 -m http.server 8000",
+    "pytest-com-motor-no-caminho": "/Users/g/teste/aula/.venv/bin/python -m pytest "
+                                   "tests/test_motor.py",
+    "motor-sem-dash-m": "/Users/g/teste/aula/.venv/bin/python -c import motor.cli",
+    "muitas-opcoes-sem-motor": "/Users/g/teste/aula/.venv/bin/python " + "-B -X dev " * 40
+                               + "-c pass",
+    "motor-sem-python": "/usr/local/bin/pypy3 -m motor.cli https://x",
+}
+# as duas folgas documentadas em `e_motor` sobre a regra do contador da outra sessão
+_FOLGAS = {"m-colado", "caminho-com-espaco"}
+
+
+@pytest.mark.parametrize("args", list(_LINHAS_DE_MOTOR.values()), ids=list(_LINHAS_DE_MOTOR))
 def test_motor_com_opcao_do_interpretador_ou_python_de_framework_segura_a_janela(tmp_path, args):
     assert _resultado(_rodar(tmp_path, [(41010, PID_DAEMON, args)], [])) == "RESULTADO=HELD", args
 
 
-@pytest.mark.parametrize("args", [
-    "/usr/bin/python3 -m http.server 8000",
-    "/Users/g/teste/aula/.venv/bin/python -m pytest tests/test_motor.py",
-    "/Users/g/teste/aula/.venv/bin/python -c import motor.cli",
-    "/Users/g/teste/aula/.venv/bin/python " + "-B -X dev " * 40 + "-c pass",
-], ids=["outro-modulo", "pytest-com-motor-no-caminho", "motor-sem-dash-m",
-        "muitas-opcoes-sem-motor"])
+@pytest.mark.parametrize("args", list(_LINHAS_SEM_MOTOR.values()), ids=list(_LINHAS_SEM_MOTOR))
 def test_python_que_nao_roda_motor_nao_segura_a_janela(tmp_path, args):
     assert _resultado(_rodar(tmp_path, [(41020, 700, args)], [])) == "RESULTADO=GUARDA_OK", args
+
+
+# A checagem de motor do script, isolada do `ps`: o `e_motor` do heredoc (ou, no script de antes, a
+# expressão regular `MOTOR`) — para medir o tempo e comparar com a regra da outra sessão.
+_CHECAGEM = r'''
+import ast, re, sys, time
+fonte = open(sys.argv[1], encoding="utf-8").read()
+codigo = fonte.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+nos = [n for n in ast.parse(codigo).body
+       if (isinstance(n, ast.FunctionDef) and n.name == "e_motor")
+       or (isinstance(n, ast.Assign) and any(getattr(a, "id", "") == "MOTOR" for a in n.targets))]
+ns = {"re": re}
+exec(compile(ast.Module(body=nos, type_ignores=[]), "bloqueios", "exec"), ns)
+checar = ns.get("e_motor") or (lambda a: bool(ns["MOTOR"].search(a)))
+for linha in sys.argv[2:]:
+    t0 = time.perf_counter()
+    casou = bool(checar(linha))
+    print(int(casou), f"{(time.perf_counter() - t0) * 1000:.3f}")
+'''
+
+
+def _checar(*linhas, timeout=10):
+    r = subprocess.run([sys.executable, "-c", _CHECAGEM, str(SCRIPT), *linhas],
+                       capture_output=True, text=True, timeout=timeout)
+    assert r.returncode == 0, r.stderr[-800:]
+    return [(bool(int(c)), float(ms)) for c, ms in (l.split() for l in r.stdout.splitlines())]
+
+
+@pytest.mark.parametrize("linha,casa", [
+    ("/Users/g/teste/aula/.venv/bin/python " + "-X " * 100 + "-c pass", False),
+    ("/Users/g/teste/aula/.venv/bin/python " + "-X dev " * 50 + "-m motor.cli https://x", True),
+], ids=["100-X-sem-motor", "100-opcoes-com-motor"])
+def test_a_checagem_de_motor_leva_menos_de_100ms_numa_linha_de_100_opcoes(linha, casa):
+    try:
+        [(casou, ms)] = _checar(linha)
+    except subprocess.TimeoutExpired:
+        pytest.fail("a checagem de motor passou de 10 s numa linha de 100 opções (backtracking)")
+    assert casou is casa and ms < 100.0, (casou, ms)
+
+
+def _regra_do_contador_da_outra_sessao(args):
+    """A regra de `motores_aula.py` (sessão 3adef9ce), copiada: argv[0] com "python" (sem
+    diferenciar maiúsculas) e um token `-m` seguido de um token que começa com `motor.`."""
+    t = args.split()
+    return bool(t and "python" in t[0].lower()
+                and any(t[i] == "-m" and t[i + 1].startswith("motor.") for i in range(len(t) - 1)))
+
+
+def test_a_checagem_de_motor_segue_a_regra_do_contador_da_outra_sessao():
+    linhas = {**_LINHAS_DE_MOTOR, **_LINHAS_SEM_MOTOR}
+    resultado = dict(zip(linhas, (casou for casou, _ms in _checar(*linhas.values()))))
+    for nome, linha in linhas.items():
+        outra = _regra_do_contador_da_outra_sessao(linha)
+        if outra:
+            assert resultado[nome], f"{nome}: o contador da outra sessão conta e o restart não segura"
+        if resultado[nome] and not outra:
+            assert nome in _FOLGAS, f"{nome}: casou além da regra sem ser uma folga documentada"
+    assert {n for n in linhas if resultado[n]} == set(_LINHAS_DE_MOTOR), resultado
 
 
 @pytest.mark.parametrize("dono", ["sonda-p102", "motor-anexos", "motor-retentar",

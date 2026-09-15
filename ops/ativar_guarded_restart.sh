@@ -5,11 +5,13 @@
 # feito (exit 2). ANTI-BAN: nunca mata um motor em voo.
 #
 # D3, item 8 (15/09):
-#   - MOTOR VIVO = `[Pp]ython…` + opções do interpretador + `-m motor.` (ver MOTOR abaixo). Antes só
-#     `python -m motor\.cli`: motor.entregadigital, motor.kiwify, motor.instagram (e o
-#     `python3.14 -m ...` do venv) eram invisíveis e o restart podia acontecer com captura em
-#     andamento. D3r2, A3: o `python[^ ]* -m motor\.` do D3 ainda não via `python -u -m motor.cli`,
-#     `-X dev`/`-W ação` antes do `-m`, nem o `Python` de framework do macOS (argv[0] maiúsculo).
+#   - MOTOR VIVO = token com "python" (sem diferenciar maiúsculas) e depois `-m` + `motor.…` (ver
+#     `e_motor` abaixo). Antes só `python -m motor\.cli`: motor.entregadigital, motor.kiwify,
+#     motor.instagram (e o `python3.14 -m ...` do venv) eram invisíveis e o restart podia acontecer
+#     com captura em andamento. D3r2, A3: `python -u -m motor.cli` e o `Python` de framework do
+#     macOS. D3r3: a expressão regular do D3r2 ainda perdia `-Xfrozen_modules=off`,
+#     `-Wignore::…` e `--check-hash-based-pycs never`, e tinha backtracking exponencial (36 `-X`
+#     = 9 s) — virou uma varredura linear dos tokens.
 #   - LOCK: só NÃO segura a janela o de dono explicitamente MANUAL (sonda-p102, motor-anexos,
 #     motor-retentar, manual...) com PID inteiro que não descende do daemon — a prova manual não é
 #     afetada pelo restart e segurava a janela para sempre. O motor desse lock (e o que descende dele)
@@ -39,7 +41,7 @@ daemon_pid(){ launchctl list 2>/dev/null | awk -v l="$LABEL" '$3==l{print $1}'; 
 # padrão (o python3 do sistema, como as leituras de pulso abaixo).
 bloqueios(){
   python3 - "$LOCKS" "$(daemon_pid)" <<'PY'
-import json, os, re, subprocess, sys
+import json, os, subprocess, sys
 
 locks_dir, daemon = sys.argv[1], sys.argv[2].strip()
 MANUAIS = ("sonda-p102", "motor-anexos", "motor-retentar")
@@ -87,12 +89,28 @@ for nome in nomes:
         continue
     locks_que_seguram += 1
 
-# D3r2, A3: opções do interpretador antes do `-m` (`-u`, `-B`, `-X dev`, `-W ação`, `-mmotor.x`) e o
-# `Python` de framework do macOS também são motor. As alternativas não se sobrepõem (sem backtracking
-# explosivo numa linha com muitas opções). Errar para o lado de segurar só adia o restart.
-MOTOR = re.compile(r"[Pp]ython[^ /]*(?: +-[XW] +[^ ]+| +-[A-Za-z]+)* +-m *motor\.")
+def e_motor(args):
+    """MOTOR VIVO (D3r3): o token `-m` seguido de um token que começa com `motor.` (ou `-mmotor.x`
+    colado), com "python" no nome de algum token ANTES dele, sem diferenciar maiúsculas. Um passe
+    só pelos tokens, sem expressão regular: tempo linear em qualquer linha (a do D3r2 tinha
+    quantificadores aninhados — 36 `-X` levavam 9 s) e nenhuma opção do interpretador escapa
+    (`-Xfrozen_modules=off`, `-Wignore::…`, `--check-hash-based-pycs never`). É a regra do contador
+    de motores da outra sessão (argv[0] com "python" + `-m motor.`), com duas folgas para o lado
+    seguro: o "python" vale em qualquer token antes do `-m` (caminho com espaço parte o argv[0]) e
+    o `-m` colado. Casar demais só adia o restart."""
+    tokens = args.split()
+    viu_python = False
+    for i, tok in enumerate(tokens):
+        if viu_python and ((tok == "-m" and i + 1 < len(tokens) and tokens[i + 1].startswith("motor."))
+                           or (tok.startswith("-m") and tok[2:].startswith("motor."))):
+            return True
+        if "python" in tok.lower():
+            viu_python = True
+    return False
+
+
 motores = [p for p, (_ppid, args) in tabela.items()
-           if MOTOR.search(args) and not descende_de(p, aceitos)]
+           if e_motor(args) and not descende_de(p, aceitos)]
 print(len(motores), locks_que_seguram)
 PY
 }
